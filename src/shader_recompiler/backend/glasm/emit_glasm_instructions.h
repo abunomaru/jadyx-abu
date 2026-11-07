@@ -84,6 +84,7 @@ void EmitSR_WScaleFactorZ(EmitContext& ctx, IR::Inst& inst);
 void EmitYDirection(EmitContext& ctx, IR::Inst& inst);
 void EmitResolutionDownFactor(EmitContext& ctx, IR::Inst& inst);
 void EmitRenderArea(EmitContext& ctx, IR::Inst& inst);
+void EmitStageConstant(EmitContext& ctx, IR::Inst& inst, u32 index);
 void EmitLoadLocal(EmitContext& ctx, IR::Inst& inst, ScalarU32 word_offset);
 void EmitWriteLocal(EmitContext& ctx, ScalarU32 word_offset, ScalarU32 value);
 void EmitUndefU1(EmitContext& ctx, IR::Inst& inst);
@@ -680,5 +681,8 @@ void EmitDPdxFine(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
 void EmitDPdyFine(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
 void EmitDPdxCoarse(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
 void EmitDPdyCoarse(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
+
+void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a,
+                      const IR::Value& b, const IR::Value& c);
 
 } // namespace Shader::Backend::GLASM

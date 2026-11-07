@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <exception>
 #include <functional>
 #include <string>
 #include <unordered_set>
@@ -19,13 +21,17 @@
 #include "common/cityhash.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/dlss_contract.h"
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -59,6 +65,38 @@ void ShaderCache::SyncGuestHost() {
     RemovePendingShaders();
 }
 
+void ShaderCache::RefreshDebugRejections(bool unrejected) {
+    std::vector<std::pair<VAddr, VAddr>> ranges;
+    {
+        std::scoped_lock lock{lookup_mutex};
+        for (const auto& [addr, entry] : lookup_cache) {
+            const ShaderInfo* const info = entry->data;
+            if (info->lowered_native &&
+                (VideoCore::Nx2Debug::IsRejected(info->unique_hash) ||
+                 VideoCore::Nx2Debug::IsRejected(info->lowered_native->native_program_key))) {
+                ranges.emplace_back(entry->addr_start, entry->addr_end);
+            }
+        }
+    }
+    {
+        std::scoped_lock lock{invalidation_mutex};
+        for (const auto& [start, end] : ranges) {
+            InvalidatePagesInRegion(start, end - start);
+        }
+        RemovePendingShaders();
+    }
+    if (unrejected) {
+        std::scoped_lock lock{rejected_mutex};
+        rejected_native.clear();
+    }
+    // shader_infos may point at removed programs: every channel must refresh its stages.
+    for (const size_t id : active_channel_ids) {
+        channel_storage[id].maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+    }
+    LOG_INFO(HW_GPU, "Debug server rejections applied: {} cached programs dropped{}", ranges.size(),
+             unrejected ? ", earlier rejections forgotten" : "");
+}
+
 ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : device_memory{device_memory_} {}
 
@@ -80,10 +118,14 @@ u64 ShaderCache::MeshStateHash() const {
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
-    if (!dirty[VideoCommon::Dirty::Shaders]) {
+    // The pixel stage is left out while rasterization is off. Turning it back on writes no shader
+    // register, so without this check the pixel stage stays out until the shaders change.
+    const bool rasterize_enable = maxwell3d->regs.rasterize_enable != 0;
+    if (!dirty[VideoCommon::Dirty::Shaders] && rasterize_enable == last_rasterize_enable) {
         return last_shaders_valid;
     }
     dirty[VideoCommon::Dirty::Shaders] = false;
+    last_rasterize_enable = rasterize_enable;
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
     if (Common::Pulse::Diagnostics()) {
@@ -152,6 +194,36 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     LOG_ERROR(HW_GPU, "Rejected program {:#x} is bound to stage {}: header {:08x}, slot {:08x}",
                               shader_addr, index, fmt::join(header, " "), fmt::join(config, " "));
                 }
+                if (native && std::getenv("EDEN_NX2_SHADER_DUMP")) {
+                    for (size_t next = index + 1; next < unique_hashes.size(); ++next) {
+                        const auto next_program =
+                            static_cast<Tegra::Engines::Maxwell3D::Regs::ShaderType>(next);
+                        if (!maxwell3d->regs.IsShaderConfigEnabled(next) ||
+                            (mesh && next_program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry) ||
+                            (!maxwell3d->regs.rasterize_enable &&
+                             next_program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel)) {
+                            continue;
+                        }
+                        const auto& next_config = maxwell3d->regs.pipelines[next];
+                        const GPUVAddr next_address =
+                            (static_cast<u64>(next_config.reserved[0] & 0xff) << 32) |
+                            next_config.reserved[1];
+                        if (!gpu_memory->IsFullyMappedRange(next_address, 128)) {
+                            LOG_WARNING(HW_GPU, "Downstream native stage {} at {:#x} is unmapped",
+                                        next, next_address);
+                            continue;
+                        }
+                        try {
+                            GraphicsEnvironment capture{*maxwell3d, *gpu_memory, next_program,
+                                                        next_address, 0};
+                            LOG_INFO(HW_GPU, "Preflighted downstream native stage {} at {:#x}",
+                                     next, next_address);
+                        } catch (const std::exception& error) {
+                            LOG_ERROR(HW_GPU, "Downstream native stage {} at {:#x} rejected: {}",
+                                      next, next_address, error.what());
+                        }
+                    }
+                }
                 throw;
             }
         }
@@ -202,17 +274,46 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         LOG_ERROR(HW_GPU, "Invalid GPU address for shader {:#016x}", shader_addr);
         return nullptr;
     }
-    if (const ShaderInfo* const shader = TryGet(*cpu_shader_addr)) {
-        return shader;
+    const ShaderInfo* shader = TryGet(*cpu_shader_addr);
+    if (shader) {
+        if (shader->lowered_native &&
+            !Shader::Ampere::VerifyTrapGuards(shader->lowered_native->trap_prefix,
+                                             [&](u32 bank, u32 offset) {
+                                                 return ReadNativeGuardConstant(
+                                                     *kepler_compute, *gpu_memory, bank, offset);
+                                             }))
+            throw Shader::Ampere::TrapGuardError{};
+    } else if (kepler_compute->IsNativeMode() && IsRejected(*cpu_shader_addr)) {
+        // A rejected program fails the same way on every dispatch. GetGraphicsEnvironments
+        // skips those draws without rethrowing; doing the same here avoids two C++ throws, a
+        // mutex-guarded insert and an exception_ptr for each dispatch of the program. The
+        // caller already turns a missing shader into a failed dispatch.
+        return nullptr;
+    } else {
+        try {
+            RethrowIfRejected(*cpu_shader_addr);
+            ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+            shader = MakeShaderInfo(env, *cpu_shader_addr);
+        } catch (const Shader::Ampere::TrapGuardError&) {
+            // Constants can become valid on the next dispatch; do not cache this rejection.
+            throw;
+        } catch (const Shader::Exception&) {
+            RememberRejection(*cpu_shader_addr);
+            throw;
+        }
     }
-    try {
-        RethrowIfRejected(*cpu_shader_addr);
-        ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
-        return MakeShaderInfo(env, *cpu_shader_addr);
-    } catch (const Shader::Exception&) {
-        RememberRejection(*cpu_shader_addr);
-        throw;
+    // Check both warm and cold shader paths, before selecting a disk-cached pipeline.
+    // EDEN_NX2_DLSS_REPLACEMENT=native retains the native network for comparisons.
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        DlssContract::IsFastFusionCandidate(program_id,
+                                            shader->lowered_native->native_program_key)) {
+        kepler_compute->TraceDlssContract(shader->lowered_native->native_program_key);
     }
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        kepler_compute->ProcessGameDlss(program_id, shader->lowered_native->native_program_key)) {
+        throw FireEmblemUpscale::DispatchReplaced{};
+    }
+    return shader;
 }
 
 void ShaderCache::RethrowIfRejected(VAddr addr) {
@@ -229,6 +330,11 @@ bool ShaderCache::IsRejected(VAddr addr) {
 
 void ShaderCache::RememberRejection(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
+    if (rejected_native.contains(addr)) {
+        // Called from a catch block: keep the first exception for that address instead of
+        // capturing and inserting a new one on every rejected dispatch.
+        return;
+    }
     rejected_native.emplace(addr, std::current_exception());
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);

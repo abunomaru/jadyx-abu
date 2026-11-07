@@ -234,6 +234,7 @@ void RendererD3D12::DrawTraceIndicator(CommandStream* cmd,
         case CaptureState::Saving: label = fmt::format("T {} GUARDANDO", status.id); break;
         case CaptureState::Saved: label = fmt::format("T {} GUARDADA", status.id); break;
         case CaptureState::Truncated: label = fmt::format("T {} TRUNCADA", status.id); break;
+        case CaptureState::Armed: label = fmt::format("T {} ARMADA", status.id); break;
         default: return;
         }
         const LONG pad = 3 * cell;
@@ -289,6 +290,13 @@ void RendererD3D12::DrawShaderIndicator(CommandStream* cmd,
     std::vector<D3D12_RECT> text;
     AppendText(text, count, left + pad + dots_width + 3 * cell, top + pad, cell);
     ClearRects(cmd, rtv, OVERLAY_TEXT, text);
+}
+
+bool ResizeGameOutput(VideoCore::RendererBase& renderer, u32 width, u32 height) {
+    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Direct3D12) {
+        return false;
+    }
+    return static_cast<RendererD3D12&>(renderer).ResizeOutput(width, height);
 }
 
 std::pair<u32, u32> GameMenuScreenSize(VideoCore::RendererBase& renderer) {

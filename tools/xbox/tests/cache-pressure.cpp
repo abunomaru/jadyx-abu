@@ -50,5 +50,25 @@ int main() {
     assert(!c.RequiresImmediateRecovery({}));
     assert(!c.Policy(CachePressure::Critical,false).aggressive);
     assert(c.Policy(CachePressure::Normal,false).min_age >= critical.min_age);
-    std::cout << "PASS: independent domains, app/GPU budget exhaustion, hysteresis, query failure, overflow and emergency recovery policy\n";
+    // A coordinator yield evicts clean idle textures sooner, never downloads a render target.
+    const auto yield = CachePressureController::YieldPolicy();
+    assert(yield.high_priority && !yield.aggressive && yield.max_downloads == 0);
+    assert(yield.min_age < c.Policy(CachePressure::Pressure,false).min_age);
+    assert(yield.iterations > c.Policy(CachePressure::Pressure,false).iterations);
+    // Texture cap: the heaps may hold the app headroom above the line, never less than the floor.
+    constexpr u64 floor = 768*MiB, line = 2192*MiB;
+    const auto room = [](u64 used) { return CacheMemorySnapshot{used*MiB,5120*MiB,0,0}; };
+    assert(TextureCapForHeadroom(floor, line, 500*MiB, room(2000)) == 1428*MiB); // light game
+    assert(TextureCapForHeadroom(floor, line, 1428*MiB, room(2928)) == 1428*MiB); // grown into it
+    assert(TextureCapForHeadroom(floor, line, 300*MiB, room(4000)) == floor); // heavy game
+    assert(TextureCapForHeadroom(floor, line, 900*MiB, room(5120)) == floor); // exhausted
+    assert(TextureCapForHeadroom(floor, line, 900*MiB, room(5200)) == floor); // over the limit
+    assert(TextureCapForHeadroom(floor, line, 900*MiB, {}) == floor); // unknown limit
+    assert(TextureCapForHeadroom(floor, 0, 0, room(0)) == floor); // growth off
+    assert(TextureCapForHeadroom(0, line, 0, room(0)) == 0); // cap off
+    // The GPU budget bounds it too, at the Normal exit: a quarter of the budget left.
+    assert(TextureCapForHeadroom(floor, line, 1000*MiB, {0,5120*MiB,1000*MiB,4000*MiB}) ==
+           3000*MiB);
+    assert(TextureCapForHeadroom(floor, line, 1000*MiB, {0,5120*MiB,3500*MiB,4000*MiB}) == floor);
+    std::cout << "PASS: independent domains, app/GPU budget exhaustion, hysteresis, query failure, overflow, emergency recovery policy and headroom texture cap\n";
 }

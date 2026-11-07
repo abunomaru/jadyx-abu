@@ -203,6 +203,10 @@ public:
         return static_cast<u32>(device.GetUniformBufferAlignment());
     }
 
+    u64 GetMaxStorageBufferRange() const {
+        return u64{128} << 20;
+    }
+
     u32 GetStorageBufferAlignment() const {
         return static_cast<u32>(device.GetShaderStorageBufferAlignment());
     }

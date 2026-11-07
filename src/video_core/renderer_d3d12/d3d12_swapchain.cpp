@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <mutex>
@@ -56,14 +57,14 @@ Swapchain::Swapchain(const Device& device, IUnknown* core_window, u32 width_, u3
     }
     if (handoff) handoff();
     ComPtr<IDXGISwapChain1> swapchain1;
-    HRESULT hr = device.Factory()->CreateSwapChainForCoreWindow(device.Queue(), core_window, &desc,
-                                                                nullptr, &swapchain1);
+    HRESULT hr = device.Factory()->CreateSwapChainForCoreWindow(device.PresentQueue(), core_window,
+                                                                &desc, nullptr, &swapchain1);
     // DXGI may unbind the frontend's swapchain from the window a moment after its last
     // reference goes: until then the window refuses a new one with E_INVALIDARG.
     for (int attempt = 0; handoff && hr == E_INVALIDARG && attempt < HANDOFF_RETRIES; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds{HANDOFF_RETRY_MS});
-        hr = device.Factory()->CreateSwapChainForCoreWindow(device.Queue(), core_window, &desc,
-                                                            nullptr, &swapchain1);
+        hr = device.Factory()->CreateSwapChainForCoreWindow(device.PresentQueue(), core_window,
+                                                            &desc, nullptr, &swapchain1);
         if (SUCCEEDED(hr)) {
             LOG_INFO(Render, "D3D12: window free after the handoff in {} ms",
                      (attempt + 1) * HANDOFF_RETRY_MS);
@@ -73,8 +74,8 @@ Swapchain::Swapchain(const Device& device, IUnknown* core_window, u32 width_, u3
         LOG_WARNING(Render, "D3D12: waitable swapchain rejected (0x{:08X}); Present will block",
                     static_cast<u32>(hr));
         desc.Flags = 0;
-        hr = device.Factory()->CreateSwapChainForCoreWindow(device.Queue(), core_window, &desc,
-                                                            nullptr, &swapchain1);
+        hr = device.Factory()->CreateSwapChainForCoreWindow(device.PresentQueue(), core_window,
+                                                            &desc, nullptr, &swapchain1);
     }
     ThrowIfFailed(hr, "CreateSwapChainForCoreWindow");
     ThrowIfFailed(swapchain1.As(&swapchain), "IDXGISwapChain3 query");
@@ -85,10 +86,7 @@ Swapchain::Swapchain(const Device& device, IUnknown* core_window, u32 width_, u3
         }
         frame_latency_waitable = swapchain->GetFrameLatencyWaitableObject();
     }
-    for (u32 i = 0; i < IMAGE_COUNT; ++i) {
-        ThrowIfFailed(swapchain->GetBuffer(i, IID_PPV_ARGS(&images[i])),
-                      "IDXGISwapChain::GetBuffer");
-    }
+    GetImages();
     LOG_INFO(Render, "D3D12: swapchain {}x{}, {} images, frame latency {}", width, height,
              IMAGE_COUNT,
              frame_latency_waitable ? fmt::format("{} (waitable)", MAX_FRAME_LATENCY)
@@ -101,17 +99,57 @@ Swapchain::~Swapchain() {
     }
 }
 
+void Swapchain::GetImages() {
+    for (u32 i = 0; i < IMAGE_COUNT; ++i) {
+        ThrowIfFailed(swapchain->GetBuffer(i, IID_PPV_ARGS(&images[i])),
+                      "IDXGISwapChain::GetBuffer");
+    }
+}
+
+bool Swapchain::Resize(u32 new_width, u32 new_height) {
+    // ResizeBuffers refuses to run while a reference to a back buffer is alive.
+    for (ComPtr<ID3D12Resource>& image : images) {
+        image.Reset();
+    }
+    const UINT flags = frame_latency_waitable != nullptr
+                           ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                           : 0;
+    const HRESULT hr = swapchain->ResizeBuffers(IMAGE_COUNT, new_width, new_height, FORMAT, flags);
+    if (FAILED(hr)) {
+        LOG_ERROR(Render, "D3D12: swapchain resize to {}x{} failed (0x{:08X})", new_width,
+                  new_height, static_cast<u32>(hr));
+        GetImages();
+        return false;
+    }
+    width = new_width;
+    height = new_height;
+    GetImages();
+    LOG_INFO(Render, "D3D12: swapchain resized to {}x{}", width, height);
+    return true;
+}
+
 u32 Swapchain::CurrentIndex() const {
     return swapchain->GetCurrentBackBufferIndex();
 }
 
-bool Swapchain::WaitForFrame() {
+bool Swapchain::WaitForFrame(u32 latency) {
     if (frame_latency_waitable == nullptr) {
+        return true;
+    }
+    const u32 want_held = MAX_FRAME_LATENCY - std::clamp(latency, 1U, MAX_FRAME_LATENCY);
+    if (held_frames > want_held) {
+        // The latency went up: a held count is a frame the swapchain already accepts.
+        --held_frames;
         return true;
     }
     const VideoCore::FrameTrace::ScopedSpan trace_wait{
         VideoCore::FrameTrace::Event::HostPresentLong, 1};
     // Not alertable: an APC ending the wait early would let Present block.
+    while (held_frames < want_held &&
+           WaitForSingleObjectEx(frame_latency_waitable, FRAME_WAIT_TIMEOUT_MS, FALSE) !=
+               WAIT_TIMEOUT) {
+        ++held_frames;
+    }
     if (WaitForSingleObjectEx(frame_latency_waitable, FRAME_WAIT_TIMEOUT_MS, FALSE) ==
         WAIT_TIMEOUT) {
         LOG_WARNING(Render, "D3D12: the swapchain accepted no frame for {} ms; frame dropped",
@@ -121,10 +159,10 @@ bool Swapchain::WaitForFrame() {
     return true;
 }
 
-void Swapchain::Present() {
+void Swapchain::Present(u32 sync_interval) {
     const VideoCore::FrameTrace::ScopedSpan trace_present{
         VideoCore::FrameTrace::Event::HostPresentLong, 0};
-    ThrowIfFailed(swapchain->Present(1, 0), "IDXGISwapChain::Present");
+    ThrowIfFailed(swapchain->Present(sync_interval, 0), "IDXGISwapChain::Present");
 }
 
 } // namespace D3D12

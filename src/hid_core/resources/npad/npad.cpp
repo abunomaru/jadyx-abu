@@ -145,6 +145,12 @@ void NPad::FreeAppletResourceId(u64 aruid) {
 }
 
 void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTriggerType type, std::size_t controller_idx) {
+    // Input callbacks can arrive before SetNpadExternals installs the applet resource.
+    const auto applet_resource = applet_resource_holder.applet_resource;
+    if (applet_resource == nullptr) {
+        return;
+    }
+
     if (type == Core::HID::ControllerTriggerType::All) {
         ControllerUpdate(kernel, Core::HID::ControllerTriggerType::Connected, controller_idx);
         ControllerUpdate(kernel, Core::HID::ControllerTriggerType::Battery, controller_idx);
@@ -156,7 +162,7 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
             return;
         }
 
-        auto* data = applet_resource_holder.applet_resource->GetAruidDataByIndex(aruid_index);
+        auto* data = applet_resource->GetAruidDataByIndex(aruid_index);
 
         if (data == nullptr || !data->flag.is_assigned) {
             continue;

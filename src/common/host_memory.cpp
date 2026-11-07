@@ -15,6 +15,7 @@
 #include <winioctl.h>
 #include <psapi.h>
 #include "common/dynamic_library.h"
+#include "common/guest_zero_census_scan.h"
 
 #else // ^^^ Windows ^^^ vvv POSIX vvv
 
@@ -26,6 +27,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "common/scope_exit.h"
+#include "common/settings.h"
 
 #if defined(__linux__)
 #include <sys/random.h>
@@ -59,10 +61,13 @@
 #include <bitset>
 #include <array>
 #include <chrono>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <random>
 
+#include "common/permafrost.h"
 #include "common/pulse_diagnostics.h"
 
 #include "common/alignment.h"
@@ -72,6 +77,7 @@
 #include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/thread.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -91,6 +97,13 @@ namespace Common {
 namespace {
 std::atomic<size_t> g_fastmem_hot_size{size_t{384} << 20};
 std::atomic<bool> g_fastmem_force_full{false};
+std::mutex g_guest_swap_settings_mutex;
+GuestSwapSettings g_guest_swap_settings;
+}
+
+void ConfigureGuestSwap(const GuestSwapSettings& settings) {
+    std::scoped_lock lock{g_guest_swap_settings_mutex};
+    g_guest_swap_settings = settings;
 }
 
 void ConfigureHostMemoryFastmem(size_t hot_mib, bool force_full) {
@@ -239,6 +252,7 @@ std::atomic<bool> g_backing_is_section{false};
 std::atomic<bool> g_backing_is_file{false};
 std::atomic<bool> g_backing_file_sparse{false};
 PFN_VirtualAllocFromApp g_pfn_virtual_alloc_from_app{nullptr};
+PFN_VirtualProtect g_pfn_virtual_protect_from_app{nullptr};
 PFN_AddVectoredExceptionHandler g_pfn_add_veh{nullptr};
 PFN_RemoveVectoredExceptionHandler g_pfn_remove_veh{nullptr};
 void* g_backing_veh{nullptr};
@@ -397,6 +411,47 @@ LONG CheckWatchedWrite(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// The private backing's demand commit of the page at `fault_addr`: its 64 KiB chunk, or the page
+// alone in a partly committed chunk. True when the access can be retried. A failure gives up the
+// Permafrost's commit reserve, when it holds one, and tries again.
+bool CommitBackingPage(u8* fault_addr) {
+    u8* const base = g_backing_base.load(std::memory_order_acquire);
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    const size_t offset = static_cast<size_t>(fault_addr - base);
+    const size_t chunk_offset = offset & ~(BACKING_COMMIT_GRANULARITY - 1);
+    const size_t chunk_len = (std::min)(BACKING_COMMIT_GRANULARITY, size - chunk_offset);
+    const auto span = reinterpret_cast<uintptr_t>(base + (offset & ~(SPAN_SIZE - 1)));
+    g_commits_in_flight.fetch_add(1);
+    if (g_held_span.load() == span) {
+        g_commits_in_flight.fetch_sub(1);
+        WaitHeldSpan(span);
+        return true;
+    }
+    // A partly committed chunk takes back only the faulting page.
+    size_t commit_offset = chunk_offset;
+    size_t commit_len = chunk_len;
+    if (MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(base + chunk_offset, &info, sizeof(info)) != 0 &&
+        !(info.State == MEM_RESERVE &&
+          static_cast<u8*>(info.BaseAddress) + info.RegionSize >= base + chunk_offset + chunk_len)) {
+        commit_offset = offset & ~(HOST_PAGE_SIZE - 1);
+        commit_len = HOST_PAGE_SIZE;
+    }
+    const auto commit = [&] {
+        return g_pfn_virtual_alloc_from_app(base + commit_offset, commit_len, MEM_COMMIT,
+                                            PAGE_READWRITE) != nullptr;
+    };
+    bool committed = commit();
+    if (!committed && Common::Permafrost::ReleaseReserve()) {
+        committed = commit();
+    }
+    if (!committed) {
+        RecordCommitFailure(reinterpret_cast<uintptr_t>(base + commit_offset), commit_len);
+    }
+    g_commits_in_flight.fetch_sub(1);
+    return committed;
+}
+
 LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -431,40 +486,13 @@ LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
     if (fault_addr < base || fault_addr >= base + size) {
         return EXCEPTION_CONTINUE_SEARCH; // not our backing — let other handlers run
     }
-    const size_t offset = static_cast<size_t>(fault_addr - base);
-    const size_t chunk_offset = offset & ~(BACKING_COMMIT_GRANULARITY - 1);
-    const size_t chunk_len = (std::min)(BACKING_COMMIT_GRANULARITY, size - chunk_offset);
-    const auto span = reinterpret_cast<uintptr_t>(base + (offset & ~(SPAN_SIZE - 1)));
-    g_commits_in_flight.fetch_add(1);
-    if (g_held_span.load() == span) {
-        g_commits_in_flight.fetch_sub(1);
-        WaitHeldSpan(span);
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    // A partly committed chunk takes back only the faulting page.
-    size_t commit_offset = chunk_offset;
-    size_t commit_len = chunk_len;
-    if (MEMORY_BASIC_INFORMATION info{};
-        VirtualQuery(base + chunk_offset, &info, sizeof(info)) != 0 &&
-        !(info.State == MEM_RESERVE &&
-          static_cast<u8*>(info.BaseAddress) + info.RegionSize >= base + chunk_offset + chunk_len)) {
-        commit_offset = offset & ~(HOST_PAGE_SIZE - 1);
-        commit_len = HOST_PAGE_SIZE;
-    }
-    const bool committed = g_pfn_virtual_alloc_from_app(base + commit_offset, commit_len,
-                                                        MEM_COMMIT, PAGE_READWRITE) != nullptr;
-    if (!committed) {
-        RecordCommitFailure(reinterpret_cast<uintptr_t>(base + commit_offset), commit_len);
-    }
-    g_commits_in_flight.fetch_sub(1);
-    if (committed) {
-        return EXCEPTION_CONTINUE_EXECUTION; // page committed — retry the faulting access
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
+    // With Permafrost on, a granule on probation or on disk is brought back first; a resident
+    // one takes the plain demand commit.
+    return Common::Permafrost::OnFault(fault_addr, CommitBackingPage) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                     : EXCEPTION_CONTINUE_SEARCH;
 }
 } // namespace
 #endif
-
 class HostMemory::Impl {
 public:
     explicit Impl(size_t backing_size_, size_t virtual_size_, HostMemoryFastmemRegion fastmem_region_)
@@ -505,6 +533,7 @@ public:
         // the handler below commits 64 KiB chunks on first touch, charging only the touched working
         // set while the full 4 GiB stays reserved (kernel memory-pool layout unchanged).
         GetFuncAddress(kernelbase_dll, "VirtualAllocFromApp", g_pfn_virtual_alloc_from_app);
+        g_pfn_virtual_protect_from_app = pfn_VirtualProtectFromApp;
         // Resolve the VEH APIs by name (see typedef note) so we do not hard-import the errorhandling
         // api-set the Xbox loader lacks — a direct call there makes the app fail to activate on-console.
         GetFuncAddress(kernelbase_dll, "AddVectoredExceptionHandler", g_pfn_add_veh);
@@ -537,6 +566,7 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to install backing demand-commit handler");
             return false;
         }
+        StartGuestSwap();
         // No file-mapping section and no fastmem arena on UWP. VirtualBasePointer() returns null;
         // that is tolerated by all callers (fastmem disabled).
         backing_handle = nullptr;
@@ -584,6 +614,59 @@ public:
     }
 
 #ifdef HOST_MEMORY_USE_FROM_APP
+    /// Cold guest memory to disk, over the private backing only: a section page cannot be
+    /// decommitted on its own.
+    void StartGuestSwap() {
+        GuestSwapSettings settings;
+        {
+            std::scoped_lock lock{g_guest_swap_settings_mutex};
+            settings = g_guest_swap_settings;
+        }
+        if (!settings.enabled) {
+            return;
+        }
+        if (g_pfn_virtual_protect_from_app == nullptr) {
+            LOG_WARNING(HW_Memory, "Permafrost off: VirtualProtectFromApp is missing");
+            return;
+        }
+        const Permafrost::Platform platform{
+            [](void* address, size_t size) {
+                return g_pfn_virtual_alloc_from_app(address, size, MEM_COMMIT, PAGE_READWRITE) !=
+                       nullptr;
+            },
+            [](void* address, size_t size, u32 protection) {
+                DWORD old{};
+                return g_pfn_virtual_protect_from_app(address, size, protection, &old) != FALSE;
+            },
+            [](size_t size) {
+                return g_pfn_virtual_alloc_from_app(nullptr, size, MEM_COMMIT | MEM_RESERVE,
+                                                    PAGE_READWRITE);
+            },
+            [](const char* name) { Common::SetCurrentThreadName(name); },
+        };
+        const Permafrost::Config config{
+            .path = settings.path,
+            .reserve_bytes = settings.reserve_bytes,
+            .probation_ms = settings.probation_ms,
+            .min_idle_ms = settings.min_idle_ms,
+            .batch_bytes = settings.batch_bytes,
+            .fill_pages = settings.fill_pages,
+            .prefetch = settings.prefetch,
+            .pause_fill = settings.pause_fill,
+        };
+        if (Permafrost::Init(backing_base, backing_size, platform, config)) {
+            LOG_INFO(HW_Memory,
+                     "Permafrost on: {} MiB reserve, {} ms probation, {} ms idle, {} MiB batches, "
+                     "fill {} pages, prefetch {}, pause fill {}",
+                     settings.reserve_bytes >> 20, settings.probation_ms, settings.min_idle_ms,
+                     settings.batch_bytes >> 20, settings.fill_pages,
+                     settings.prefetch ? "on" : "off", settings.pause_fill ? "on" : "off");
+        } else {
+            LOG_WARNING(HW_Memory, "Permafrost off: the swap file could not be opened (error {})",
+                        GetLastError());
+        }
+    }
+
     /// Xbox fastmem: only a bounded hot slice of the application pool is section-backed. The private
     /// reservations and the mapped section remain adjacent, so every existing BackingBasePointer
     /// user still sees one linear DRAM allocation. Only the section-backed range can be aliased.
@@ -1084,6 +1167,8 @@ private:
 #ifdef HOST_MEMORY_USE_FROM_APP
         // UWP: private demand-committed backing, no section handle and no fastmem arena. Tear down the
         // demand-commit handler first, then release the private reservation (committed pages included).
+        // Permafrost goes before it, with its file: nothing faults into it any more.
+        Permafrost::Shutdown();
         if (g_backing_veh != nullptr && g_pfn_remove_veh != nullptr) {
             g_pfn_remove_veh(g_backing_veh);
             g_backing_veh = nullptr;
@@ -1375,7 +1460,7 @@ private:
 #define MAP_NOCORE 0
 #endif
 
-#ifdef ARCHITECTURE_arm64
+#if defined(ARCHITECTURE_arm64) && !defined(__APPLE__)
 
 static void* ChooseVirtualBase(size_t virtual_size) {
     constexpr uintptr_t Map39BitSize = (1ULL << 39);
@@ -1491,8 +1576,19 @@ public:
 #endif
 
     bool Init() {
-        long page_size = sysconf(_SC_PAGESIZE);
-        ASSERT_MSG(page_size == 0x1000, "page size {:#x} is incompatible with 4K paging", page_size);
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size < static_cast<long>(PageAlignment) ||
+            page_size % static_cast<long>(PageAlignment) != 0) {
+            LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem", page_size);
+            return false;
+        }
+#ifdef HAS_NCE
+        if (page_size != static_cast<long>(PageAlignment) && Settings::IsNceEnabled()) {
+            LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem with NCE", page_size);
+            return false;
+        }
+#endif
+        host_page_size = static_cast<size_t>(page_size);
         // Backing memory initialization
 #if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
@@ -1500,7 +1596,20 @@ public:
         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
 #elif defined(__FreeBSD__)
         fd = shm_open(SHM_ANON, O_RDWR, 0600);
-#elif defined(__APPLE__) || defined(__managarm__)
+#elif defined(__APPLE__)
+        char shm_name[32];
+        std::snprintf(shm_name, sizeof(shm_name), "/eden_mem_%d", int(getpid()));
+        fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            shm_unlink(shm_name);
+        } else {
+            char template_path[] = "/tmp/eden_mem_XXXXXX";
+            fd = mkstemp(template_path);
+            if (fd >= 0) {
+                unlink(template_path);
+            }
+        }
+#elif defined(__managarm__)
         // macOS doesn't have memfd_create, use anonymous temporary file
         char template_path[] = "/tmp/eden_mem_XXXXXX";
         fd = mkstemp(template_path);
@@ -1548,6 +1657,24 @@ public:
         madvise(virtual_base, virtual_size, MADV_HUGEPAGE);
 #endif
         free_manager.SetAddressSpace(virtual_base, virtual_size);
+
+        if (host_page_size != PageAlignment) {
+            if (fd < 0 || virtual_size % host_page_size != 0) {
+                LOG_WARNING(Common_Memory, "Can't emulate {:#x} byte pages with host page size {:#x}",
+                            PageAlignment, host_page_size);
+                return false;
+            }
+            page_states_size = (virtual_size / PageAlignment) * sizeof(u32);
+            void* const states = mmap(nullptr, page_states_size, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (states == MAP_FAILED) {
+                LOG_CRITICAL(HW_Memory, "mmap failed: {}", strerror(errno));
+                return false;
+            }
+            page_states = static_cast<u32*>(states);
+            LOG_INFO(Common_Memory, "Fastmem maps {:#x} byte host pages whose guest pages are contiguous",
+                     host_page_size);
+        }
         return true;
     }
 
@@ -1565,7 +1692,26 @@ public:
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
         // Intersect the range with our address space.
+        const size_t intended_offset = virtual_offset;
         AdjustMap(&virtual_offset, &length);
+        if (length != 0) {
+            host_offset += virtual_offset - intended_offset;
+        }
+
+        if (page_states) {
+            if (length == 0) {
+                return;
+            }
+            std::scoped_lock lk{page_states_mutex};
+            const size_t first = StateIndex(virtual_offset);
+            const u32 state = PageMapped | PermissionBits(perms);
+            for (size_t i = 0; i < length / PageAlignment; ++i) {
+                const u32 host_page = static_cast<u32>(host_offset / PageAlignment + i);
+                page_states[first + i] = state | (host_page << PageOffsetShift);
+            }
+            UpdateHostPages(virtual_offset, length, true);
+            return;
+        }
 
         // We are removing a placeholder.
         free_manager.AllocateBlock(virtual_base + virtual_offset, length);
@@ -1592,6 +1738,16 @@ public:
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
 
+        if (page_states) {
+            if (length == 0) {
+                return;
+            }
+            std::scoped_lock lk{page_states_mutex};
+            std::fill_n(page_states + StateIndex(virtual_offset), length / PageAlignment, 0u);
+            UpdateHostPages(virtual_offset, length, true);
+            return;
+        }
+
         // Merge with any adjacent placeholder mappings.
         auto [merged_pointer, merged_size] =
             free_manager.FreeBlock(virtual_base + virtual_offset, length);
@@ -1603,6 +1759,21 @@ public:
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
+
+        if (page_states) {
+            if (length == 0) {
+                return;
+            }
+            const u32 bits = (read ? PageRead : 0u) | (write ? PageWrite : 0u) |
+                             (execute ? PageExecute : 0u);
+            std::scoped_lock lk{page_states_mutex};
+            u32* const states = page_states + StateIndex(virtual_offset);
+            for (size_t i = 0; i < length / PageAlignment; ++i) {
+                states[i] = (states[i] & ~PagePermissionMask) | bits;
+            }
+            UpdateHostPages(virtual_offset, length, false);
+            return;
+        }
 
         int flags = PROT_NONE;
         if (read) {
@@ -1634,6 +1805,10 @@ public:
 private:
     /// Release all resources in the object
     void Release() {
+        if (page_states != nullptr) {
+            munmap(page_states, page_states_size);
+        }
+
         if (virtual_map_base != MAP_FAILED) {
             int ret = munmap(virtual_map_base, virtual_size);
             ASSERT_MSG(ret == 0, "munmap failed: {}", strerror(errno));
@@ -1671,8 +1846,105 @@ private:
         }
     }
 
+    static constexpr u32 PageRead = 1u << 0;
+    static constexpr u32 PageWrite = 1u << 1;
+    static constexpr u32 PageExecute = 1u << 2;
+    static constexpr u32 PagePermissionMask = PageRead | PageWrite | PageExecute;
+    static constexpr u32 PageMapped = 1u << 3;
+    static constexpr u32 PageOffsetShift = 4;
+
+    static u32 PermissionBits(MemoryPermission perms) {
+        return (True(perms & MemoryPermission::Read) ? PageRead : 0u) |
+               (True(perms & MemoryPermission::Write) ? PageWrite : 0u) |
+               (True(perms & MemoryPermission::Execute) ? PageExecute : 0u);
+    }
+
+    static int ProtectionFlags(u32 bits) {
+        int prot = PROT_NONE;
+        if ((bits & PageRead) != 0) {
+            prot |= PROT_READ;
+        }
+        if ((bits & PageWrite) != 0) {
+            prot |= PROT_WRITE;
+        }
+#ifdef HAS_NCE
+        if ((bits & PageExecute) != 0) {
+            prot |= PROT_EXEC;
+        }
+#endif
+        return prot;
+    }
+
+    struct HostPage {
+        bool mapped;
+        size_t host_offset;
+        int prot;
+    };
+
+    size_t StateIndex(size_t virtual_offset) const {
+        const size_t base = virtual_base != nullptr ? 0 : reinterpret_cast<size_t>(virtual_map_base);
+        return (virtual_offset - base) / PageAlignment;
+    }
+
+    HostPage ResolveHostPage(size_t virtual_offset) const {
+        const u32* const states = page_states + StateIndex(virtual_offset);
+        const u32 first = states[0];
+        const size_t host_offset = size_t(first >> PageOffsetShift) * PageAlignment;
+        if ((first & PageMapped) == 0 || host_offset % host_page_size != 0) {
+            return {};
+        }
+        u32 permissions = first & PagePermissionMask;
+        for (size_t i = 1; i < host_page_size / PageAlignment; ++i) {
+            const u32 state = states[i];
+            if ((state & PageMapped) == 0 || (state >> PageOffsetShift) != (first >> PageOffsetShift) + i) {
+                return {};
+            }
+            permissions &= state;
+        }
+        return {true, host_offset, ProtectionFlags(permissions)};
+    }
+
+    void UpdateHostPages(size_t virtual_offset, size_t length, bool remap) {
+        const size_t begin = AlignDown(virtual_offset, host_page_size);
+        const size_t end = AlignUp(virtual_offset + length, host_page_size);
+        const auto apply = [&](size_t run_begin, size_t run_end, const HostPage& page) {
+            u8* const address = virtual_base + run_begin;
+            const size_t size = run_end - run_begin;
+            if (!page.mapped) {
+                if (remap) {
+                    void* ret = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                    ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
+                }
+            } else if (remap) {
+                void* ret = mmap(address, size, page.prot, MAP_SHARED | MAP_FIXED, fd, off_t(page.host_offset));
+                ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
+            } else {
+                int ret = mprotect(address, size, page.prot);
+                ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
+            }
+        };
+        size_t run_begin = begin;
+        HostPage run = ResolveHostPage(begin);
+        for (size_t offset = begin + host_page_size; offset < end; offset += host_page_size) {
+            const HostPage page = ResolveHostPage(offset);
+            const bool continues = page.mapped == run.mapped &&
+                                   (!page.mapped || (page.prot == run.prot &&
+                                                     page.host_offset == run.host_offset + (offset - run_begin)));
+            if (!continues) {
+                apply(run_begin, offset, run);
+                run_begin = offset;
+                run = page;
+            }
+        }
+        apply(run_begin, end, run);
+    }
+
     int fd{-1}; // memfd file descriptor, -1 is the error value of memfd_create
     FreeRegionManager free_manager{};
+    size_t host_page_size{PageAlignment};
+    u32* page_states{};
+    size_t page_states_size{};
+    std::mutex page_states_mutex;
 };
 
 #endif // ^^^ POSIX ^^^
@@ -1995,6 +2267,8 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
         if (pages_begin < pages_end &&
             [&] {
                 std::scoped_lock decommit{g_backing_decommit_mutex};
+                Permafrost::ForgetPages(reinterpret_cast<u8*>(pages_begin),
+                                       reinterpret_cast<u8*>(pages_end));
                 return VirtualFree(reinterpret_cast<void*>(pages_begin), pages_end - pages_begin,
                                    MEM_DECOMMIT);
             }()) {
@@ -2118,6 +2392,7 @@ size_t HostMemory::ReleaseBackingRegion(size_t physical_offset, size_t length) {
     }
     size_t released = 0;
     std::scoped_lock decommit{g_backing_decommit_mutex};
+    Permafrost::ForgetPages(reinterpret_cast<u8*>(pages_begin), reinterpret_cast<u8*>(pages_end));
     ForEachCommittedRun(reinterpret_cast<u8*>(pages_begin), reinterpret_cast<u8*>(pages_end),
                         [&](u8* run_begin, u8* run_end) {
                             if (VirtualFree(run_begin, run_end - run_begin, MEM_DECOMMIT)) {
@@ -2174,6 +2449,13 @@ void ForEachPageRun(const std::bitset<N>& mask, F&& f) {
 size_t ReleaseRuns(u8* span, const std::bitset<SPAN_PAGES>& candidates) {
     using Mask = std::bitset<SPAN_PAGES>;
     std::scoped_lock hold{g_backing_decommit_mutex};
+    // A granule Permafrost moved is its own: on probation its pages are no-access, and a read
+    // back fills them outside this mutex. A resident one stays so while the mutex is held.
+    for (size_t granule = 0; granule < SPAN_SIZE; granule += Permafrost::GRANULE_SIZE) {
+        if (!Permafrost::IsResident(span + granule)) {
+            return 0;
+        }
+    }
     g_held_span.store(reinterpret_cast<uintptr_t>(span));
     while (g_commits_in_flight.load() != 0) {
         YieldProcessor();
@@ -2338,11 +2620,50 @@ std::optional<DramRegion> QueryDramRegion(const void* host) {
         return std::nullopt;
     }
     const auto* const region = static_cast<const u8*>(info.BaseAddress);
-    return DramRegion{
+    DramRegion result{
         .begin = (std::max)(region, base),
         .end = (std::min)(region + info.RegionSize, base + size),
         .untouched = info.State == MEM_RESERVE,
     };
+    if (result.untouched && Permafrost::Active()) {
+        // Reserved pages of a granule on disk hold data: the run stops at the first such granule,
+        // and one that starts in it is not untouched.
+        const u8* const granule =
+            base + Common::AlignDown(static_cast<size_t>(address - base), Permafrost::GRANULE_SIZE);
+        result.begin = (std::max)(result.begin, granule);
+        result.end = Permafrost::ClipUntouched(result.begin, result.end);
+        if (result.end == result.begin) {
+            result.end = (std::min)(granule + Permafrost::GRANULE_SIZE, base + size);
+            result.untouched = false;
+        }
+    }
+    return result;
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<GuestZeroCensus> CensusGuestZeroMemory() {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (g_backing_is_file.load(std::memory_order_acquire) ||
+        g_backing_is_section.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    const u8* const base = g_backing_base.load(std::memory_order_acquire);
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    if (base == nullptr) {
+        return std::nullopt;
+    }
+    // One granule at a time under the decommit mutex: no clear decommits a page and no swap step
+    // moves the granule while it is read. A granule the swap holds is left out.
+    return CensusZeroPages(base, size, Permafrost::GRANULE_SIZE, [](const u8* granule, auto&& count) {
+        std::scoped_lock hold{g_backing_decommit_mutex};
+        if (!Permafrost::IsResident(granule)) {
+            return false;
+        }
+        count();
+        return true;
+    });
 #else
     return std::nullopt;
 #endif
@@ -2361,6 +2682,9 @@ std::string HostMemoryCommitStats() {
         if (const u64 failures = g_commit_failures.load(std::memory_order_relaxed); failures != 0) {
             stats += ", " + std::to_string(failures) + " DRAM commit failures (last error " +
                      std::to_string(g_last_commit_error.load(std::memory_order_relaxed)) + ")";
+        }
+        if (Permafrost::Active()) {
+            stats += "; " + Permafrost::Describe();
         }
         return stats;
     }
@@ -2422,6 +2746,36 @@ std::string HostMemoryCommitStats() {
 #else
     return {};
 #endif
+}
+
+bool GuestSwapActive() {
+    return Permafrost::Active();
+}
+
+u64 StepGuestSwap(u64 want, GuestSwapPressure pressure) {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    constexpr Permafrost::Urgency URGENCY[]{Permafrost::Urgency::Watch, Permafrost::Urgency::Normal,
+                                           Permafrost::Urgency::Urgent,
+                                           Permafrost::Urgency::Emergency};
+    return Permafrost::Step(want, URGENCY[static_cast<size_t>(pressure)], g_backing_decommit_mutex)
+        .released;
+#else
+    (void)want;
+    (void)pressure;
+    return 0;
+#endif
+}
+
+bool RefillGuestSwapReserve() {
+    return Permafrost::RefillReserve();
+}
+
+bool GuestSwapReserveReleased() {
+    return Permafrost::ReserveReleased();
+}
+
+std::string DescribeGuestSwap() {
+    return Permafrost::Describe(true);
 }
 
 void FormatBackingFault(char* out, size_t out_size, uintptr_t address) {

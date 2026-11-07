@@ -50,7 +50,7 @@ public:
     void LogBacktrace(KernelCore& kernel);
 
     // Wait for an interrupt.
-    void Idle();
+    void Idle(KernelCore& kernel);
 
     /// How idle cores wait for an interrupt; read when the cores are created. Guest threads hand
     /// work between cores thousands of times a second (a mutex unlocked on one core wakes its

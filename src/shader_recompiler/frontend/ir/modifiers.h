@@ -31,6 +31,8 @@ struct FpControl {
     bool no_contraction{false};
     FpRounding rounding{FpRounding::DontCare};
     FmzMode fmz_mode{FmzMode::DontCare};
+    /// fp16 math lowered to fp32 that flushed denormals as fp16 (LowerFp16ToFp32).
+    bool half_ftz{false};
 };
 static_assert(sizeof(FpControl) <= sizeof(u32));
 
@@ -39,7 +41,9 @@ union TextureInstInfo {
     BitField<0, 16, u32> descriptor_index;
     BitField<16, 3, TextureType> type;
     BitField<19, 1, u32> is_depth;
+    BitField<19, 1, u32> image_byte_address;
     BitField<20, 1, u32> has_bias;
+    BitField<20, 1, u32> image_coherent;
     BitField<21, 1, u32> has_lod_clamp;
     BitField<22, 1, u32> relaxed_precision;
     BitField<23, 2, u32> gather_component;

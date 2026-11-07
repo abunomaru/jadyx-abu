@@ -201,6 +201,7 @@ void TranslatorVisitor::ATOM(u64 insn) {
     GlobalAtomic(*this, atom.dest_reg, atom.operand_reg, offset, atom.size, atom.op, true);
 }
 
+/// ATOM.CAS Rd, [Ra + imm], Rb: if the word equals Rb, store Rb+1; Rd gets the old word.
 void TranslatorVisitor::ATOM_cas(u64 insn) {
     union {
         u64 raw;
@@ -212,10 +213,13 @@ void TranslatorVisitor::ATOM_cas(u64 insn) {
     if (atom.size != 0) {
         throw NotImplementedException("ATOM.CAS size {}", atom.size.Value());
     }
-    // The new value sits in the register after the compared one.
-    const IR::Reg compare_reg{atom.compare_reg};
-    const IR::U32 value{compare_reg == IR::Reg::RZ ? ir.Imm32(0) : X(compare_reg + 1)};
     const IR::U64 offset{AtomOffset(*this, insn)};
+    // The new value sits in the register after the compared one. RZ has none (it compares zero
+    // and stores zero), and the register after R254 is RZ: IR::Reg arithmetic refuses both.
+    const IR::Reg compare_reg{atom.compare_reg};
+    const IR::U32 value{compare_reg == IR::Reg::RZ || compare_reg == IR::Reg::R254
+                            ? ir.Imm32(0)
+                            : X(compare_reg + 1)};
     X(atom.dest_reg, ir.GlobalAtomicCompareExchange(offset, X(compare_reg), value));
 }
 

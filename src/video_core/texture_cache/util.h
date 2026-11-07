@@ -21,6 +21,10 @@
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
+namespace Tegra::Texture {
+class UnswizzleWorker;
+}
+
 namespace VideoCommon {
 
 using Tegra::Texture::TICEntry;
@@ -65,8 +69,13 @@ void SetOpaqueAstcToBc1(bool enabled) noexcept;
 /// True when a new ASTC image should be scanned for alpha (DetectOpaqueAstc) before it is made.
 [[nodiscard]] bool WantsOpaqueAstcScan(const ImageInfo& info) noexcept;
 
-/// Sets info.astc_opaque from the image's guest ASTC blocks (Tegra::Texture::ASTC::MayHaveAlpha).
+/// Sets info.astc_opaque and info.astc_mask from the image's guest ASTC blocks
+/// (Tegra::Texture::ASTC::ScanAlpha).
 void DetectOpaqueAstc(ImageInfo& info, std::span<const u8> guest_blocks) noexcept;
+
+/// The alpha mask an ASTC image is re-encoded as (BC4 holding the alpha, RGB forced to white or
+/// black when sampled): info.astc_mask when the image would otherwise be BC3, else None.
+[[nodiscard]] AstcMask AstcAlphaMaskFor(const ImageInfo& info) noexcept;
 
 /// The ASTC re-encoding this image gets: astc_recompression, unless it is an array kept
 /// uncompressed (SetAstcArrayRecompression), and BC1 for BC3 when the image has no alpha
@@ -135,7 +144,8 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
 
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
-    std::span<const u8> input, std::span<u8> output, const HostRowLayout& host = {});
+    std::span<const u8> input, std::span<u8> output, const HostRowLayout& host = {},
+    Tegra::Texture::UnswizzleWorker* worker = nullptr);
 
 /// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
 /// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into
@@ -211,5 +221,26 @@ void DeduceBlitImages(ImageInfo& dst_info, ImageInfo& src_info, const ImageBase*
                       const ImageBase* src);
 
 [[nodiscard]] u32 MapSizeBytes(const ImageBase& image);
+
+// TODO: Remove once Debian STABLE no longer has such outdated boost
+// This is a gcc bug where ADL lookup fails for range niebloids of std::span<T>
+// for any given type of the static_vector/small_vector, etc which makes a whole mess
+// for anything using std::span<T> so we just do this terrible hack on older versions of
+// GCC12 because people actually still use stable debian so... yeah
+// One may say: "This is bad for performance" - to which I say, using GCC 12 you already know
+// what kind of bs you will be dealing with anyways.
+template<typename T, size_t N>
+#if BOOST_VERSION >= 108100 || __GNUC__ > 12
+[[nodiscard]] boost::container::small_vector<T, N> FixSmallVectorADL(const boost::container::small_vector<T, N>& v) {
+    return v;
+}
+#else
+[[nodiscard]] std::vector<T> FixSmallVectorADL(const boost::container::small_vector<T, N>& v) {
+    std::vector<T> u;
+    for (auto const& e : v)
+        u.push_back(e);
+    return u;
+}
+#endif
 
 } // namespace VideoCommon

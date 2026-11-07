@@ -74,6 +74,7 @@ OPCODE(SR_WScaleFactorZ,                                    U32,                
 OPCODE(YDirection,                                          F32,                                                                                            )
 OPCODE(ResolutionDownFactor,                                F32,                                                                                            )
 OPCODE(RenderArea,                                          F32x4,                                                                                          )
+OPCODE(StageConstant,                                       F32,            U32,                                                                            )
 
 // Undefined
 OPCODE(UndefU1,                                             U1,                                                                                             )
@@ -573,6 +574,9 @@ OPCODE(ImageAtomicAnd32,                                    U32,            Opaq
 OPCODE(ImageAtomicOr32,                                     U32,            Opaque,            Opaque,            U32,                                      )
 OPCODE(ImageAtomicXor32,                                    U32,            Opaque,            Opaque,            U32,                                      )
 OPCODE(ImageAtomicExchange32,                               U32,            Opaque,            Opaque,            U32,                                      )
+
+// Software matrix collective.
+OPCODE(TensorMulAdd, U32x2, U32x4, U32x2, U32x2, )
 
 // Warp operations
 OPCODE(LaneId,                                              U32,                                                                                            )

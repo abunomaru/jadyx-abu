@@ -11,6 +11,10 @@ DynarmicExclusiveMonitor::DynarmicExclusiveMonitor(Memory::Memory& memory_, std:
 
 DynarmicExclusiveMonitor::~DynarmicExclusiveMonitor() = default;
 
+static_assert(std::tuple_size_v<decltype(ExclusiveMonitorCheckpoint::reservations)> ==
+                  Dynarmic::ExclusiveMonitor::MaxCheckpointProcessors,
+              "the Pulse and dynarmic exclusive checkpoints must hold the same reservations");
+
 ExclusiveMonitorCheckpoint DynarmicExclusiveMonitor::CaptureCheckpoint() {
     const auto source = monitor.CaptureCheckpoint();
     ExclusiveMonitorCheckpoint state{};

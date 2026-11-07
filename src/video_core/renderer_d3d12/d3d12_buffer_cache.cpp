@@ -11,6 +11,7 @@
 
 #include "common/alignment.h"
 #include "common/logging.h"
+#include "common/write_combined_copy.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/perf_counters.h"
 #include "video_core/renderer_d3d12/d3d12_buffer_cache.h"
@@ -24,6 +25,7 @@
 namespace D3D12 {
 namespace {
 std::atomic_bool uniform_upload_copy_enabled{};
+std::atomic_bool uniform_reuse_enabled{};
 // Buffer::Transition logs the first upload into a buffer between a work's bindings, and Copy the
 // first one it returns to UAV. The GPU thread alone records bindings.
 bool logged_upload_into_uav{};
@@ -31,6 +33,9 @@ bool logged_upload_left_uav{};
 }
 void SetUniformUploadCopy(bool enabled) {
     uniform_upload_copy_enabled.store(enabled, std::memory_order_relaxed);
+}
+void SetUniformReuse(bool enabled) {
+    uniform_reuse_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 
@@ -255,8 +260,11 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, Scheduler& schedul
                                        Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : device{device_}, scheduler{scheduler_}, staging{staging_},
       transfer_buffers{transfer_buffers_}, device_memory{device_memory_},
-      uniform_upload_copy{uniform_upload_copy_enabled.load(std::memory_order_relaxed)} {
-    LOG_INFO(Render, "D3D12: buffer cache runtime ready (short uniform upload copy {})", uniform_upload_copy ? "on" : "off");
+      uniform_upload_copy{uniform_upload_copy_enabled.load(std::memory_order_relaxed)},
+      uniform_reuse{uniform_reuse_enabled.load(std::memory_order_relaxed)} {
+    LOG_INFO(Render, "D3D12: buffer cache runtime ready (short uniform upload copy {}, uniform "
+                     "reuse {})",
+             uniform_upload_copy ? "on" : "off", uniform_reuse ? "on" : "off");
 
 }
 
@@ -406,14 +414,16 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
                                          u32 size) {
     rewritten_count.reset();
     if (trace_buffers) {
-        const bool rewritten = IsEmulatedTopology(topology) || format == IndexFormat::UnsignedByte;
+        const bool rewritten = IsEmulatedTopology(topology) || format == IndexFormat::UnsignedByte ||
+                               NeedsRestartRewrite(format);
         trace_buffers->push_back({.kind = rewritten ? TracedBuffer::Kind::RewrittenIndex
                                                     : TracedBuffer::Kind::Index,
                                   .buffer = &buffer, .offset = offset, .size = size,
                                   .stride = IndexSize(format),
                                   .device_addr = buffer.CpuAddr() + offset});
     }
-    if (!IsEmulatedTopology(topology) && format != IndexFormat::UnsignedByte) {
+    if (!IsEmulatedTopology(topology) && format != IndexFormat::UnsignedByte &&
+        !NeedsRestartRewrite(format)) {
         buffer.Transition(D3D12_RESOURCE_STATE_GENERIC_READ);
         pending_index = D3D12_INDEX_BUFFER_VIEW{
             .BufferLocation = buffer.Address() + offset,
@@ -423,10 +433,10 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         };
         return;
     }
-    // D3D12 has neither these topologies nor 8-bit indices: rewrite the guest's indices on the
+    // D3D12 has neither these topologies nor 8-bit indices nor restart values other than all ones:
+    // rewrite the guest's indices on the
     // CPU from guest memory (the Vulkan backend uses compute passes instead), remembering the
     // rewrite: most draws repeat every frame with the same indices.
-    // TODO: inline index draws (inline_index_draw_indexes) never reach guest memory.
     if (!logged_rewrite) {
         LOG_INFO(Render, "D3D12: rewriting indexed draws on the CPU (topology {}, format {})",
                  static_cast<u32>(topology), static_cast<u32>(format));
@@ -436,23 +446,38 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
     const u64 byte_offset = offset + static_cast<u64>(first) * index_size;
     const IndexRewriteCache::Key key{.buffer_id = buffer.Id(), .offset = byte_offset,
                                      .count = num_indices, .format = static_cast<u8>(index_size),
-                                     .topology = static_cast<u8>(topology)};
+                                     .topology = static_cast<u8>(topology),
+                                     .restart = index_restart.value_or(0),
+                                     .has_restart = index_restart.has_value()};
     IndexRewriteCache::Entry* entry = rewrite_cache.Find(key);
-    if (entry && entry->generation == buffer.Generation()) {
+    // The inline buffer's generation says nothing: each draw brings its own indices.
+    const bool is_inline = !inline_indices.empty();
+    if (entry && !is_inline && entry->generation == buffer.Generation()) {
         VideoCore::Perf::Add(VideoCore::Perf::Counter::IndexRewriteReuses, 1);
         BindRewrittenIndices(*entry);
         return;
     }
     const auto start = std::chrono::steady_clock::now();
     guest_indices.resize(static_cast<size_t>(num_indices) * index_size);
-    device_memory.ReadBlockUnsafe(buffer.CpuAddr() + byte_offset, guest_indices.data(),
-                                  guest_indices.size());
+    if (is_inline) {
+        const size_t available =
+            byte_offset < inline_indices.size() ? inline_indices.size() - byte_offset : 0;
+        const size_t bytes = std::min(available, guest_indices.size());
+        if (bytes != 0) {
+            std::memcpy(guest_indices.data(), inline_indices.data() + byte_offset, bytes);
+        }
+        std::fill(guest_indices.begin() + bytes, guest_indices.end(), u8{0});
+    } else {
+        device_memory.ReadBlockUnsafe(buffer.CpuAddr() + byte_offset, guest_indices.data(),
+                                      guest_indices.size());
+    }
     if (entry && entry->source == guest_indices) {
         // Another part of the buffer was written, not these indices.
         entry->generation = buffer.Generation();
         VideoCore::Perf::Add(VideoCore::Perf::Counter::IndexRewriteRechecks, 1);
     } else {
-        const auto read = [&](u32 i) -> u32 {
+        const u32 cut = format == IndexFormat::UnsignedInt ? 0xFFFFFFFFu : 0xFFFFu;
+        const auto guest_index = [&](u32 i) -> u32 {
             const u8* const data = guest_indices.data() + static_cast<size_t>(i) * index_size;
             switch (index_size) {
             case 1:
@@ -469,6 +494,10 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
             }
             }
         };
+        const auto read = [&](u32 i) -> u32 {
+            const u32 value = guest_index(i);
+            return value == index_restart ? cut : value;
+        };
         AssembleTopology(topology, num_indices, read, rewrite_scratch);
         entry = &rewrite_cache.Obtain(key);
         entry->generation = buffer.Generation();
@@ -482,6 +511,14 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
                                               std::chrono::steady_clock::now() - start)
                                               .count()));
     BindRewrittenIndices(*entry);
+}
+
+bool BufferCacheRuntime::NeedsRestartRewrite(IndexFormat format) const noexcept {
+    if (!index_restart) {
+        return false;
+    }
+    const u32 cut = format == IndexFormat::UnsignedShort ? 0xFFFFu : 0xFFFFFFFFu;
+    return (*index_restart & cut) != cut;
 }
 
 void BufferCacheRuntime::EmulateTopology(PrimitiveTopology topology, u32 first, u32 count) {
@@ -607,7 +644,49 @@ std::span<u8> BufferCacheRuntime::BindMappedUniformBuffer(size_t, u32, u32 size)
     if (reach > size) {
         std::memset(upload.mapped.data() + size, 0, reach - size);
     }
+    last_uniform_address = upload.address;
     return upload.mapped.first(size);
+}
+
+bool BufferCacheRuntime::BindGuestUniformBuffer(size_t stage, u32 index, DAddr device_addr,
+                                                u32 size) {
+    // Traced uniforms keep their own copy per draw.
+    if (!uniform_reuse || trace_buffers || size == 0) {
+        return false;
+    }
+    // Compared in place: a buffer split across separately mapped pages takes the copying path.
+    const u8* const guest = device_memory.GetSpan(device_addr, size);
+    if (!guest) {
+        return false;
+    }
+    StreamedUniform& streamed = streamed_uniforms[stage][index];
+    const u32 reach = descriptor_queue ? descriptor_queue->ConstantBufferReach(size) : size;
+    // The stream hands out memory for the submission being recorded only: an earlier copy is
+    // bound again within its tick alone. It still holds zeros up to its own reach.
+    if (streamed.tick == scheduler.CurrentTick() && streamed.device_addr == device_addr &&
+        streamed.size == size && streamed.reach >= reach &&
+        std::memcmp(streamed.bytes.data(), guest, size) == 0) {
+        VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::CbvReused, 1);
+        if (descriptor_queue) {
+            descriptor_queue->AddConstantBuffer(streamed.address, size);
+        }
+        return true;
+    }
+    // Guest memory is read once: into the cached copy, then from it to the stream.
+    streamed.bytes.resize(size);
+    std::memcpy(streamed.bytes.data(), guest, size);
+    const std::span<u8> mapped = BindMappedUniformBuffer(stage, index, size);
+    if (UseWriteCombinedUniformCopy(size)) {
+        Common::CopyToWriteCombined(mapped.data(), streamed.bytes.data(), size);
+    } else {
+        std::memcpy(mapped.data(), streamed.bytes.data(), size);
+    }
+    streamed.device_addr = device_addr;
+    streamed.tick = scheduler.CurrentTick();
+    streamed.address = last_uniform_address;
+    streamed.size = size;
+    streamed.reach = reach;
+    return true;
 }
 
 void BufferCacheRuntime::BindUniformBuffer(Buffer& buffer, u32 offset, u32 size) {

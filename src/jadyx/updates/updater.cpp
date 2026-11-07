@@ -266,6 +266,15 @@ Runtime ProductionRuntime() {
     // verified package goes in through the Device Portal, guided from a phone or PC.
     if (!IsXbox())
         runtime.deploy = DeployPackage;
+    // Jadyx NX (the Switch 1 + Switch 2 fork, package-appx.ps1 -Nx) installs next to Jadyx: the
+    // official releases are another app, so it neither checks for them nor installs them.
+    try {
+        if (winrt::Windows::ApplicationModel::Package::Current().Id().Name() == L"Jadyx.NX") {
+            runtime.automatic_check = false;
+            runtime.deploy = nullptr;
+        }
+    } catch (...) {
+    }
     return runtime;
 }
 } // namespace

@@ -6,6 +6,7 @@
 // Shared by the files implementing the texture cache runtime (d3d12_texture_cache.cpp,
 // d3d12_texture_formats.cpp, d3d12_image_*.cpp, ...). Not meant for other users.
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <optional>
@@ -20,8 +21,8 @@
 #include "video_core/renderer_d3d12/d3d12_log.h"
 #include "video_core/renderer_d3d12/d3d12_resource_utils.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
-#include "video_core/renderer_d3d12/d3d12_texture_downscale.h"
 #include "video_core/surface.h"
+#include "video_core/texture_cache/image_info.h"
 #include "video_core/textures/texture.h"
 
 namespace D3D12::TextureDetail {
@@ -41,8 +42,16 @@ constexpr u32 AlignPitch(u32 value) {
 // Format tables and Maxwell -> D3D12 enums (d3d12_texture_formats.cpp).
 FormatInfo BaseFormat(PixelFormat format);
 FormatInfo AstcFormat(PixelFormat format, Settings::AstcRecompression recompression);
+/// The format an ASTC image is held in: AstcFormat of its recompression, or BC4 for the alpha
+/// masks of VideoCommon::AstcAlphaMaskFor.
+FormatInfo AstcFormatFor(const VideoCommon::ImageInfo& info);
+/// Reads an alpha mask held in BC4 as the guest's RGBA: RGB white or black, alpha from red.
+void AstcMaskSwizzle(VideoCommon::AstcMask mask,
+                     std::array<Tegra::Texture::SwizzleSource, 4>& swizzle);
 FormatInfo NativeFormat(PixelFormat format);
 std::optional<FormatInfo> DecodedBcFormat(PixelFormat format);
+/// Whether d3d12_bcn_decoder.comp decodes this guest format (BC1-5, BC7).
+bool CanDecodeBcnOnGpu(PixelFormat format);
 D3D12_RESOURCE_DIMENSION Dimension(ImageType type);
 D3D12_TEXTURE_ADDRESS_MODE AddressMode(Tegra::Texture::WrapMode mode);
 D3D12_COMPARISON_FUNC Compare(Tegra::Texture::DepthCompareFunc func);
@@ -103,11 +112,14 @@ inline bool logged_depth_stencil_download = false;
 inline bool logged_self_copy = false;
 inline bool logged_decoded_copy = false;
 inline bool logged_gpu_astc = false;
+inline bool logged_gpu_bcn = false;
+inline bool logged_gpu_unswizzle = false;
 inline bool logged_reinterpret_copy = false;
 inline bool logged_depth_size = false;
 inline bool logged_view_format = false;
 inline bool logged_self_blit = false;
 inline bool logged_msaa_blit = false;
+inline bool logged_msaa_copy = false;
 inline bool logged_mixed_blit = false;
 inline bool logged_integer_blit = false;
 inline bool logged_blit_target = false;
@@ -118,13 +130,18 @@ inline bool logged_min_max_filter = false;
 inline bool logged_point_reduction = false;
 inline bool logged_srv_fallback = false;
 inline bool logged_view_family = false;
-inline bool logged_downscaled_copy = false;
 
 // Runtime toggles (Set* in d3d12_texture_cache.cpp).
 /// Sampler keys for SamplerHeap; 0 is the presenter's linear sampler.
 inline std::atomic<u64> next_sampler_key{1};
 inline std::atomic<bool> decode_bc_arrays{true};
 inline std::atomic<bool> gpu_astc_decode{true};
+inline std::atomic<bool> gpu_bc_decode{true};
+inline std::atomic<bool> gpu_unswizzle{true};
+inline std::atomic<u64> heap_compaction_budget{0};
+inline std::atomic<u64> heap_compaction_moved{0};
+inline std::atomic<u64> heap_compaction_bytes{0};
+inline std::atomic<bool> astc_drop_top_level{false};
 inline std::atomic<int> gpu_astc_verify{0}; ///< GPU ASTC uploads left to check against the CPU
 inline std::atomic<bool> gpu_astc_sync{false};
 inline std::atomic<int> stencil_blit_verify{0}; ///< depth-stencil blits left to read back
@@ -134,11 +151,19 @@ inline std::atomic<bool> emulate_min_max_filter{false};
 inline std::atomic<bool> gpu_astc_fresh{false};
 /// Texture heap bytes above which clean textures are evicted with headroom left (0: no cap).
 inline std::atomic<u64> texture_memory_cap{0};
-/// Sampled-image mip levels the host copy may omit ("texture_scale=" in boot.cfg; 0 keeps all).
-inline std::atomic<u32> texture_downscale_levels{0};
+/// App headroom kept clear of the textures: above it the cap grows into the rest (0: fixed cap).
+inline std::atomic<u64> texture_memory_line{0};
+/// The memory coordinator asked the textures to give way (SetTextureYield).
+inline std::atomic<bool> texture_yield{false};
+/// Published each frame for the memory coordinator: texture heap bytes and the cap they ran with.
+inline std::atomic<u64> texture_heap_published{0};
+inline std::atomic<u64> texture_cap_published{0};
 
 constexpr u64 ASTC_RGBA_SCRATCH_BUDGET = 32ULL * 1024 * 1024;
 constexpr u64 ASTC_BC_SCRATCH_BUDGET = 8ULL * 1024 * 1024;
+/// Smaller uploads stay on the CPU: the dispatch and the extra copy cost more than they save.
+constexpr u64 GPU_UNSWIZZLE_MIN_BYTES = 64ULL * 1024;
+constexpr u64 GPU_UNSWIZZLE_SCRATCH_BUDGET = 8ULL * 1024 * 1024;
 
 } // namespace D3D12::TextureDetail
 

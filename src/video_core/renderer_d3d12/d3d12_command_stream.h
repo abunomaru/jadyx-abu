@@ -36,6 +36,15 @@ public:
     void Record(Func&& func) {
         recorder.Record(std::forward<Func>(func));
     }
+    /// func(list, data pointer), reading a copy of data.
+    template <typename T, typename Func>
+    void Record(std::span<const T> data, Func&& func) {
+        recorder.Record(data, std::forward<Func>(func));
+    }
+    /// Whether recorded calls reach the list later, on the recorder's worker.
+    [[nodiscard]] bool IsThreaded() const noexcept {
+        return recorder.IsThreaded();
+    }
 
     // --- Barriers and pipeline state -------------------------------------------------------
 
@@ -178,6 +187,10 @@ public:
     }
     void SetGraphicsRootConstantBufferView(UINT param, D3D12_GPU_VIRTUAL_ADDRESS address) {
         Probed("SetGraphicsRootConstantBufferView", [=](List* list) { list->SetGraphicsRootConstantBufferView(param, address); },
+               [=] { return fmt::format("param={} VA={:x}", param, address); });
+    }
+    void SetGraphicsRootShaderResourceView(UINT param, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        Probed("SetGraphicsRootShaderResourceView", [=](List* list) { list->SetGraphicsRootShaderResourceView(param, address); },
                [=] { return fmt::format("param={} VA={:x}", param, address); });
     }
     void SetGraphicsRootUnorderedAccessView(UINT param, D3D12_GPU_VIRTUAL_ADDRESS address) {
@@ -509,6 +522,22 @@ public:
                });
         Breadcrumb(token, true);
     }
+    void ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
+                            UINT src_subresource, DXGI_FORMAT format) {
+        if (!dst || !src) {
+            return;
+        }
+        Probed("ResolveSubresource",
+               [=](List* list) {
+                   list->ResolveSubresource(dst, dst_subresource, src, src_subresource, format);
+               },
+               [=] {
+                   return fmt::format("to {} sub {} from {} sub {} format {}",
+                                      DescribeResource(dst), dst_subresource,
+                                      DescribeResource(src), src_subresource,
+                                      static_cast<u32>(format));
+               });
+    }
     void BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
         if (!ValidQuery("BeginQuery", heap)) {
             return;
@@ -589,9 +618,7 @@ private:
         recorder.Record([call, func = std::forward<Func>(func),
                          describe = std::forward<Describe>(describe)](List* list) mutable {
             func(list);
-            using Stored = decltype(func);
-            const auto run = [](void* ctx, List* scratch) { (*static_cast<Stored*>(ctx))(scratch); };
-            ProbeAppend(list, run, &func, call, describe());
+            ProbeAppend(list, func, call, describe());
         });
     }
 
@@ -612,14 +639,16 @@ private:
             recorder.Record(span, std::forward<Func>(func));
             return;
         }
-        recorder.Record(span, [call, func = std::forward<Func>(func),
+        recorder.Record(span, [call, count, func = std::forward<Func>(func),
                                describe = std::forward<Describe>(describe)](
                                   List* list, const T* copy) mutable {
             func(list, copy);
-            auto once = [&func, copy](List* scratch) { func(scratch, copy); };
-            using Once = decltype(once);
-            const auto run = [](void* ctx, List* scratch) { (*static_cast<Once*>(ctx))(scratch); };
-            ProbeAppend(list, run, &once, call, describe(copy));
+            // The probe may run it again after the recorder has dropped its copy of the data.
+            ProbeAppend(list,
+                        [func, data = std::vector<T>(copy, copy + count)](List* scratch) mutable {
+                            func(scratch, data.data());
+                        },
+                        call, describe(copy));
         });
     }
 

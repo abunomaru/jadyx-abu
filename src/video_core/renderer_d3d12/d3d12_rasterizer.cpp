@@ -4,9 +4,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <unordered_map>
+#include <vector>
 
 #include <spirv_to_dxil.h>
 
@@ -21,7 +24,9 @@
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
 #include "video_core/memory_manager.h"
+#include "video_core/cpu_write_queue.h"
 #include "video_core/perf_counters.h"
+#include "video_core/renderer_d3d12/d3d12_async_pipelines.h"
 #include "video_core/renderer_d3d12/d3d12_barrier_batch.h"
 #include "video_core/renderer_d3d12/d3d12_draw_metrics.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_key_tracking.h"
@@ -33,23 +38,36 @@ namespace D3D12 {
 
 namespace {
 
-/// Guest query types the D3D12 query cache counts on the host (see d3d12_query_cache.cpp); the
-/// rest are written by QueryFallback. Same mapping as the OpenGL backend.
-std::optional<VideoCore::QueryType> MaxwellToVideoCoreQuery(VideoCommon::QueryType type) {
-    switch (type) {
-    case VideoCommon::QueryType::PrimitivesGenerated:
-    case VideoCommon::QueryType::VtgPrimitivesOut:
-        return VideoCore::QueryType::PrimitivesGenerated;
-    case VideoCommon::QueryType::ZPassPixelCount64:
-        return VideoCore::QueryType::SamplesPassed;
-    case VideoCommon::QueryType::StreamingPrimitivesSucceeded:
-        return VideoCore::QueryType::TfbPrimitivesWritten;
-    default:
-        return std::nullopt;
+std::atomic<u32> submit_draws{512};
+
+/// Some color or depth target of the framebuffer has had no draw recorded to it yet.
+bool HasNewTarget(const Framebuffer& framebuffer) {
+    for (size_t index = 0; index < VideoCommon::NUM_RT; ++index) {
+        const Image* const image = framebuffer.ColorImage(index);
+        if (image && !image->TargetDrawn()) {
+            return true;
+        }
+    }
+    const Image* const depth = framebuffer.DepthImage();
+    return depth && !depth->TargetDrawn();
+}
+
+void MarkTargetsDrawn(const Framebuffer& framebuffer) {
+    for (size_t index = 0; index < VideoCommon::NUM_RT; ++index) {
+        if (const Image* const image = framebuffer.ColorImage(index)) {
+            image->MarkTargetDrawn();
+        }
+    }
+    if (const Image* const depth = framebuffer.DepthImage()) {
+        depth->MarkTargetDrawn();
     }
 }
 
 } // Anonymous namespace
+
+void SetSubmitDraws(u32 draws) {
+    submit_draws.store(draws, std::memory_order_relaxed);
+}
 
 bool RasterizerD3D12::CullsEveryPrimitive() const {
     // D3D12 has no cull mode for both faces (MaxwellToD3D12::CullMode): those draws are skipped.
@@ -81,22 +99,24 @@ bool RasterizerD3D12::CullsEveryPrimitive() const {
 
 RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu_,
                                  Tegra::MaxwellDeviceMemoryManager& device_memory_,
-                                 const Device& device, Scheduler& scheduler_,
+                                 const Device& device_, Scheduler& scheduler_,
                                  const ShaderCompiler& compiler,
                                  BufferCacheRuntime& buffer_runtime_,
                                  TextureCacheRuntime& texture_runtime,
                                  DescriptorRing& descriptor_ring_, SamplerHeap& sampler_heap_,
                                  BlitImageHelper& blit_helper_, StagingBufferPool& staging)
-    : gpu{gpu_}, device_memory{device_memory_}, scheduler{scheduler_}, staging{staging},
+    : gpu{gpu_}, device_memory{device_memory_}, device{device_}, scheduler{scheduler_}, staging{staging},
       buffer_runtime{buffer_runtime_}, texture_runtime{texture_runtime}, descriptor_ring{descriptor_ring_},
       sampler_heap{sampler_heap_}, blit_helper{blit_helper_},
       indirect_args{device, scheduler_, staging},
       stream_output{device, scheduler_, compiler},
+      tess_emulation{device, scheduler_, compiler},
       descriptor_queue{device.Get(), descriptor_ring_},
       buffer_cache{device_memory_, buffer_runtime_}, texture_cache{texture_runtime, device_memory_},
       pipeline_cache{device_memory_, device, compiler, texture_runtime, gpu_.ShaderNotify()},
       local_memory_pool{device, scheduler_},
-      query_cache{*this, device_memory_, device, scheduler_},
+      query_runtime{device, scheduler_, compiler, buffer_cache, buffer_runtime_, staging},
+      query_cache{gpu_, *this, device_memory_, query_runtime},
       conditional_rendering{device, scheduler_, compiler, query_cache, buffer_cache},
       accelerate_dma{buffer_cache, texture_cache, draw_hunt},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_},
@@ -121,7 +141,221 @@ RasterizerD3D12::~RasterizerD3D12() {
     buffer_runtime.SetDescriptorQueue(nullptr);
 }
 
+bool RasterizerD3D12::WaitPendingPipeline(GraphicsPipeline* pipeline, u32 vertices,
+                                          u32 instances, bool indexed) {
+    // Still building on a worker (async_pipelines, pso_budget): skipped, unless the draw matters
+    // enough to wait for it.
+    using VideoCore::FramePipeline::Mode;
+    const AsyncPipelines mode = GetAsyncPipelines();
+    // The budget belongs to Balanced: under it Wait (Off) used to skip too once the frame's few
+    // ms were spent, and Skip (Full) waited, so every choice behaved alike.
+    const Mode budget = mode == AsyncPipelines::Balanced ? GetPsoBudget() : Mode::Off;
+    const PendingDraw draw{
+        .vertices = vertices,
+        .instances = instances,
+        .indexed = indexed,
+        .new_target = HasNewTarget(*texture_cache.GetFramebuffer()),
+    };
+    // Off waits for every draw, here or in the pipeline cache when no budget is configured.
+    const PendingDrawAction unbudgeted = mode == AsyncPipelines::Off
+                                             ? PendingDrawAction::WaitBudget
+                                             : DecidePendingDraw(mode, GetWaitSmallDraws(), draw);
+    PendingDrawAction action = unbudgeted;
+    if (budget != Mode::Off) {
+        const PendingDrawAction budgeted =
+            DecideBudgetedDraw(GetWaitSmallDraws(), draw, PendingWaitBudgetLeft());
+        if (budget == Mode::On) {
+            action = budgeted;
+        } else if ((budgeted == PendingDrawAction::Skip) !=
+                   (unbudgeted == PendingDrawAction::Skip)) {
+            CountBudgetDifference(budgeted == PendingDrawAction::Skip);
+        }
+    }
+    const auto wait_start = std::chrono::steady_clock::now();
+    const auto add_wait = [&wait_start] {
+        AddPendingWait(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - wait_start)
+                                            .count()));
+    };
+    if (budget == Mode::On && action == PendingDrawAction::WaitBudget) {
+        // The budget has to cut the wait itself: checked only before waiting, one driver build
+        // cost 100-330 ms of a frame "within the budget" and the game dropped to 20 fps.
+        if (pipeline_cache.WaitPendingFor(pipeline, PendingWaitBudgetRemaining())) {
+            CountPendingDraw(action);
+            add_wait();
+            return pipeline_cache.WaitPending(pipeline) != nullptr;
+        }
+        add_wait();
+        action = DecideBudgetedDraw(GetWaitSmallDraws(), draw, false);
+    }
+    CountPendingDraw(action);
+    if (action == PendingDrawAction::Skip) {
+        return false;
+    }
+    const bool built = pipeline_cache.WaitPending(pipeline) != nullptr;
+    add_wait();
+    return built;
+}
+
+void RasterizerD3D12::DrawVertexTextureRuns(const GraphicsPipeline& pipeline, bool is_indexed,
+                                            u32 instance_count) {
+    using Maxwell = Tegra::Engines::Maxwell3D::Regs;
+    using Topology = Maxwell::PrimitiveTopology;
+    const GraphicsPipeline::VertexTextureHandle source = *pipeline.GetVertexTextureHandle();
+    const auto& regs = maxwell3d->regs;
+    auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& attribute = regs.vertex_attrib_format[source.attribute];
+    const u32 stream_index = attribute.buffer;
+    const auto& stream = regs.vertex_streams[stream_index];
+    const bool holds_words = attribute.size == Maxwell::VertexAttribute::Size::Size_R32 ||
+                             attribute.size == Maxwell::VertexAttribute::Size::Size_R32_G32 ||
+                             attribute.size == Maxwell::VertexAttribute::Size::Size_R32_G32_B32 ||
+                             attribute.size == Maxwell::VertexAttribute::Size::Size_R32_G32_B32_A32;
+    if (attribute.constant != 0 || !stream.IsEnabled() || !holds_words ||
+        source.component >= attribute.ComponentCount()) {
+        BUG_TRACK_KEY(DrawSkipped, reinterpret_cast<std::uintptr_t>(&pipeline),
+                      "draw skipped: unreadable per-primitive texture handle (attribute {} "
+                      "{:#x}, PS {:016x})",
+                      source.attribute, attribute.hex, pipeline.Key().unique_hashes[5]);
+        return;
+    }
+    const GPUVAddr words = stream.Address() + attribute.offset + source.component * sizeof(u32);
+    const u32 count = is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
+    const u32 first = is_indexed ? draw.index_buffer.first : draw.vertex_buffer.first;
+    const auto& restart = regs.primitive_restart;
+
+    const auto read_vertex = [&](u32 element, u32& vertex) {
+        if (!is_indexed) {
+            vertex = first + element;
+            return true;
+        }
+        u32 index{};
+        if (!draw.inline_index_draw_indexes.empty()) {
+            const size_t offset = (size_t{first} + element) * sizeof(u32);
+            if (offset + sizeof(u32) > draw.inline_index_draw_indexes.size()) {
+                return false;
+            }
+            std::memcpy(&index, draw.inline_index_draw_indexes.data() + offset, sizeof(u32));
+        } else {
+            const GPUVAddr address = draw.index_buffer.StartAddress() +
+                                     (u64{first} + element) * draw.index_buffer.FormatSizeInBytes();
+            switch (draw.index_buffer.format) {
+            case Maxwell::IndexFormat::UnsignedByte:
+                index = gpu_memory->Read<u8>(address);
+                break;
+            case Maxwell::IndexFormat::UnsignedShort:
+                index = gpu_memory->Read<u16>(address);
+                break;
+            case Maxwell::IndexFormat::UnsignedInt:
+                index = gpu_memory->Read<u32>(address);
+                break;
+            }
+        }
+        if (restart.enabled != 0 && index == restart.index) {
+            return false;
+        }
+        vertex = index + draw.base_index;
+        return true;
+    };
+    const auto read_handle = [&](u32 element, u32 previous) {
+        u32 vertex{};
+        return read_vertex(element, vertex)
+                   ? gpu_memory->Read<u32>(words + u64{vertex} * stream.stride)
+                   : previous;
+    };
+
+    // Primitives of a list stand alone, so a run can start at any of them. Strips and fans cannot
+    // be cut without changing their winding: they draw with one texture and report if they had more.
+    const u32 primitive = [&]() -> u32 {
+        switch (draw.topology) {
+        case Topology::Points:
+            return 1;
+        case Topology::Lines:
+            return 2;
+        case Topology::Triangles:
+            return 3;
+        case Topology::Quads:
+        case Topology::LinesAdjacency:
+            return 4;
+        case Topology::TrianglesAdjacency:
+            return 6;
+        default:
+            return 0;
+        }
+    }();
+    const bool per_instance = regs.vertex_stream_instances.IsInstancingEnabled(stream_index);
+    const u32 provoking =
+        primitive != 0 && regs.provoking_vertex == Maxwell::ProvokingVertex::Last ? primitive - 1 : 0;
+
+    // The state is what the guest would have set for each run: the draw path works as for any draw.
+    const auto saved_index = draw.index_buffer;
+    const auto saved_vertex = draw.vertex_buffer;
+    SCOPE_EXIT {
+        draw.index_buffer = saved_index;
+        draw.vertex_buffer = saved_vertex;
+        if (is_indexed) {
+            maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        }
+    };
+    const auto draw_run = [&](u32 run_first, u32 run_count, u32 handle) {
+        if (is_indexed) {
+            draw.index_buffer.first = first + run_first;
+            draw.index_buffer.count = run_count;
+            maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        } else {
+            draw.vertex_buffer.first = first + run_first;
+            draw.vertex_buffer.count = run_count;
+        }
+        DrawRun(is_indexed, instance_count, handle);
+    };
+
+    if (per_instance) {
+        const u32 handle = gpu_memory->Read<u32>(words + u64{draw.base_instance} * stream.stride);
+        if (instance_count > 1) {
+            BUG_TRACK_KEY(UnsupportedState, reinterpret_cast<std::uintptr_t>(&pipeline),
+                          "per-instance texture handle in a draw of {} instances (PS {:016x})",
+                          instance_count, pipeline.Key().unique_hashes[5]);
+        }
+        draw_run(0, count, handle);
+        return;
+    }
+    if (primitive == 0) {
+        const u32 handle = count != 0 ? read_handle(0, 0) : 0;
+        for (u32 element = 1; element < count; ++element) {
+            if (read_handle(element, handle) != handle) {
+                BUG_TRACK_KEY(UnsupportedState, reinterpret_cast<std::uintptr_t>(&pipeline),
+                              "several per-primitive texture handles in topology {} (PS {:016x})",
+                              static_cast<u32>(draw.topology), pipeline.Key().unique_hashes[5]);
+                break;
+            }
+        }
+        draw_run(0, count, handle);
+        return;
+    }
+    if (count < primitive) {
+        draw_run(0, count, 0);
+        return;
+    }
+    u32 run_first = 0;
+    u32 run_handle = read_handle(provoking, 0);
+    for (u32 element = primitive; element + primitive <= count; element += primitive) {
+        const u32 handle = read_handle(element + provoking, run_handle);
+        if (handle != run_handle) {
+            draw_run(run_first, element - run_first, run_handle);
+            run_first = element;
+            run_handle = handle;
+        }
+    }
+    draw_run(run_first, count - run_first, run_handle);
+}
+
 void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
+    DrawRun(is_indexed, instance_count, std::nullopt);
+}
+
+void RasterizerD3D12::DrawRun(bool is_indexed, u32 instance_count,
+                              std::optional<u32> vertex_texture_handle) {
+    DrainCpuWrites();
     const bool full = VideoCommon::FullCapture::Active();
     if (full) {
         ++full_capture_operation;
@@ -167,7 +401,7 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
 
     scheduler.BeginWork();
     hunt.PipelineStart();
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    GraphicsPipeline* pipeline = pipeline_cache.CurrentGraphicsPipeline();
     hunt.PipelineEnd();
     if (!pipeline) {
         if (full) VideoCommon::FullCapture::Event("draw_no_pipeline");
@@ -179,6 +413,10 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
         return;
     }
     hunt.Shaders(pipeline->Key().unique_hashes[1], pipeline->Key().unique_hashes[5]);
+    if (pipeline->GetVertexTextureHandle() && !vertex_texture_handle) [[unlikely]] {
+        DrawVertexTextureRuns(*pipeline, is_indexed, instance_count);
+        return;
+    }
     const DrawMetrics::CacheLockTimer lock_timer;
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     lock_timer.Locked();
@@ -186,6 +424,7 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     const bool trace_this_draw = trace_draws ||
         material_trace.Select(pipeline->Key().unique_hashes[5]) || full;
     PipelineBindings bindings;
+    bindings.vertex_texture_handle = vertex_texture_handle.value_or(0);
     std::vector<VideoCommon::ImageViewId> traced_views;
     std::vector<std::string> traced_filters;
     std::vector<u32> traced_types;
@@ -211,13 +450,48 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
             }
         }
     }
+    const auto& restart = maxwell3d->regs.primitive_restart;
+    buffer_runtime.SetIndexRestart(restart.enabled != 0 ? std::optional<u32>{restart.index}
+                                                        : std::nullopt);
     pipeline->Configure(is_indexed,
                         {*maxwell3d, *gpu_memory, buffer_cache, texture_cache, descriptor_queue,
                          sampler_heap, scheduler},
                         bindings);
+    if ((bindings.unemulated_reduction_stages != 0 || bindings.unemulated_mirror_border))
+        [[unlikely]] {
+        if (bindings.unemulated_reduction_stages != 0) {
+            pipeline_cache.EmulateReduction(pipeline->Key(), bindings.unemulated_reduction_stages);
+        }
+        if (bindings.unemulated_mirror_border) {
+            pipeline_cache.EmulateMirrorBorder(pipeline->Key());
+        }
+        // This draw too: only the bindings seen just now tell that it needs the other pipeline.
+        if (GraphicsPipeline* const emulating = pipeline_cache.CurrentGraphicsPipeline();
+            emulating && emulating != pipeline) {
+            pipeline = emulating;
+            traced_views.clear();
+            traced_filters.clear();
+            traced_types.clear();
+            pipeline->Configure(is_indexed,
+                                {*maxwell3d, *gpu_memory, buffer_cache, texture_cache,
+                                 descriptor_queue, sampler_heap, scheduler},
+                                bindings);
+        }
+    }
     buffer_runtime.SetTraceBuffers(nullptr);
-    if (bindings.unemulated_reduction_stages != 0) [[unlikely]] {
-        pipeline_cache.EmulateReduction(pipeline->Key(), bindings.unemulated_reduction_stages);
+    if (!pipeline->IsBuilt()) [[unlikely]] {
+        const auto& draw = maxwell3d->draw_manager.draw_state;
+        if (!WaitPendingPipeline(pipeline,
+                                 is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count,
+                                 instance_count, is_indexed)) {
+            ++zpass_diag.pending;
+            hunt.Outcome(Hunt::Outcome::NoPipeline);
+            if (trace_this_draw) {
+                TraceDraw("draw skipped (pipeline building)", pipeline, nullptr, traced_views, 0,
+                          0);
+            }
+            return;
+        }
     }
     if (!pipeline->Handle()) {
         BUG_TRACK_KEY(DrawSkipped, reinterpret_cast<std::uintptr_t>(pipeline),
@@ -237,7 +511,8 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     }
     VideoCore::Perf::ScopedNsTimer record_timer{VideoCore::Perf::Counter::DrawRecordNs};
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
-    framebuffer->PrepareAttachments(scheduler, bindings.depth_sampled);
+    framebuffer->PrepareAttachments(scheduler, bindings.depth_sampled,
+                                    pipeline->BoundColorTargets());
     hunt.Target(framebuffer);
 
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -297,6 +572,9 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     }
     RecordDraw(*pipeline, bindings, *framebuffer, params, draw_state.topology);
     full_draw_recorded = true;
+    if (GetAsyncPipelines() == AsyncPipelines::Balanced) {
+        MarkTargetsDrawn(*framebuffer);
+    }
     if (material_trace.Active() && pipeline->Layout().StreamOutput() &&
         maxwell3d->regs.transform_feedback_enabled != 0) {
         try {
@@ -354,7 +632,7 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     }
 }
 
-void RasterizerD3D12::RecordDraw(const GraphicsPipeline& pipeline,
+void RasterizerD3D12::RecordDraw(GraphicsPipeline& pipeline,
                                  const PipelineBindings& bindings, const Framebuffer& framebuffer,
                                  const DrawParams& params,
                                  Maxwell::PrimitiveTopology topology) {
@@ -363,20 +641,110 @@ void RasterizerD3D12::RecordDraw(const GraphicsPipeline& pipeline,
     BindDrawState(pipeline, bindings, framebuffer, params, topology, compatible);
     CommandStream* const cmd = scheduler.CommandList();
     VideoCore::Perf::Add(VideoCore::Perf::Counter::Draws, 1);
-    {
+    if (pipeline.GeneratesGeometry()) {
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::GeneratedGeometryDraws, 1);
+    }
+    if (pipeline.TessPlan().Active()) {
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::TessDraws, 1);
+        RecordTessellatedDraw(pipeline, bindings, params);
+    } else {
+        query_runtime.PrepareDraw(maxwell3d->regs.zpass_pixel_count_enable);
         const ConditionalRendering::Scope predicate{conditional_rendering, cmd};
-        if (params.is_indexed) {
-            cmd->DrawIndexedInstanced(params.num_vertices, params.num_instances, params.first_index,
-                                      static_cast<INT>(params.base_vertex), params.base_instance);
-        } else {
-            cmd->DrawInstanced(params.num_vertices, params.num_instances, params.base_vertex,
-                               params.base_instance);
-        }
+        DrawStencilFaces(pipeline, topology, [&] {
+            if (params.is_indexed) {
+                cmd->DrawIndexedInstanced(params.num_vertices, params.num_instances,
+                                          params.first_index,
+                                          static_cast<INT>(params.base_vertex),
+                                          params.base_instance);
+            } else {
+                cmd->DrawInstanced(params.num_vertices, params.num_instances, params.base_vertex,
+                                   params.base_instance);
+            }
+        });
     }
     texture_runtime.FinishCompatibleDrawTargets(framebuffer);
 }
 
+void RasterizerD3D12::RecordTessellatedDraw(GraphicsPipeline& pipeline,
+                                            const PipelineBindings& bindings,
+                                            const DrawParams& params) {
+    CommandStream* const cmd = scheduler.CommandList();
+    const PipelineLayout& layout = pipeline.Layout();
+    const ConditionalRendering::Scope predicate{conditional_rendering, cmd};
+    TessEmulation::DrawShape shape{
+        .num_vertices = params.num_vertices,
+        .num_instances = params.num_instances,
+        .first_index = params.first_index,
+        .base_vertex = params.base_vertex,
+        .base_instance = params.base_instance,
+        .is_indexed = params.is_indexed,
+        .index_address = 0,
+        .index_size = 0,
+        .index_slots = 0,
+    };
+    if (params.is_indexed) {
+        const std::optional<D3D12_INDEX_BUFFER_VIEW>& view = buffer_runtime.AppliedIndex();
+        if (!view) [[unlikely]] {
+            BUG_TRACK(UnsupportedState, "tessellated indexed draw without an index buffer");
+            return;
+        }
+        shape.index_address = view->BufferLocation;
+        shape.index_size = view->Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+        shape.index_slots = TessIndexSlots();
+    }
+    // The emulation's own passes are not the guest's draw: only its last one is counted.
+    query_runtime.PauseCounters();
+    const u32 patches = tess_emulation.Capture(cmd, pipeline, shape);
+    command_state.topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+    if (patches != 0) {
+        cmd->SetComputeRootSignature(layout.Handle());
+        SetTessControlRootArguments(cmd, pipeline, bindings);
+        tess_emulation.Control(cmd, pipeline, patches);
+        tess_emulation.Tessellate(cmd, pipeline, patches, command_state.viewport.yz_flip_mask, 0);
+        scheduler.SetPipelineState(pipeline.Handle());
+        query_runtime.PrepareDraw(maxwell3d->regs.zpass_pixel_count_enable);
+        command_state.topology = tess_emulation.Draw(cmd, pipeline);
+        // The record wrote the runtime data constants, and the index buffer is the emulation's.
+        command_state.root_args.valid = false;
+        buffer_runtime.InvalidateGeometry();
+    }
+}
+
+u32 RasterizerD3D12::TessIndexSlots() const {
+    // The largest index the draw reads, from the guest's indices: the rewritten ones keep their
+    // values. All ones is the restart index, which names no vertex.
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& index_buffer = draw_state.index_buffer;
+    const size_t size = index_buffer.FormatSizeInBytes();
+    const size_t bytes = size_t{index_buffer.count} * size;
+    std::vector<u8> guest;
+    std::span<const u8> indices;
+    if (!draw_state.inline_index_draw_indexes.empty()) {
+        const std::span<const u8> inline_indices{draw_state.inline_index_draw_indexes};
+        const size_t first = std::min(size_t{index_buffer.first} * size, inline_indices.size());
+        indices = inline_indices.subspan(first, std::min(bytes, inline_indices.size() - first));
+    } else {
+        guest.resize(bytes);
+        gpu_memory->ReadBlockUnsafe(index_buffer.IndexStart(), guest.data(), bytes);
+        indices = guest;
+    }
+    const auto largest = [&]<typename T>(T) {
+        T max{};
+        for (size_t offset = 0; offset + sizeof(T) <= indices.size(); offset += sizeof(T)) {
+            T value;
+            std::memcpy(&value, indices.data() + offset, sizeof(T));
+            if (value != static_cast<T>(~T{})) {
+                max = std::max(max, value);
+            }
+        }
+        return u64{max} + 1;
+    };
+    const u64 slots = size == 1 ? largest(u8{}) : size == 2 ? largest(u16{}) : largest(u32{});
+    return static_cast<u32>(std::min<u64>(slots, ~0u));
+}
+
 void RasterizerD3D12::DispatchCompute() {
+    DrainCpuWrites();
     const bool full = VideoCommon::FullCapture::Active();
     if (full) {
         ++full_capture_operation;
@@ -400,7 +768,7 @@ void RasterizerD3D12::DispatchCompute() {
 
     scheduler.BeginWork();
     hunt.PipelineStart();
-    ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
+    ComputePipeline* pipeline = pipeline_cache.CurrentComputePipeline();
     hunt.PipelineEnd();
     if (!pipeline) {
         hunt.Outcome(Hunt::Outcome::NoPipeline);
@@ -431,15 +799,28 @@ void RasterizerD3D12::DispatchCompute() {
     const bool dump_inputs = ComputeInputsWanted(pipeline->UniqueHash(), dispatch_count);
     if (full || dump_inputs) {
         buffer_runtime.SetTraceBuffers(&full_buffers);
+        pipeline->WaitBuilt(); // the captures read its DXIL
     }
+    // Still building on a worker: the dispatch is recorded all the same, and the recorder waits
+    // for the PSO before it binds it (pipeline_cache.CurrentComputePipeline).
+    bool pending = !pipeline->IsBuilt();
     SCOPE_EXIT { buffer_runtime.SetTraceBuffers(nullptr); };
     pipeline->Configure({*kepler_compute, *gpu_memory, buffer_cache, texture_cache,
                          descriptor_queue, sampler_heap, scheduler},
                         bindings);
     if (bindings.unemulated_reduction_stages != 0) [[unlikely]] {
         pipeline_cache.EmulateReduction(pipeline->UniqueHash());
+        // This dispatch too: only the bindings seen just now tell that it needs the other one.
+        if (ComputePipeline* const emulating = pipeline_cache.CurrentComputePipeline();
+            emulating && emulating != pipeline) {
+            pipeline = emulating;
+            pending = !pipeline->IsBuilt();
+            pipeline->Configure({*kepler_compute, *gpu_memory, buffer_cache, texture_cache,
+                                 descriptor_queue, sampler_heap, scheduler},
+                                bindings);
+        }
     }
-    if (!pipeline->Handle()) {
+    if (!pending && !pipeline->Handle()) {
         hunt.Outcome(Hunt::Outcome::PsoRejected);
         return; // D3D12 rejected the PSO (logged when it was built)
     }
@@ -548,7 +929,9 @@ void RasterizerD3D12::DispatchCompute() {
         command_state.heaps_bound = true;
     }
     cmd->SetComputeRootSignature(layout.Handle());
-    scheduler.SetPipelineState(pipeline->Handle());
+    if (!pending) {
+        scheduler.SetPipelineState(pipeline->Handle());
+    }
     MarkGpuCommands(cmd, "dispatch CS", pipeline->UniqueHash(), 0);
     if (GpuDiagnosticsEnabled()) {
         TraceGpuDetail(fmt::format("dispatch tick={} PSO={} CS={:016x} groups={}x{}x{} table={:x}",
@@ -581,6 +964,35 @@ void RasterizerD3D12::DispatchCompute() {
                                               bindings.integer_samplers);
     }
     VideoCore::Perf::Add(VideoCore::Perf::Counter::Dispatches, 1);
+    const u32 groups_x = dim[0] * pipeline->WorkgroupSplit();
+    if (pending) {
+        // One call: without a PSO (rejected, out of memory) the dispatch is left out with it.
+        ID3D12CommandSignature* const signature = layout.DispatchSignature();
+        ID3D12Resource* const arguments = indirect_range ? indirect_range->buffer : nullptr;
+        const UINT64 arguments_offset = indirect_range ? indirect_range->offset : 0;
+        if (indirect_range &&
+            !ValidExecuteIndirect(signature, arguments, arguments_offset, nullptr, 0)) {
+            return;
+        }
+        scheduler.ForgetPipelineState();
+        cmd->Record([pipeline, signature, arguments, arguments_offset, groups_x, dim,
+                     indirect = indirect_range.has_value()](ID3D12GraphicsCommandList* list) {
+            ID3D12PipelineState* const pso = pipeline->WaitHandle();
+            if (!pso) {
+                return;
+            }
+            list->SetPipelineState(pso);
+            if (indirect) {
+                list->ExecuteIndirect(signature, 1, arguments, arguments_offset, nullptr, 0);
+            } else {
+                list->Dispatch(groups_x, dim[1], dim[2]);
+            }
+        });
+        dispatched = true;
+        hunt.Geometry(indirect_range ? 0 : dim[0] * dim[1] * dim[2], 1, 0);
+        hunt.Recorded();
+        return;
+    }
     if (indirect_range) {
         cmd->ExecuteIndirect(layout.DispatchSignature(), 1, indirect_range->buffer,
                              indirect_range->offset, nullptr, 0);
@@ -596,7 +1008,7 @@ void RasterizerD3D12::DispatchCompute() {
     }
     // A split shader runs each guest group as WorkgroupSplit() real ones; the runtime data above
     // keeps the guest's count.
-    cmd->Dispatch(dim[0] * pipeline->WorkgroupSplit(), dim[1], dim[2]);
+    cmd->Dispatch(groups_x, dim[1], dim[2]);
     dispatched = true;
     hunt.Geometry(dim[0] * dim[1] * dim[2], 1, 0);
     hunt.Recorded();
@@ -612,6 +1024,7 @@ std::optional<RasterizerD3D12::DisplayTexture> RasterizerD3D12::AccelerateDispla
     if (!framebuffer_addr) {
         return std::nullopt;
     }
+    DrainCpuWrites();
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
@@ -631,15 +1044,14 @@ bool RasterizerD3D12::AccelerateConditionalRendering() {
 }
 
 void RasterizerD3D12::ResetCounter(VideoCommon::QueryType type) {
-    const auto host_type = MaxwellToVideoCoreQuery(type);
     if (type == VideoCommon::QueryType::ZPassPixelCount64) zpass_diag = {};
-    if (host_type) query_cache.ResetCounter(*host_type);
+    if (QueryCacheRuntime::IsHostCounted(type)) query_cache.CounterReset(type);
 }
 
 void RasterizerD3D12::Query(GPUVAddr address, VideoCommon::QueryType type,
                             VideoCommon::QueryPropertiesFlags flags, u32 payload,
                             u32 subreport) {
-    const auto host_type = MaxwellToVideoCoreQuery(type);
+    const bool host_type = QueryCacheRuntime::IsHostCounted(type);
     {
         // Diagnostic: every guest query by raw type, logged at 1, 2, 4, 8... requests.
         static std::array<std::atomic<u64>, 32> query_counts{};
@@ -659,21 +1071,25 @@ void RasterizerD3D12::Query(GPUVAddr address, VideoCommon::QueryType type,
             const ZPassDiag& d = zpass_diag;
             LOG_WARNING(Render,
                         "D3D12: ZPass report since reset: {} draws ({} recorded, {} conditional, "
-                        "{} culled, {} no pipeline, {} rejected, {} skipped shader, {} empty); "
-                        "first recorded VS/PS/depth: {:016x}/{:016x}/{} {:016x}/{:016x}/{} "
-                        "{:016x}/{:016x}/{}",
+                        "{} culled, {} no pipeline, {} pipeline building, {} rejected, {} skipped "
+                        "shader, {} empty); first recorded VS/PS/depth: {:016x}/{:016x}/{} "
+                        "{:016x}/{:016x}/{} {:016x}/{:016x}/{}",
                         d.attempted, d.recorded, d.conditional, d.culled, d.no_pipeline,
-                        d.rejected, d.skipped_shader, d.empty, d.vs[0], d.ps[0], d.depth_test[0],
+                        d.pending, d.rejected, d.skipped_shader, d.empty, d.vs[0], d.ps[0], d.depth_test[0],
                         d.vs[1], d.ps[1], d.depth_test[1], d.vs[2], d.ps[2], d.depth_test[2]);
         }
     }
     if (type == VideoCommon::QueryType::StreamingByteCount && HasDrawTransformFeedback()) {
         return QueryByteCount(address, flags, subreport);
     }
-    if (!host_type) return QueryFallback(address, type, flags, payload);
-    const bool timeout = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
-    query_cache.Query(address, *host_type,
-                      timeout ? std::optional<u64>{gpu.GetTicks()} : std::nullopt);
+    if (!host_type) {
+        // A report the CPU writes ends any counter report pending at the address.
+        if (const std::optional<DAddr> cpu_address = gpu_memory->GpuToCpuAddress(address)) {
+            query_cache.InvalidateRegion(*cpu_address, sizeof(u64));
+        }
+        return QueryFallback(address, type, flags, payload);
+    }
+    query_cache.CounterReport(address, type, flags, payload, subreport);
 }
 
 bool RasterizerD3D12::HasDrawTransformFeedback() {
@@ -763,7 +1179,7 @@ bool RasterizerD3D12::MaterializeCheckpointMemory() {
     texture_cache.DownloadCheckpointMemory();
     buffer_cache.DownloadCheckpointMemory();
     scheduler.Finish();
-    ThrowIfFailed(query_cache.GetDevice().Get()->GetDeviceRemovedReason(),
+    ThrowIfFailed(device.Get()->GetDeviceRemovedReason(),
                   "Pulse materialize GPU memory");
     return true;
 }
@@ -771,7 +1187,7 @@ bool RasterizerD3D12::MaterializeCheckpointMemory() {
 void RasterizerD3D12::FlushCheckpointRegion(DAddr address, u64 size) {
     if (!address || !size) return;
     // What each cache's download leaves in the app's memory, for the save's peak log.
-    const auto used = [this] { return query_cache.GetDevice().QueryCacheMemoryPressure().app_used; };
+    const auto used = [this] { return device.QueryCacheMemoryPressure().app_used; };
     const auto mib = [](u64 after, u64 before) {
         return (static_cast<s64>(after) - static_cast<s64>(before)) / (1 << 20);
     };
@@ -887,6 +1303,34 @@ void RasterizerD3D12::InnerInvalidation(
     }
 }
 
+void RasterizerD3D12::DrainCpuWrites() {
+    if (VideoCommon::CpuWriteQueue::Empty()) {
+        return;
+    }
+    cpu_writes_drained.clear();
+    u64 late = 0;
+    {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        const u64 drained = VideoCommon::CpuWriteQueue::Drain([&](u64 address, u64 size) {
+            // OnCPUWrite, with the locks taken once for the batch.
+            if (buffer_cache.OnCPUWrite(address, size)) {
+                cpu_writes_after_gpu.emplace_back(address, size);
+                ++late;
+                return;
+            }
+            texture_cache.WriteMemory(address, size);
+            cpu_writes_drained.emplace_back(address, size);
+        });
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::CpuWritesDrained, drained);
+    }
+    if (late != 0) {
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::CpuWritesLateGpu, late);
+    }
+    for (const auto& [address, size] : cpu_writes_drained) {
+        pipeline_cache.InvalidateRegion(address, size);
+    }
+}
+
 bool RasterizerD3D12::OnCPUWrite(PAddr address, u64 size) {
     {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -904,7 +1348,14 @@ void RasterizerD3D12::OnCacheInvalidation(PAddr address, u64 size) {
     InvalidateRegion(address, size, VideoCommon::CacheType::TextureCache |
                                         VideoCommon::CacheType::BufferCache);
 }
-void RasterizerD3D12::InvalidateGPUCache() { gpu.InvalidateGPUCache(); }
+void RasterizerD3D12::InvalidateGPUCache() {
+    DrainCpuWrites();
+    for (const auto& [address, size] : cpu_writes_after_gpu) {
+        OnCacheInvalidation(address, size);
+    }
+    cpu_writes_after_gpu.clear();
+    gpu.InvalidateGPUCache();
+}
 void RasterizerD3D12::UnmapMemory(DAddr address, u64 size) {
     { std::scoped_lock lock{texture_cache.mutex}; texture_cache.UnmapMemory(address, size); }
     { std::scoped_lock lock{buffer_cache.mutex}; buffer_cache.WriteMemory(address, size); }
@@ -932,6 +1383,8 @@ void RasterizerD3D12::WaitForIdle() {
     const D3D12_RESOURCE_BARRIER barrier{.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
                                          .UAV = {.pResource = nullptr}};
     scheduler.CommandList()->ResourceBarrier(1, &barrier);
+    // Counter reports read after the wait are summed where the GPU reads them.
+    query_cache.NotifyWFI();
     fence_manager.SignalOrdering();
 }
 void RasterizerD3D12::FragmentBarrier() {
@@ -967,11 +1420,11 @@ void RasterizerD3D12::FlushIfUploadHeavy() {
     // A game drawing ~3900 times in one guest command list had the host GPU start only once the
     // whole list was recorded (~50 ms), and the guest waited for both in turn every frame.
     // Submitting every few hundred draws lets the GPU execute while the rest is recorded.
-    constexpr u32 SUBMIT_DRAWS = 512;
+    const u32 submit_after = submit_draws.load(std::memory_order_relaxed);
     // Copy scratch past the transfer pool's budget is freed only with the list that used it: a
     // loading screen's conversions held ~600 MiB of 8 MiB buffers in one list and ran out.
     constexpr u64 TRANSFER_SUBMIT_BYTES = 32ULL << 20;
-    if (staging.PendingUploadBytes() < upload_submit_bytes && draw_counter < SUBMIT_DRAWS &&
+    if (staging.PendingUploadBytes() < upload_submit_bytes && draw_counter < submit_after &&
         texture_runtime.PendingTransferBytes() < TRANSFER_SUBMIT_BYTES) {
         return;
     }
@@ -980,7 +1433,15 @@ void RasterizerD3D12::FlushIfUploadHeavy() {
 }
 void RasterizerD3D12::TickFrame() {
     Common::BugTracker::TickFrame();
+    DrainCpuWrites();
     draw_counter = 0;
+    ResetPendingWaitBudget();
+    if (GetPsoLoading() != VideoCore::FramePipeline::Mode::Off) {
+        const u64 draws = VideoCore::Perf::ReadCounter(VideoCore::Perf::Counter::Draws);
+        pipeline_cache.SetLoadingScreen(
+            loading_detector.Tick(LoadingDetector::Clock::now(), draws - composite_draws));
+        composite_draws = draws;
+    }
     fence_manager.TickFrame();
     {
         // The fence worker shares staging with both caches. Retire resources only while neither
@@ -1002,6 +1463,7 @@ void RasterizerD3D12::TickFrame() {
 bool RasterizerD3D12::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                             const Tegra::Engines::Fermi2D::Surface& dst,
                                             const Tegra::Engines::Fermi2D::Config& config) {
+    DrainCpuWrites();
     HuntScope hunt{draw_hunt, Hunt::Kind::Blit};
     std::scoped_lock lock{texture_cache.mutex};
     hunt.Target(nullptr);
@@ -1019,9 +1481,13 @@ bool RasterizerD3D12::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surfa
     return blitted;
 }
 
-Tegra::Engines::AccelerateDMAInterface& RasterizerD3D12::AccessAccelerateDMA() { return accelerate_dma; }
+Tegra::Engines::AccelerateDMAInterface& RasterizerD3D12::AccessAccelerateDMA() {
+    DrainCpuWrites(); // called on each DMA launch
+    return accelerate_dma;
+}
 void RasterizerD3D12::AccelerateInlineToMemory(GPUVAddr address, size_t size,
                                                std::span<const u8> memory) {
+    DrainCpuWrites();
     const auto cpu_address = gpu_memory->GpuToCpuAddress(address);
     if (!cpu_address) return gpu_memory->WriteBlock(address, memory.data(), size);
     gpu_memory->WriteBlockUnsafe(address, memory.data(), size);

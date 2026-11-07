@@ -114,11 +114,8 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
 template <bool TO_LINEAR, u32 BYTES_PER_PIXEL>
 void SwizzleSubrectImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32 height,
                         u32 depth, u32 origin_x, u32 origin_y, u32 extent_x, u32 num_lines,
-                        u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling) {
-    // The origin of the transformation can be configured here, leave it as zero as the current API
-    // doesn't expose it.
-    static constexpr u32 origin_z = 0;
-
+                        u32 block_height, u32 block_depth, u32 pitch_linear, u32 origin_z,
+                        bool native_tiling) {
     // We can configure here a custom pitch
     // As it's not exposed 'width * BYTES_PER_PIXEL' will be the expected pitch.
     const u32 pitch = pitch_linear;
@@ -224,13 +221,14 @@ void SwizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_p
 
 void SwizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
                     u32 height, u32 depth, u32 origin_x, u32 origin_y, u32 extent_x, u32 extent_y,
-                    u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling) {
+                    u32 block_height, u32 block_depth, u32 pitch_linear, u32 origin_z,
+                    bool native_tiling) {
     switch (bytes_per_pixel) {
 #define BPP_CASE(x)                                                                                \
     case x:                                                                                        \
         return SwizzleSubrectImpl<true, x>(output, input, width, height, depth, origin_x,          \
                                            origin_y, extent_x, extent_y, block_height,             \
-                                           block_depth, pitch_linear, native_tiling);
+                                           block_depth, pitch_linear, origin_z, native_tiling);
         BPP_CASE(1)
         BPP_CASE(2)
         BPP_CASE(3)
@@ -254,7 +252,7 @@ void UnswizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes
     case x:                                                                                        \
         return SwizzleSubrectImpl<false, x>(output, input, width, height, depth, origin_x,         \
                                             origin_y, extent_x, extent_y, block_height,            \
-                                            block_depth, pitch_linear, native_tiling);
+                                            block_depth, pitch_linear, 0, native_tiling);
         BPP_CASE(1)
         BPP_CASE(2)
         BPP_CASE(3)

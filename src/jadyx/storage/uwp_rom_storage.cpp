@@ -32,6 +32,11 @@ using winrt::Windows::Storage::AccessCache::StorageApplicationPermissions;
 constexpr unsigned PageSize = 64;
 constexpr unsigned MaxSources = 16;
 constexpr unsigned MaxEntries = 10000;
+/// A game's own folders (a raw dump's romfs) hold far more than a library folder: Pokopia's data
+/// is over 200k files. Their listings get a bound only against a runaway enumeration, in larger
+/// pages, since each page is a brokered call.
+constexpr unsigned GameDirectoryPageSize = 1024;
+constexpr unsigned MaxGameDirectoryEntries = 4'000'000;
 std::atomic<bool> storage_read_failure{};
 constexpr unsigned ReadChunk = 1024 * 1024;
 
@@ -233,27 +238,44 @@ public:
         std::vector<FileSys::VirtualFile> result;
         try {
             EnsureStorageApartment();
-            for (unsigned start = 0; start < MaxEntries; start += PageSize) {
-                auto files = folder.GetFilesAsync(Search::CommonFileQuery::DefaultQuery, start, PageSize).get();
+            for (unsigned start = 0;; start += GameDirectoryPageSize) {
+                if (start >= MaxGameDirectoryEntries) {
+                    LOG_ERROR(Frontend, "ROM storage: {} lists more than {} files; the rest are missing",
+                              path, MaxGameDirectoryEntries);
+                    break;
+                }
+                auto files = folder.GetFilesAsync(Search::CommonFileQuery::DefaultQuery, start, GameDirectoryPageSize).get();
                 for (const auto& file : files)
                     result.push_back(std::make_shared<StorageGameFile>(file, MakeDirectory(folder, path),
                                       path + "/" + winrt::to_string(file.Name())));
-                if (files.Size() < PageSize) break;
+                if (files.Size() < GameDirectoryPageSize) break;
             }
-        } catch (const winrt::hresult_error&) {}
+        } catch (const winrt::hresult_error& e) {
+            // A partial listing hides the rest of the folder from the game: say so.
+            LOG_WARNING(Frontend, "ROM storage: listing the files of {} stopped after {}: {}", path,
+                        result.size(), winrt::to_string(e.message()));
+        }
         return result;
     }
     std::vector<FileSys::VirtualDir> GetSubdirectories() const override {
         std::vector<FileSys::VirtualDir> result;
         try {
             EnsureStorageApartment();
-            for (unsigned start = 0; start < MaxEntries; start += PageSize) {
-                auto folders = folder.GetFoldersAsync(Search::CommonFolderQuery::DefaultQuery, start, PageSize).get();
+            for (unsigned start = 0;; start += GameDirectoryPageSize) {
+                if (start >= MaxGameDirectoryEntries) {
+                    LOG_ERROR(Frontend, "ROM storage: {} lists more than {} folders; the rest are missing",
+                              path, MaxGameDirectoryEntries);
+                    break;
+                }
+                auto folders = folder.GetFoldersAsync(Search::CommonFolderQuery::DefaultQuery, start, GameDirectoryPageSize).get();
                 for (const auto& child : folders)
                     result.push_back(MakeDirectory(child, path + "/" + winrt::to_string(child.Name())));
-                if (folders.Size() < PageSize) break;
+                if (folders.Size() < GameDirectoryPageSize) break;
             }
-        } catch (const winrt::hresult_error&) {}
+        } catch (const winrt::hresult_error& e) {
+            LOG_WARNING(Frontend, "ROM storage: listing the folders of {} stopped after {}: {}", path,
+                        result.size(), winrt::to_string(e.message()));
+        }
         return result;
     }
 private:

@@ -157,6 +157,20 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 VideoCore::FrameTrace::ScopedSpan trace_run{
                     VideoCore::FrameTrace::Event::GuestRunLong, trace_context};
                 hr = interface->RunThread(thread);
+                VideoCore::Perf::Add(VideoCore::Perf::Counter::GuestRunExits, 1);
+                if (True(hr & Core::HaltReason::SupervisorCall)) {
+                    VideoCore::Perf::RecordGuestSvcExit(interface->GetSvcNumber());
+                }
+                if (True(hr & Core::HaltReason::BreakLoop)) {
+                    VideoCore::Perf::Add(VideoCore::Perf::Counter::GuestExitsInterrupt, 1);
+                }
+                // Dynarmic::HaltReason::CacheInvalidation, which Core::HaltReason does not name.
+                if ((static_cast<u64>(hr) & 0x2) != 0) {
+                    VideoCore::Perf::Add(VideoCore::Perf::Counter::GuestExitsCacheInvalidation, 1);
+                }
+                if (True(hr & Core::HaltReason::DataAbort)) {
+                    VideoCore::Perf::Add(VideoCore::Perf::Counter::GuestExitsDataAbort, 1);
+                }
                 if (trace_run.Finish() >= 200) {
                     const u64 compile_us =
                         (Dynarmic::JitProfile::ReadLocalCompileNs() - compile_begin) / 1000;
@@ -380,7 +394,9 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
     }
 }
 
-void PhysicalCore::Idle() {
+// Jadyx's WakeFlag already spins adaptively (MWAITX) before blocking, which covers Lichii's
+// Switch 2 idle spin; the kernel is unused here.
+void PhysicalCore::Idle([[maybe_unused]] KernelCore& kernel) {
     // Frame chain counters: an emulated core with no guest thread to run.
     VideoCore::Perf::ScopedTimer timer{VideoCore::Perf::Counter::GuestCoreIdleUs};
     switch (m_interrupt.Wait()) {

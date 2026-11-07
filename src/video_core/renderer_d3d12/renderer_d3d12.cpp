@@ -15,6 +15,9 @@
 #include "common/fs/path_util.h"
 #include "video_core/renderer_d3d12/diagnostics/d3d12_local_memory_matrix.h"
 #include "common/settings.h"
+#ifdef _WIN32
+#include "common/windows/sampling_profiler.h"
+#endif
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
@@ -106,7 +109,9 @@ RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
       shader_compiler{}, scheduler{device}, staging_pool{device, scheduler},
       transfer_buffers{device, scheduler},
       buffer_cache_runtime{device, scheduler, staging_pool, transfer_buffers, device_memory_},
-      view_descriptors{device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV},
+      // Deferred descriptor tables copy offline views on the recorder's worker, later.
+      view_descriptors{device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1024,
+                       DescriptorDeferralEnabled() ? &scheduler : nullptr},
       sampler_descriptors{device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 256},
       rtv_descriptors{device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 256, &scheduler},
       dsv_descriptors{device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 256, &scheduler},
@@ -120,7 +125,8 @@ RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
       rasterizer{gpu_, device_memory_, device, scheduler, shader_compiler, buffer_cache_runtime,
                  texture_cache_runtime, descriptor_ring, sampler_heap, blit_helper,
                  staging_pool},
-      present_manager{device, scheduler, swapchain, rtv_descriptors,
+      present_manager{device, scheduler, swapchain, rtv_descriptors, shader_compiler,
+                      descriptor_ring, sampler_heap,
                       Settings::values.async_presentation.GetValue()} {
     ID3D12Device* const dev = device.Get();
     texture_cache_runtime.SetBlitHelper(&blit_helper);
@@ -167,6 +173,16 @@ RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
     LOG_INFO(Render, "D3D12: presenting through the scheduler (tick {})", scheduler.CurrentTick());
 }
 
+bool RendererD3D12::ResizeOutput(u32 width, u32 height) {
+    if (!present_manager.Resize(width, height)) {
+        return false;
+    }
+    const D3D12_RESOURCE_DESC image_desc = Texture2DDesc(width, height, Swapchain::FORMAT);
+    device.Get()->GetCopyableFootprints(&image_desc, 0, 1, 0, &footprint, nullptr, nullptr,
+                                        &upload_size);
+    return true;
+}
+
 RendererD3D12::~RendererD3D12() {
     EndBootScreen();
     rasterizer.EndMaterialTrace(false);
@@ -200,6 +216,9 @@ void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         return;
     }
     last_framebuffers.assign(framebuffers.begin(), framebuffers.end());
+#ifdef _WIN32
+    Common::SamplingProfiler::NoteFrame();
+#endif
     if (!present_failed) {
         try {
             if (std::optional<std::string> error = present_manager.TakeError()) {
@@ -227,7 +246,14 @@ void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                     readback = RecordFrameReadback(*frame);
                 }
                 CaptureGuestPresent(frame);
-                Present(std::move(frame));
+                // Frame generation runs on the game's own frames, never under the menu, and only
+                // while FSR is not upscaling them: FSR keeps the image, FG the rate, never both.
+                Present(std::move(frame),
+                        PresentInfo{.vsync_index = framebuffer.vsync_index,
+                                    .frame_gen = !game_menu.has_value() && !last_composite_fsr,
+                                    .new_frame = framebuffer.new_frame,
+                                    .queue_time =
+                                        static_cast<double>(framebuffer.queue_time_ns) * 1e-9});
                 if (readback) {
                     WriteFrameDump(*readback, (accelerated_frames - DUMP_FRAME) / DUMP_INTERVAL);
                 }
@@ -349,8 +375,8 @@ void RendererD3D12::CaptureGuestPresent(FrameLease& frame) {
              started ? "begin (2 present intervals)" : "busy: capture not started");
 }
 
-void RendererD3D12::Present(FrameLease&& frame) {
-    present_manager.Present(std::move(frame));
+void RendererD3D12::Present(FrameLease&& frame, const PresentInfo& info) {
+    present_manager.Present(std::move(frame), info);
     staging_pool.TickFrame();
 }
 

@@ -57,6 +57,89 @@ std::optional<u64> TrackIMNMX(Environment& env, Location block_begin, Location& 
         return opcode == Opcode::IMNMX_imm && imnmx.dest_reg == shl_reg;
     });
 }
+
+union SelEncoding {
+    u64 raw;
+    BitField<0, 8, IR::Reg> dest_reg;
+    BitField<8, 8, IR::Reg> src_a;
+    BitField<20, 8, IR::Reg> src_b;
+    BitField<39, 3, u64> pred;
+    BitField<42, 1, u64> neg_pred;
+};
+
+union IsetpEncoding {
+    u64 raw;
+    BitField<0, 3, u64> dest_pred_b;
+    BitField<3, 3, u64> dest_pred_a;
+    BitField<8, 8, IR::Reg> src_a;
+    BitField<20, 8, IR::Reg> src_b;
+    BitField<39, 3, u64> bop_pred;
+    BitField<42, 1, u64> neg_bop_pred;
+    BitField<43, 1, u64> x;
+    BitField<45, 2, u64> bop;
+    BitField<48, 1, u64> is_signed;
+    BitField<49, 3, u64> compare_op;
+};
+
+union Mov32iEncoding {
+    u64 raw;
+    BitField<0, 8, IR::Reg> dest_reg;
+    BitField<12, 4, u64> mask;
+    BitField<20, 32, u64> imm;
+};
+
+/// The bound of a jump table written as a compare and a select instead of IMNMX, as code lowered
+/// from the Switch 2's native ISA has it:
+///   MOV32I  Rk, K
+///   ISETP.LT.U32.AND Pn, PT, Ridx, Rk, PT   (or LE)
+///   SEL     Ridx, Ridx, Rk, Pn
+/// which keeps the index at most K. Returns K when every piece matches exactly.
+std::optional<u32> TrackSelectBound(Environment& env, Location block_begin, Location& pos,
+                                    IR::Reg shl_reg) {
+    const std::optional<u64> sel_insn{Track(env, block_begin, pos, [shl_reg](u64 insn, Opcode opcode) {
+        const SelEncoding sel{insn};
+        return opcode == Opcode::SEL_reg && sel.dest_reg == shl_reg;
+    })};
+    if (!sel_insn) {
+        return std::nullopt;
+    }
+    const SelEncoding sel{*sel_insn};
+    if (sel.src_a != shl_reg || sel.neg_pred != 0 || sel.pred == 7) {
+        return std::nullopt;
+    }
+    const IR::Reg bound_reg{sel.src_b};
+    const u64 pred{sel.pred};
+    Location isetp_pos{pos};
+    const std::optional<u64> isetp_insn{
+        Track(env, block_begin, isetp_pos, [pred](u64 insn, Opcode opcode) {
+            const IsetpEncoding isetp{insn};
+            return opcode == Opcode::ISETP_reg && isetp.dest_pred_a == pred;
+        })};
+    if (!isetp_insn) {
+        return std::nullopt;
+    }
+    const IsetpEncoding isetp{*isetp_insn};
+    const u64 less_than{1}, less_equal{3}, bop_and{0};
+    if (isetp.src_a != shl_reg || isetp.src_b != bound_reg || isetp.is_signed != 0 ||
+        isetp.x != 0 || isetp.bop != bop_and || isetp.bop_pred != 7 || isetp.neg_bop_pred != 0 ||
+        (isetp.compare_op != less_than && isetp.compare_op != less_equal)) {
+        return std::nullopt;
+    }
+    Location mov_pos{isetp_pos};
+    const std::optional<u64> mov_insn{
+        Track(env, block_begin, mov_pos, [bound_reg](u64 insn, Opcode opcode) {
+            const Mov32iEncoding mov{insn};
+            return opcode == Opcode::MOV32I && mov.dest_reg == bound_reg;
+        })};
+    if (!mov_insn) {
+        return std::nullopt;
+    }
+    const Mov32iEncoding mov{*mov_insn};
+    if (mov.mask != 0xf || mov.imm >= 4096) {
+        return std::nullopt;
+    }
+    return static_cast<u32>(mov.imm);
+}
 } // Anonymous namespace
 
 std::optional<IndirectBranchTableInfo> TrackIndirectBranchTable(Environment& env, Location brx_pos,
@@ -86,9 +169,20 @@ std::optional<IndirectBranchTableInfo> TrackIndirectBranchTable(Environment& env
     const Encoding shl{*shl_insn};
     const IR::Reg shl_reg{shl.src_reg};
 
+    Location bound_pos{pos};
     const std::optional<u64> imnmx_insn{TrackIMNMX(env, block_begin, pos, shl_reg)};
     if (!imnmx_insn) {
-        return std::nullopt;
+        const std::optional<u32> bound{TrackSelectBound(env, block_begin, bound_pos, shl_reg)};
+        if (!bound) {
+            return std::nullopt;
+        }
+        return IndirectBranchTableInfo{
+            .cbuf_index = cbuf_index,
+            .cbuf_offset = cbuf_offset,
+            .num_entries = *bound + 1,
+            .branch_offset = brx_offset,
+            .branch_reg = brx_reg,
+        };
     }
     const Encoding imnmx{*imnmx_insn};
     if (imnmx.is_negative != 0) {

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -38,11 +39,17 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
 
+#ifdef ARCHITECTURE_arm64
+        std::atomic_ref<VAddr>{exclusive_addresses[processor_id]}.store(masked_address, std::memory_order_release);
+        const T value = op();
+        std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
+#else
         Lock();
         reservations[processor_id].address = masked_address;
         const T value = op();
         std::memcpy(reservations[processor_id].value.data(), &value, sizeof(T));
         Unlock();
+#endif
         return value;
     }
 
@@ -61,7 +68,9 @@ public:
         std::memcpy(&saved_value, reservations[processor_id].value.data(), sizeof(T));
         const bool result = op(saved_value);
 
+#ifndef ARCHITECTURE_arm64
         Unlock();
+#endif
         return result;
     }
 
@@ -70,15 +79,20 @@ public:
         Vector value{};
         bool active{};
     };
+    /// Processors a checkpoint holds (Switch 2 titles run 6 emulated cores).
+    static constexpr size_t MaxCheckpointProcessors = 8;
     struct Checkpoint {
         size_t processor_count{};
-        std::array<CheckpointReservation, 4> reservations{};
+        std::array<CheckpointReservation, MaxCheckpointProcessors> reservations{};
     };
 
     // All guest CPUs and HLE exclusive operations must be parked by the caller.
     // No JIT code, locks, pointers or layout-dependent storage are saved.
     Checkpoint CaptureCheckpoint() {
         Checkpoint state{};
+        if (processor_count > state.reservations.size()) {
+            throw std::invalid_argument("Pulse: too many processors for an exclusive checkpoint");
+        }
         Lock();
         state.processor_count = processor_count;
         for (size_t i = 0; i < state.processor_count; ++i) {

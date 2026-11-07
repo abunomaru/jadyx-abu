@@ -18,8 +18,17 @@ void MemoryBarrier(EmitContext& ctx, spv::Scope scope) {
 void EmitBarrier(EmitContext& ctx) {
     const auto execution{spv::Scope::Workgroup};
     const auto memory{spv::Scope::Workgroup};
-    const auto memory_semantics{spv::MemorySemanticsMask::AcquireRelease |
-                                spv::MemorySemanticsMask::WorkgroupMemory};
+    // An emulated control shader shares its patch outputs through a storage buffer, and global
+    // memory that must stay coherent across invocations needs uniform memory semantics too.
+    auto memory_semantics{spv::MemorySemanticsMask::AcquireRelease |
+                          spv::MemorySemanticsMask::WorkgroupMemory};
+    if (ctx.runtime_info.tess_emulation == TessEmulation::ControlCompute ||
+        ctx.requires_coherent_global_memory) {
+        memory_semantics = memory_semantics | spv::MemorySemanticsMask::UniformMemory;
+    }
+    if (ctx.requires_coherent_image_memory) {
+        memory_semantics = memory_semantics | spv::MemorySemanticsMask::ImageMemory;
+    }
     ctx.OpControlBarrier(ctx.Const(static_cast<u32>(execution)),
                          ctx.Const(static_cast<u32>(memory)),
                          ctx.Const(static_cast<u32>(memory_semantics)));

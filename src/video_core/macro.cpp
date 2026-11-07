@@ -32,10 +32,12 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
 #include "video_core/perf_counters.h"
+#include "video_core/query_dma.h"
 
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -101,6 +103,9 @@ void SetIndirectMacroCpuRead(bool enabled) {
 }
 
 void HLE_DrawArraysIndirect::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    // The DMA hands over GPU-written arguments without flushing them: the topology is the only
+    // word the GPU path reads here, the draw takes the rest from GPU memory.
+    maxwell3d.RefreshParameters(0, 1);
     auto topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(parameters[0]);
     if (UsesCpuArguments(maxwell3d, topology)) {
         Fallback(system, maxwell3d, parameters);
@@ -161,6 +166,10 @@ void HLE_DrawArraysIndirect::Fallback(Core::System& system, Engines::Maxwell3D& 
 }
 
 void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    // The DMA hands over GPU-written arguments without flushing them: only the topology is
+    // refreshed here. The indirect draw reads base vertex and base instance from GPU memory, so
+    // the registers set from parameters 4 and 5 below do not reach it.
+    maxwell3d.RefreshParameters(0, 1);
     auto topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(parameters[0]);
     if (UsesCpuArguments(maxwell3d, topology)) {
         Fallback(system, maxwell3d, parameters);
@@ -235,6 +244,8 @@ void HLE_MultiLayerClear::Execute(Core::System& system, Engines::Maxwell3D& maxw
     maxwell3d.draw_manager.Clear(maxwell3d, num_layers);
 }
 void HLE_MultiDrawIndexedIndirectCount::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    // Draw range, topology and padding are read on the CPU; the count and the draws stay on the GPU.
+    maxwell3d.RefreshParameters(0, 4);
     const auto topology = Maxwell3D::Regs::PrimitiveTopology(parameters[2]);
     if (IsTopologySafe(topology)) {
         const u32 start_indirect = parameters[0];
@@ -309,6 +320,8 @@ void HLE_MultiDrawIndexedIndirectCount::Fallback(Core::System& system, Engines::
 void HLE_DrawIndirectByteCount::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
     const bool force = maxwell3d.Rasterizer().HasDrawTransformFeedback();
     if (force) {
+        // Draw begin and stride are read on the CPU; the byte count stays on the GPU.
+        maxwell3d.RefreshParameters(0, 2);
         auto topology = Maxwell3D::Regs::PrimitiveTopology(parameters[0] & 0xFFFFU);
         auto& params = maxwell3d.draw_manager.indirect_state;
         params.is_byte_count = true;
@@ -1504,6 +1517,20 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                                 VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
                             }
                         }
+                    }
+                    // Accurate GPU mode holds report and semaphore writes in the query cache until a
+                    // fence: write them out, or occlusion predicates read stale values.
+                    const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
+                                             VideoCommon::GpuSplit::OnBackThread();
+                    if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&
+                        VideoCommon::QueryDma::HasPendingQueries(memory, maxwell3d.Rasterizer(),
+                                                                 source, read_bytes)) {
+                        VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
+                                                     source, read_bytes);
+                    }
+                    if (owns_caches) {
+                        VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
+                                                            read_bytes);
                     }
                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "jadyx/settings/uwp_system_settings.h"
 
+#include <type_traits>
+
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.System.UserProfile.h>
@@ -22,7 +24,11 @@ constexpr auto PulseSessionsKey = L"system_pulse_sessions";
 constexpr auto PlayTimeKey = L"system_track_play_time";
 constexpr auto MultipleControllersKey = L"system_multiple_controllers";
 constexpr auto OfflineModeKey = L"system_offline_mode";
-constexpr auto UpscalingKey = L"system_upscaling";
+constexpr auto GraphicsUpscalingKey = L"graphics_upscaling";
+constexpr auto GraphicsFrameGenKey = L"graphics_frame_gen";
+constexpr auto GraphicsShadersKey = L"graphics_shaders";
+constexpr auto GraphicsGpuFenceKey = L"graphics_gpu_fence";
+constexpr auto GraphicsAsyncRecordKey = L"graphics_async_record";
 
 /// Saved as the enum's value, or -1 for "follow the system". A value that is not a selectable
 /// option (an older or newer build's) also falls back to the system.
@@ -61,9 +67,6 @@ SystemSettings LoadSystemSettings() {
         if (values.HasKey(MultipleControllersKey))
             settings.multiple_controllers = winrt::unbox_value<bool>(values.Lookup(MultipleControllersKey));
         if (values.HasKey(OfflineModeKey)) settings.offline_mode = winrt::unbox_value<bool>(values.Lookup(OfflineModeKey));
-        if (values.HasKey(UpscalingKey))
-            settings.upscaling = UpscalingFromValue(winrt::unbox_value<int32_t>(values.Lookup(UpscalingKey)))
-                                     .value_or(Upscaling::Bilinear);
     } catch (...) { /* Missing or invalid values keep following the system. */ }
     return settings;
 }
@@ -81,7 +84,38 @@ bool SaveSystemSettings(const SystemSettings& settings) {
         values.Insert(PlayTimeKey, winrt::box_value(settings.track_play_time));
         values.Insert(MultipleControllersKey, winrt::box_value(settings.multiple_controllers));
         values.Insert(OfflineModeKey, winrt::box_value(settings.offline_mode));
-        values.Insert(UpscalingKey, winrt::box_value(static_cast<int32_t>(settings.upscaling)));
+        return true;
+    } catch (...) { return false; }
+}
+
+GraphicsSettings LoadGraphicsSettings() {
+    GraphicsSettings settings;
+    try {
+        const auto values = winrt::Windows::Storage::ApplicationData::Current().LocalSettings().Values();
+        if (const auto upscaling = LoadChoice(values, GraphicsUpscalingKey, SelectableUpscalings()))
+            settings.upscaling = *upscaling;
+        if (values.HasKey(GraphicsFrameGenKey))
+            settings.frame_gen = winrt::unbox_value<bool>(values.Lookup(GraphicsFrameGenKey));
+        if (const auto shaders = LoadChoice(values, GraphicsShadersKey, SelectableShaderBuilds()))
+            settings.shaders = *shaders;
+        if (const auto gpu_fence = LoadChoice(values, GraphicsGpuFenceKey, SelectableGpuFences()))
+            settings.gpu_fence = *gpu_fence;
+        if (values.HasKey(GraphicsAsyncRecordKey))
+            settings.async_record = winrt::unbox_value<bool>(values.Lookup(GraphicsAsyncRecordKey));
+    } catch (...) { /* Missing or invalid values keep the defaults. */ }
+    // Saved by hand or by an older build with both on: FSR wins, as on a first install.
+    if (IsFsr(settings.upscaling)) settings.frame_gen = false;
+    return settings;
+}
+
+bool SaveGraphicsSettings(const GraphicsSettings& settings) {
+    try {
+        const auto values = winrt::Windows::Storage::ApplicationData::Current().LocalSettings().Values();
+        values.Insert(GraphicsUpscalingKey, winrt::box_value(static_cast<int32_t>(settings.upscaling)));
+        values.Insert(GraphicsFrameGenKey, winrt::box_value(settings.frame_gen));
+        values.Insert(GraphicsShadersKey, winrt::box_value(static_cast<int32_t>(settings.shaders)));
+        values.Insert(GraphicsGpuFenceKey, winrt::box_value(static_cast<int32_t>(settings.gpu_fence)));
+        values.Insert(GraphicsAsyncRecordKey, winrt::box_value(settings.async_record));
         return true;
     } catch (...) { return false; }
 }
@@ -105,7 +139,83 @@ winrt::hstring GameOfflineModeKey(std::uint64_t program_id) {
     swprintf(key, std::size(key), L"game_offline_mode_%016llx", static_cast<unsigned long long>(program_id));
     return key;
 }
+winrt::hstring GameGraphicsKey(const wchar_t* field, std::uint64_t program_id) {
+    wchar_t key[48];
+    swprintf(key, std::size(key), L"game_graphics_%ls_%016llx", field, static_cast<unsigned long long>(program_id));
+    return key;
+}
+
+/// Writes a game's override, or removes it so the game follows Settings > Graphics.
+template <typename T>
+void SaveOverride(const winrt::Windows::Foundation::Collections::IPropertySet& values, const winrt::hstring& key,
+                  std::optional<T> value) {
+    if (!value) {
+        if (values.HasKey(key)) values.Remove(key);
+    } else if constexpr (std::is_same_v<T, bool>) {
+        values.Insert(key, winrt::box_value(*value));
+    } else {
+        values.Insert(key, winrt::box_value(static_cast<int32_t>(*value)));
+    }
+}
 } // namespace
+
+GameGraphics LoadGameGraphics(std::uint64_t program_id) {
+    GameGraphics graphics;
+    try {
+        const auto values = winrt::Windows::Storage::ApplicationData::Current().LocalSettings().Values();
+        const auto upscaling = GameGraphicsKey(L"upscaling", program_id);
+        graphics.upscaling = LoadChoice(values, upscaling.c_str(), SelectableUpscalings());
+        const auto frame_gen = GameGraphicsKey(L"frame_gen", program_id);
+        if (values.HasKey(frame_gen)) graphics.frame_gen = winrt::unbox_value<bool>(values.Lookup(frame_gen));
+        const auto shaders = GameGraphicsKey(L"shaders", program_id);
+        graphics.shaders = LoadChoice(values, shaders.c_str(), SelectableShaderBuilds());
+        const auto gpu_fence = GameGraphicsKey(L"gpu_fence", program_id);
+        graphics.gpu_fence = LoadChoice(values, gpu_fence.c_str(), SelectableGpuFences());
+        const auto async_record = GameGraphicsKey(L"async_record", program_id);
+        if (values.HasKey(async_record)) graphics.async_record = winrt::unbox_value<bool>(values.Lookup(async_record));
+        const auto slow_clock = GameGraphicsKey(L"slow_clock", program_id);
+        if (values.HasKey(slow_clock)) graphics.slow_guest_clock = winrt::unbox_value<bool>(values.Lookup(slow_clock));
+        auto& advanced = graphics.advanced;
+        const auto load = [&](const wchar_t* field, auto& value, auto options) {
+            const auto key = GameGraphicsKey(field, program_id);
+            if (const auto saved = LoadChoice(values, key.c_str(), options)) value = *saved;
+        };
+        load(L"anisotropy", advanced.anisotropy, SelectableAnisotropy());
+        load(L"texture_cap", advanced.texture_cap_mib, SelectableTextureCaps());
+        load(L"gpu_accuracy", advanced.gpu_accuracy, SelectableGpuAccuracy());
+        load(L"workers", advanced.shader_workers, SelectableShaderWorkers());
+        load(L"console_mode", advanced.console_mode, SelectableConsoleModes());
+        const auto full_textures = GameGraphicsKey(L"full_textures", program_id);
+        if (values.HasKey(full_textures)) advanced.full_textures = winrt::unbox_value<bool>(values.Lookup(full_textures));
+    } catch (...) { /* A missing or invalid value follows Settings > Graphics. */ }
+    return graphics;
+}
+
+bool SaveGameGraphics(std::uint64_t program_id, const GameGraphics& graphics) {
+    try {
+        const auto values = winrt::Windows::Storage::ApplicationData::Current().LocalSettings().Values();
+        SaveOverride(values, GameGraphicsKey(L"upscaling", program_id), graphics.upscaling);
+        SaveOverride(values, GameGraphicsKey(L"frame_gen", program_id), graphics.frame_gen);
+        SaveOverride(values, GameGraphicsKey(L"shaders", program_id), graphics.shaders);
+        SaveOverride(values, GameGraphicsKey(L"gpu_fence", program_id), graphics.gpu_fence);
+        SaveOverride(values, GameGraphicsKey(L"async_record", program_id), graphics.async_record);
+        SaveOverride(values, GameGraphicsKey(L"slow_clock", program_id),
+                     graphics.slow_guest_clock ? std::optional<bool>{true} : std::nullopt);
+        // A default is not saved: a later build can change what the app does with no choice made.
+        const auto& advanced = graphics.advanced;
+        const GameAdvancedGraphics defaults;
+        const auto save = [&]<typename T>(const wchar_t* field, T value, T standard) {
+            SaveOverride(values, GameGraphicsKey(field, program_id), value == standard ? std::nullopt : std::optional<T>{value});
+        };
+        save(L"anisotropy", advanced.anisotropy, defaults.anisotropy);
+        save(L"texture_cap", advanced.texture_cap_mib, defaults.texture_cap_mib);
+        save(L"gpu_accuracy", advanced.gpu_accuracy, defaults.gpu_accuracy);
+        save(L"workers", advanced.shader_workers, defaults.shader_workers);
+        save(L"console_mode", advanced.console_mode, defaults.console_mode);
+        save(L"full_textures", advanced.full_textures, defaults.full_textures);
+        return true;
+    } catch (...) { return false; }
+}
 
 std::optional<bool> LoadGameOfflineMode(std::uint64_t program_id) {
     try {
@@ -130,7 +240,7 @@ ResolvedSystem ApplySystemSettings() {
     const auto locale = DetectSystemLocale();
     const auto settings = LoadSystemSettings();
     VideoCore::performance_overlay_enabled.store(settings.show_performance_stats, std::memory_order_relaxed);
-    ApplyUpscaling(settings.upscaling);
+    ApplyUpscaling(LoadGraphicsSettings().upscaling);
     const auto resolved = ResolveSystem(settings, locale);
     I18n::SetUiLanguage(*resolved.ui_language);
     Settings::values.language_index = resolved.game_language;

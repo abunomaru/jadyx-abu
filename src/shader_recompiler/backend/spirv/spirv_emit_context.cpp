@@ -20,8 +20,10 @@
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/local_memory_scratch.h"
+#include "shader_recompiler/tessellation_emulation.h"
 #include "shader_recompiler/transform_feedback_storage.h"
 
 namespace Shader::Backend::SPIRV {
@@ -137,7 +139,11 @@ Id DefineInput(EmitContext& ctx, Id type, bool per_invocation,
     case Stage::TessellationControl:
     case Stage::TessellationEval:
         if (per_invocation) {
-            type = ctx.TypeArray(type, ctx.Const(32u));
+            // D3D12 takes the hull shader's input control point count from this array, and it
+            // must match the draw's patch size or the draw is dropped.
+            const bool sized{ctx.stage == Stage::TessellationControl &&
+                             ctx.runtime_info.patch_vertices != 0};
+            type = ctx.TypeArray(type, ctx.Const(sized ? ctx.runtime_info.patch_vertices : 32u));
         }
         break;
     case Stage::Geometry:
@@ -563,6 +569,9 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     const Id struct_type{ctx.TypeStruct(array_type)};
     ctx.Decorate(struct_type, spv::Decoration::Block);
     ctx.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    if (info.requires_coherent_global_memory) {
+        ctx.MemberDecorate(struct_type, 0, spv::Decoration::Coherent);
+    }
 
     const Id struct_pointer{ctx.TypePointer(spv::StorageClass::StorageBuffer, struct_type)};
     type_def.array = struct_pointer;
@@ -631,7 +640,7 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
 }
 
 Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_pointer,
-           Id value_type, Id memory_type, spv::Scope scope) {
+           Id value_type, spv::Scope scope) {
     const bool is_shared{scope == spv::Scope::Workgroup};
     const bool is_struct{!is_shared || ctx.uses_explicit_workgroup_layout};
     const Id cas_func{CasFunction(ctx, operation, value_type)};
@@ -650,6 +659,13 @@ Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_p
     const Id op_b{ctx.OpFunctionParameter(value_type)};
     const Id base{is_shared ? ctx.shared_memory_u32 : ctx.OpFunctionParameter(array_pointer)};
     ctx.AddLabel();
+    // Each attempt expects the word the previous compare-exchange returned. A plain reload can
+    // keep returning a stale copy (AMD), and the invocations that lost would never match again.
+    const Id expected_var{ctx.AddLocalVariable(
+        ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]), spv::StorageClass::Function)};
+    const Id word_pointer{is_struct ? ctx.OpAccessChain(element_pointer, base, zero, index)
+                                    : ctx.OpAccessChain(element_pointer, base, index)};
+    ctx.OpStore(expected_var, ctx.OpLoad(ctx.U32[1], word_pointer));
     ctx.OpBranch(loop_header);
     ctx.AddLabel(loop_header);
 
@@ -657,34 +673,28 @@ Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_p
     ctx.OpBranch(continue_block);
 
     ctx.AddLabel(continue_block);
-    const Id word_pointer{is_struct ? ctx.OpAccessChain(element_pointer, base, zero, index)
-                                    : ctx.OpAccessChain(element_pointer, base, index)};
-    if (value_type.value == ctx.F32[2].value) {
-        const Id u32_value{ctx.OpLoad(ctx.U32[1], word_pointer)};
-        const Id value{ctx.OpUnpackHalf2x16(ctx.F32[2], u32_value)};
-        const Id new_value{ctx.OpFunctionCall(value_type, cas_func, value, op_b)};
-        const Id u32_new_value{ctx.OpPackHalf2x16(ctx.U32[1], new_value)};
-        const Id atomic_res{ctx.OpAtomicCompareExchange(ctx.U32[1], word_pointer, scope_id, zero,
-                                                        zero, u32_new_value, u32_value)};
-        const Id success{ctx.OpIEqual(ctx.U1, atomic_res, u32_value)};
-        ctx.OpBranchConditional(success, merge_block, loop_header);
+    // The word holds a u32, an f32, an f16x2, or an f32x2 packed as two halves.
+    const bool packed_half{value_type.value == ctx.F32[2].value};
+    const bool is_u32{value_type.value == ctx.U32[1].value};
+    const auto from_word{[&](Id word) {
+        if (packed_half) {
+            return ctx.OpUnpackHalf2x16(ctx.F32[2], word);
+        }
+        return is_u32 ? word : ctx.OpBitcast(value_type, word);
+    }};
+    const Id expected{ctx.OpLoad(ctx.U32[1], expected_var)};
+    const Id new_value{ctx.OpFunctionCall(value_type, cas_func, from_word(expected), op_b)};
+    const Id new_word{packed_half ? ctx.OpPackHalf2x16(ctx.U32[1], new_value)
+                      : is_u32    ? new_value
+                                  : ctx.OpBitcast(ctx.U32[1], new_value)};
+    const Id atomic_res{ctx.OpAtomicCompareExchange(ctx.U32[1], word_pointer, scope_id, zero, zero,
+                                                    new_word, expected)};
+    ctx.OpStore(expected_var, atomic_res);
+    const Id success{ctx.OpIEqual(ctx.U1, atomic_res, expected)};
+    ctx.OpBranchConditional(success, merge_block, loop_header);
 
-        ctx.AddLabel(merge_block);
-        ctx.OpReturnValue(ctx.OpUnpackHalf2x16(ctx.F32[2], atomic_res));
-    } else {
-        const Id value{ctx.OpLoad(memory_type, word_pointer)};
-        const bool matching_type{value_type.value == memory_type.value};
-        const Id bitcast_value{matching_type ? value : ctx.OpBitcast(value_type, value)};
-        const Id cal_res{ctx.OpFunctionCall(value_type, cas_func, bitcast_value, op_b)};
-        const Id new_value{matching_type ? cal_res : ctx.OpBitcast(memory_type, cal_res)};
-        const Id atomic_res{ctx.OpAtomicCompareExchange(ctx.U32[1], word_pointer, scope_id, zero,
-                                                        zero, new_value, value)};
-        const Id success{ctx.OpIEqual(ctx.U1, atomic_res, value)};
-        ctx.OpBranchConditional(success, merge_block, loop_header);
-
-        ctx.AddLabel(merge_block);
-        ctx.OpReturnValue(ctx.OpBitcast(value_type, atomic_res));
-    }
+    ctx.AddLabel(merge_block);
+    ctx.OpReturnValue(from_word(atomic_res));
     ctx.OpFunctionEnd();
     return func;
 }
@@ -740,6 +750,8 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
                          IR::Program& program, Bindings& bindings)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
+      requires_coherent_global_memory{program.info.requires_coherent_global_memory},
+      requires_coherent_image_memory{program.info.requires_coherent_image_memory},
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     geometry_passthrough_lowered = program.geometry_passthrough_lowered;
@@ -783,11 +795,26 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineImageBuffers(program.info, image_binding);
     DefineTextures(program.info, texture_binding, bindings.texture_scaling_index);
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
+    if (program.info.uses_destination_read) {
+        destination_read_type = TypeImage(F32[1], spv::Dim::Dim2D, 0, 0, 0, 1, spv::ImageFormat::Unknown);
+        destination_read = AddGlobalVariable(
+            TypePointer(spv::StorageClass::UniformConstant, destination_read_type),
+            spv::StorageClass::UniformConstant);
+        Decorate(destination_read, spv::Decoration::Binding, image_binding);
+        Decorate(destination_read, spv::Decoration::DescriptorSet, 0U);
+        Name(destination_read, "destination_read");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(destination_read);
+        }
+        ++image_binding;
+    }
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
-    DefineGlobalMemoryFunctions(program.info);
+    DefineGlobalMemoryFunctions(program);
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
+    DefineBlendConstants();
+    DefineStageConstants(program.info);
 }
 
 EmitContext::~EmitContext() = default;
@@ -891,8 +918,97 @@ void EmitContext::DefineCommonConstants() {
 }
 
 void EmitContext::DefineInterfaces(const IR::Program& program) {
+    if (EmulatesTessellation()) {
+        // The stage reads and writes the emulation's buffers instead of its interface; the
+        // evaluation shader still outputs like a vertex shader.
+        DefineTessellationEmulation();
+        DefineSubgroupInputs(program.info);
+        if (runtime_info.tess_emulation == TessEmulation::EvalVertex) {
+            DefineOutputs(program);
+        }
+        return;
+    }
     DefineInputs(program);
     DefineOutputs(program);
+    if (runtime_info.tess_capture) {
+        DefineTessellationEmulation();
+    }
+}
+
+void EmitContext::DefineTessellationEmulation() {
+    namespace Tess = TessellationEmulation;
+    const bool control{runtime_info.tess_emulation == TessEmulation::ControlCompute};
+    const bool capture{runtime_info.tess_capture};
+    tess_storage_element = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+    const auto define_buffer{[&](u32 binding, bool writable, std::string_view name) {
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+        const Id struct_type{TypeStruct(array_type)};
+        Decorate(struct_type, spv::Decoration::Block);
+        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+        const Id variable{AddGlobalVariable(TypePointer(spv::StorageClass::StorageBuffer, struct_type),
+                                            spv::StorageClass::StorageBuffer)};
+        if (!writable) {
+            // Read-only buffers are SRVs in D3D12. The struct type is shared by every buffer, so
+            // the decoration goes on the variable.
+            Decorate(variable, spv::Decoration::NonWritable);
+        }
+        Decorate(variable, spv::Decoration::Binding, binding);
+        Decorate(variable, spv::Decoration::DescriptorSet, Tess::DESCRIPTOR_SET);
+        Name(variable, name);
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(variable);
+        }
+        return variable;
+    }};
+    if (!capture) {
+        tess_input_buffer = define_buffer(Tess::INPUT_BINDING, false, "tess_input");
+    }
+    if (!control && !capture) {
+        tess_points_buffer = define_buffer(Tess::POINTS_BINDING, false, "tess_points");
+        vertex_index = DefineVariable(*this, U32[1], spv::BuiltIn::VertexIndex,
+                                      spv::StorageClass::Input);
+        return;
+    }
+    tess_output_buffer = define_buffer(Tess::OUTPUT_BINDING, true,
+                                       capture ? "tess_capture" : "tess_output");
+
+    const std::vector<Id> members(Tess::CONSTANT_WORDS, U32[1]);
+    const Id constants_type{TypeStruct(members)};
+    Decorate(constants_type, spv::Decoration::Block);
+    for (u32 word = 0; word < Tess::CONSTANT_WORDS; ++word) {
+        MemberDecorate(constants_type, word, spv::Decoration::Offset, word * 4);
+    }
+    tess_constant_element = TypePointer(spv::StorageClass::Uniform, U32[1]);
+    tess_constants = AddGlobalVariable(TypePointer(spv::StorageClass::Uniform, constants_type),
+                                       spv::StorageClass::Uniform);
+    Decorate(tess_constants, spv::Decoration::Binding, Tess::CONSTANTS_BINDING);
+    Decorate(tess_constants, spv::Decoration::DescriptorSet, Tess::DESCRIPTOR_SET);
+    Name(tess_constants, "tess_constants");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(tess_constants);
+    }
+    if (capture) {
+        // The capture slot: the vertex (or its index) and instance relative to the draw's first.
+        if (!Sirit::ValidId(vertex_index)) {
+            vertex_index = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexIndex);
+        }
+        if (!Sirit::ValidId(base_vertex)) {
+            base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+        }
+        if (!Sirit::ValidId(instance_index)) {
+            instance_index = DefineInput(*this, U32[1], true, spv::BuiltIn::InstanceIndex);
+        }
+        if (!Sirit::ValidId(base_instance)) {
+            base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+        }
+        return;
+    }
+    tess_indices_buffer = define_buffer(Tess::INDICES_BINDING, false, "tess_indices");
+    workgroup_id = DefineVariable(*this, U32[3], spv::BuiltIn::WorkgroupId,
+                                  spv::StorageClass::Input);
+    local_invocation_id = DefineVariable(*this, U32[3], spv::BuiltIn::LocalInvocationId,
+                                         spv::StorageClass::Input);
 }
 
 void EmitContext::DefineLocalMemory(IR::Program& program) {
@@ -1068,22 +1184,26 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
         const Id offset{OpFunctionParameter(U32[1])};
         const Id insert_value{OpFunctionParameter(U32[1])};
         AddLabel();
-        OpBranch(loop_header);
-
-        AddLabel(loop_header);
+        const Id expected_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
+                                               spv::StorageClass::Function)};
         const Id word_offset{OpShiftRightArithmetic(U32[1], offset, Const(2U))};
         const Id shift_offset{OpShiftLeftLogical(U32[1], offset, Const(3U))};
         const Id bit_offset{OpBitwiseAnd(U32[1], shift_offset, Const(mask))};
         const Id count{Const(size)};
+        const Id word_pointer{OpAccessChain(shared_u32, shared_memory_u32, word_offset)};
+        OpStore(expected_var, OpLoad(U32[1], word_pointer));
+        OpBranch(loop_header);
+
+        AddLabel(loop_header);
         OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
         OpBranch(continue_block);
 
         AddLabel(continue_block);
-        const Id word_pointer{OpAccessChain(shared_u32, shared_memory_u32, word_offset)};
-        const Id old_value{OpLoad(U32[1], word_pointer)};
+        const Id old_value{OpLoad(U32[1], expected_var)};
         const Id new_value{OpBitFieldInsert(U32[1], old_value, insert_value, bit_offset, count)};
         const Id atomic_res{OpAtomicCompareExchange(U32[1], word_pointer, Const(1U), u32_zero_value,
                                                     u32_zero_value, new_value, old_value)};
+        OpStore(expected_var, atomic_res);
         const Id success{OpIEqual(U1, atomic_res, old_value)};
         OpBranchConditional(success, merge_block, loop_header);
 
@@ -1103,15 +1223,21 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
 void EmitContext::DefineSharedMemoryFunctions(const IR::Program& program) {
     if (program.info.uses_shared_increment) {
         increment_cas_shared = CasLoop(*this, Operation::Increment, shared_memory_u32_type,
-                                       shared_u32, U32[1], U32[1], spv::Scope::Workgroup);
+                                       shared_u32, U32[1], spv::Scope::Workgroup);
     }
     if (program.info.uses_shared_decrement) {
         decrement_cas_shared = CasLoop(*this, Operation::Decrement, shared_memory_u32_type,
-                                       shared_u32, U32[1], U32[1], spv::Scope::Workgroup);
+                                       shared_u32, U32[1], spv::Scope::Workgroup);
     }
 }
 
 void EmitContext::DefineAttributeMemAccess(const Info& info) {
+    if (EmulatesTessellation() &&
+        (info.loads_indexed_attributes ||
+         (runtime_info.tess_emulation == TessEmulation::ControlCompute &&
+          info.stores_indexed_attributes))) {
+        throw NotImplementedException("Indexed attributes with emulated tessellation");
+    }
     const auto make_load{[&] {
         const bool is_array{stage == Stage::Geometry};
         const Id end_block{OpLabel()};
@@ -1362,6 +1488,10 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     const Id bit_count{OpFunctionParameter(U32[1])};
 
     AddLabel();
+    // Each attempt expects the word the previous compare-exchange returned (see CasLoop).
+    const Id expected_var{
+        AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]), spv::StorageClass::Function)};
+    OpStore(expected_var, OpLoad(U32[1], pointer));
     const Id scope_device{Const(1u)};
     const Id ordering_relaxed{u32_zero_value};
     const Id body_label{OpLabel()};
@@ -1375,10 +1505,11 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     OpBranch(body_label);
 
     AddLabel(body_label);
-    const Id expected_value{OpLoad(U32[1], pointer)};
+    const Id expected_value{OpLoad(U32[1], expected_var)};
     const Id desired_value{OpBitFieldInsert(U32[1], expected_value, value, bit_offset, bit_count)};
     const Id actual_value{OpAtomicCompareExchange(U32[1], pointer, scope_device, ordering_relaxed,
                                                   ordering_relaxed, desired_value, expected_value)};
+    OpStore(expected_var, actual_value);
     const Id store_successful{OpIEqual(U1, expected_value, actual_value)};
     OpBranchConditional(store_successful, endloop_label, continue_label);
 
@@ -1393,7 +1524,10 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     write_storage_cas_loop_func = func;
 }
 
-void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+/// Defines the functions that route global memory accesses and atomics to the storage buffer
+/// holding the address at run time.
+void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+    const Info& info{program.info};
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
@@ -1419,6 +1553,32 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
         const auto base_address{[&](size_t index) {
             const auto& ssbo{info.storage_buffers_descriptors[index]};
+            // A pointer read through the buffer bound for another constant buffer pointer
+            // (StorageBufferDescriptor::indirect_offset). Uses the views both modes have.
+            if (ssbo.indirect_offset != ~0U) {
+                const auto holder{std::ranges::find_if(
+                    info.storage_buffers_descriptors, [&ssbo](const auto& desc) {
+                        return desc.cbuf_index == ssbo.cbuf_index &&
+                               desc.cbuf_offset == ssbo.cbuf_offset && desc.indirect_offset == ~0U;
+                    })};
+                if (holder == info.storage_buffers_descriptors.end()) {
+                    return Constant(U64, ~u64{0});
+                }
+                const size_t holder_index{static_cast<size_t>(
+                    std::distance(info.storage_buffers_descriptors.begin(), holder))};
+                const Id holder_low{load_cbuf_word(ssbo, ssbo.cbuf_offset / 4)};
+                const Id byte{OpIAdd(
+                    U32[1],
+                    OpBitwiseAnd(U32[1], holder_low,
+                                 Const(static_cast<u32>(profile.min_ssbo_alignment - 1))),
+                    Const(ssbo.indirect_offset))};
+                const Id word_index{OpShiftRightLogical(U32[1], byte, Const(2U))};
+                const Id pointer_words{OpCompositeConstruct(
+                    U32[2], OpLoad(U32[1], word_pointer(holder_index, word_index, 0)),
+                    OpLoad(U32[1], word_pointer(holder_index, word_index, 1)))};
+                return OpBitwiseAnd(U64, OpBitcast(U64, pointer_words),
+                                    Constant(U64, ssbo_align_mask));
+            }
             Id unaligned_addr;
             if (aliasing) {
                 const Id ssbo_addr_pointer{OpAccessChain(uniform_types.U32x2,
@@ -1554,6 +1714,64 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
+
+    if (!std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
+            return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
+        })) {
+        return;
+    }
+    for (const auto opcode : {IR::Opcode::GlobalAtomicIAdd32, IR::Opcode::GlobalAtomicUMax32}) {
+        if (!std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
+                return std::ranges::any_of(block->Instructions(), [opcode](const IR::Inst& inst) {
+                    return inst.GetOpcode() == opcode;
+                });
+            })) {
+            continue;
+        }
+        const Id function_type{TypeFunction(U32[1], U64, U32[1])};
+        const Id function{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
+        if (opcode == IR::Opcode::GlobalAtomicIAdd32) {
+            atomic_add_global_func_u32 = function;
+        } else {
+            atomic_umax_global_func_u32 = function;
+        }
+        const Id address{OpFunctionParameter(U64)};
+        const Id value{OpFunctionParameter(U32[1])};
+        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
+                    [&](Id location, size_t index) {
+                        // Without aliasing the body gets the word index (DefineGlobalMemoryFunctions).
+                        const Id pointer{aliasing ? location : word_pointer(index, location, 0)};
+                        OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
+                                          ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
+                                          : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
+                    });
+        OpReturnValue(u32_zero_value);
+        OpFunctionEnd();
+    }
+    if (std::ranges::any_of(program.blocks, [](const IR::Block* block) {
+            return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {
+                return inst.GetOpcode() == IR::Opcode::GlobalAtomicCompareExchange32;
+            });
+        })) {
+        const Id function_type{TypeFunction(U32[1], U64, U32[1], U32[1])};
+        atomic_cas_global_func_u32 =
+            OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type);
+        const Id address{OpFunctionParameter(U64)};
+        const Id comparator{OpFunctionParameter(U32[1])};
+        const Id value{OpFunctionParameter(U32[1])};
+        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
+                    [&](Id location, size_t index) {
+                        const Id pointer{aliasing ? location : word_pointer(index, location, 0)};
+                        OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
+                                                              u32_zero_value, u32_zero_value,
+                                                              value, comparator));
+                    });
+        // No buffer matched: report success so a guest CAS retry loop cannot spin forever.
+        OpReturnValue(comparator);
+        OpFunctionEnd();
+    }
 }
 
 void EmitContext::DefineRescalingInput(const Info& info) {
@@ -1620,6 +1838,52 @@ void EmitContext::DefineRescalingInputUniformConstant() {
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_uniform_constant);
+    }
+}
+
+void EmitContext::DefineBlendConstants() {
+    if (stage != Stage::Fragment ||
+        std::ranges::all_of(runtime_info.blend_constant_factors, [](BlendConstantFactor factor) {
+            return factor == BlendConstantFactor::None;
+        })) {
+        return;
+    }
+    const Id push_constant_struct{TypeStruct(F32[4])};
+    Decorate(push_constant_struct, spv::Decoration::Block);
+    Name(push_constant_struct, "BlendConstants");
+    MemberDecorate(push_constant_struct, 0U, spv::Decoration::Offset, BLEND_CONSTANTS_OFFSET);
+    MemberName(push_constant_struct, 0U, "blend_constant");
+    const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
+    blend_constants_push_constant = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+    Name(blend_constants_push_constant, "blend_constants_push_constant");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(blend_constants_push_constant);
+    }
+}
+
+void EmitContext::DefineStageConstants(const Info& info) {
+    if (!info.uses_stage_constants) {
+        return;
+    }
+    std::vector<Id> members(STAGE_CONSTANT_WORDS, F32[1]);
+    if (info.uses_polygon_stipple) {
+        const Id pattern{TypeArray(U32[1], Const(POLYGON_STIPPLE_WORDS))};
+        Decorate(pattern, spv::Decoration::ArrayStride, static_cast<u32>(sizeof(u32)));
+        members.push_back(pattern);
+        polygon_stipple_pointer = TypePointer(spv::StorageClass::PushConstant, U32[1]);
+    }
+    const Id push_constant_struct{TypeStruct(std::span<const Id>(members))};
+    Decorate(push_constant_struct, spv::Decoration::Block);
+    Name(push_constant_struct, "StageConstants");
+    for (u32 index = 0; index < members.size(); ++index) {
+        MemberDecorate(push_constant_struct, index, spv::Decoration::Offset,
+                       STAGE_CONSTANTS_OFFSET + index * static_cast<u32>(sizeof(float)));
+    }
+    const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
+    stage_constants_push_constant = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+    Name(stage_constants_push_constant, "stage_constants_push_constant");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(stage_constants_push_constant);
     }
 }
 
@@ -1819,39 +2083,39 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     }
     if (info.uses_global_increment) {
         increment_cas_ssbo = CasLoop(*this, Operation::Increment, storage_types.U32.array,
-                                     storage_types.U32.element, U32[1], U32[1], spv::Scope::Device);
+                                     storage_types.U32.element, U32[1], spv::Scope::Device);
     }
     if (info.uses_global_decrement) {
         decrement_cas_ssbo = CasLoop(*this, Operation::Decrement, storage_types.U32.array,
-                                     storage_types.U32.element, U32[1], U32[1], spv::Scope::Device);
+                                     storage_types.U32.element, U32[1], spv::Scope::Device);
     }
     if (info.uses_atomic_f32_add) {
         f32_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
-                              storage_types.U32.element, F32[1], U32[1], spv::Scope::Device);
+                              storage_types.U32.element, F32[1], spv::Scope::Device);
     }
     if (info.uses_atomic_f16x2_add) {
         f16x2_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
-                                storage_types.U32.element, F16[2], F16[2], spv::Scope::Device);
+                                storage_types.U32.element, F16[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f16x2_min) {
         f16x2_min_cas = CasLoop(*this, Operation::FPMin, storage_types.U32.array,
-                                storage_types.U32.element, F16[2], F16[2], spv::Scope::Device);
+                                storage_types.U32.element, F16[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f16x2_max) {
         f16x2_max_cas = CasLoop(*this, Operation::FPMax, storage_types.U32.array,
-                                storage_types.U32.element, F16[2], F16[2], spv::Scope::Device);
+                                storage_types.U32.element, F16[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f32x2_add) {
         f32x2_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
-                                storage_types.U32.element, F32[2], F32[2], spv::Scope::Device);
+                                storage_types.U32.element, F32[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f32x2_min) {
         f32x2_min_cas = CasLoop(*this, Operation::FPMin, storage_types.U32.array,
-                                storage_types.U32.element, F32[2], F32[2], spv::Scope::Device);
+                                storage_types.U32.element, F32[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f32x2_max) {
         f32x2_max_cas = CasLoop(*this, Operation::FPMax, storage_types.U32.array,
-                                storage_types.U32.element, F32[2], F32[2], spv::Scope::Device);
+                                storage_types.U32.element, F32[2], spv::Scope::Device);
     }
 }
 
@@ -1895,6 +2159,9 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "imgbuf"));
+        if (info.requires_coherent_image_memory) {
+            Decorate(id, spv::Decoration::Coherent);
+        }
         image_buffers.push_back({
             .id = id,
             .image_type = image_type,
@@ -1950,12 +2217,16 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "img"));
+        if (info.requires_coherent_image_memory) {
+            Decorate(id, spv::Decoration::Coherent);
+        }
         images.push_back({
             .id = id,
             .image_type = image_type,
             .pointer_type = pointer_type,
             .count = desc.count,
             .is_integer = desc.is_integer,
+            .raw_load = desc.raw_load,
         });
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);
@@ -1965,32 +2236,9 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
     }
 }
 
-void EmitContext::DefineInputs(const IR::Program& program) {
-    const Info& info{program.info};
-    const VaryingState loads{info.loads.mask | info.passthrough.mask};
-
-    if (info.uses_workgroup_id) {
-        workgroup_id = DefineInput(*this, U32[3], false, spv::BuiltIn::WorkgroupId);
-    }
-    if (info.uses_local_invocation_id) {
-        local_invocation_id = DefineInput(*this, U32[3], false, spv::BuiltIn::LocalInvocationId);
-    }
-    if (info.uses_invocation_id) {
-        invocation_id = DefineInput(*this, U32[1], false, spv::BuiltIn::InvocationId);
-    }
-    if (info.uses_invocation_info &&
-        (stage == Shader::Stage::TessellationControl || stage == Shader::Stage::TessellationEval)) {
-        patch_vertices_in = DefineInput(*this, U32[1], false, spv::BuiltIn::PatchVertices);
-    }
-    if (info.uses_sample_id) {
-        sample_id = DefineInput(*this, U32[1], false, spv::BuiltIn::SampleId);
-        if (stage == Stage::Fragment) {
-            Decorate(sample_id, spv::Decoration::Flat);
-        }
-    }
-    if (info.uses_is_helper_invocation) {
-        is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
-    }
+/// The subgroup built-ins and FSWZADD tables the warp instructions read, which do not depend on
+/// the stage's interface.
+void EmitContext::DefineSubgroupInputs(const Info& info) {
     if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage)) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
@@ -2026,9 +2274,40 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         fswzadd_lut_b =
             ConstantComposite(F32[4], f32_minus_one, f32_minus_one, f32_one, f32_minus_one);
     }
+}
+
+void EmitContext::DefineInputs(const IR::Program& program) {
+    const Info& info{program.info};
+    const VaryingState loads{info.loads.mask | info.passthrough.mask};
+
+    if (info.uses_workgroup_id) {
+        workgroup_id = DefineInput(*this, U32[3], false, spv::BuiltIn::WorkgroupId);
+    }
+    if (info.uses_local_invocation_id) {
+        local_invocation_id = DefineInput(*this, U32[3], false, spv::BuiltIn::LocalInvocationId);
+    }
+    if (info.uses_invocation_id) {
+        invocation_id = DefineInput(*this, U32[1], false, spv::BuiltIn::InvocationId);
+    }
+    if (info.uses_invocation_info && runtime_info.patch_vertices == 0 &&
+        (stage == Shader::Stage::TessellationControl || stage == Shader::Stage::TessellationEval)) {
+        patch_vertices_in = DefineInput(*this, U32[1], false, spv::BuiltIn::PatchVertices);
+    }
+    if (info.uses_sample_id) {
+        sample_id = DefineInput(*this, U32[1], false, spv::BuiltIn::SampleId);
+        if (stage == Stage::Fragment) {
+            Decorate(sample_id, spv::Decoration::Flat);
+        }
+    }
+    if (info.uses_is_helper_invocation) {
+        is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
+    }
+    DefineSubgroupInputs(info);
     if (loads[IR::Attribute::PrimitiveId]) {
         primitive_id = DefineInput(*this, U32[1], false, spv::BuiltIn::PrimitiveId);
         if (stage == Stage::Fragment) {
+            // A fragment PrimitiveId input requires Geometry (geometryShader is a required feature).
+            AddCapability(spv::Capability::Geometry);
             Decorate(primitive_id, spv::Decoration::Flat);
         }
     }
@@ -2040,6 +2319,12 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     // Quad shuffles through derivatives find their quad lane from the window position.
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
         (stage == Stage::Fragment && runtime_info.lower_noperspective_mask != 0) ||
+        (stage == Stage::Fragment && runtime_info.polygon_stipple) ||
+        (stage == Stage::Fragment && runtime_info.logic_op_enable) ||
+        (stage == Stage::Fragment && runtime_info.alpha_to_coverage_footprint == 2) ||
+        (stage == Stage::Fragment && runtime_info.sample_mask_footprint != 0) ||
+        (stage == Stage::Fragment && runtime_info.depth_bias_in_shader &&
+         !info.stores_frag_depth) ||
         (stage == Stage::Fragment && info.uses_quad_shuffles &&
          profile.has_helperless_quad_shuffles)) {
         const bool is_fragment{stage == Stage::Fragment};
@@ -2064,34 +2349,40 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             }
         }
     }
+    // BaseInstance, BaseVertex and DrawIndex are only valid with the DrawParameters capability.
+    const auto define_draw_parameter{[this](spv::BuiltIn builtin) {
+        AddExtension("SPV_KHR_shader_draw_parameters");
+        AddCapability(spv::Capability::DrawParameters);
+        return DefineInput(*this, U32[1], true, builtin);
+    }};
     if (loads[IR::Attribute::InstanceId]) {
         if (profile.support_vertex_instance_id) {
             instance_id = DefineInput(*this, U32[1], true, spv::BuiltIn::InstanceId);
             if (loads[IR::Attribute::BaseInstance]) {
-                base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+                base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
             }
         } else {
             instance_index = DefineInput(*this, U32[1], true, spv::BuiltIn::InstanceIndex);
-            base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+            base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
         }
     } else if (loads[IR::Attribute::BaseInstance]) {
-        base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+        base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
     }
     if (loads[IR::Attribute::VertexId]) {
         if (profile.support_vertex_instance_id) {
             vertex_id = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexId);
             if (loads[IR::Attribute::BaseVertex]) {
-                base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+                base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
             }
         } else {
             vertex_index = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexIndex);
-            base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+            base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
         }
     } else if (loads[IR::Attribute::BaseVertex]) {
-        base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+        base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
     }
     if (loads[IR::Attribute::DrawID]) {
-        draw_index = DefineInput(*this, U32[1], true, spv::BuiltIn::DrawIndex);
+        draw_index = define_draw_parameter(spv::BuiltIn::DrawIndex);
     }
     if (loads[IR::Attribute::FrontFace]) {
         front_face = DefineInput(*this, U1, true, spv::BuiltIn::FrontFacing);
@@ -2108,7 +2399,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         if (!runtime_info.previous_stage_stores.Generic(index)) {
             continue;
         }
-        if (!loads.Generic(index)) {
+        if (!loads.Generic(index) && !info.passthrough.Generic(index)) {
             continue;
         }
         if (input_type == AttributeType::Disabled) {
@@ -2210,7 +2501,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_attribute_words = (std::max)(
         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
         1U);
-    mesh_map_bytes = 4 + 3 * mesh_info.max_primitives;
+    mesh_map_bytes = 4 + mesh_info.PrimitiveVertices() * mesh_info.max_primitives;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);
@@ -2224,11 +2515,20 @@ void EmitContext::DefineMesh(const IR::Program& program) {
 
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
-    mesh_primitive_indices =
-        DefineVariable(*this, TypeArray(U32[3], primitive_count),
-                       spv::BuiltIn::PrimitiveTriangleIndicesEXT, spv::StorageClass::Output);
+    const u32 primitive_vertices{mesh_info.PrimitiveVertices()};
+    mesh_primitive_indices = DefineVariable(
+        *this, TypeArray(U32[primitive_vertices], primitive_count),
+        primitive_vertices == 1   ? spv::BuiltIn::PrimitivePointIndicesEXT
+        : primitive_vertices == 2 ? spv::BuiltIn::PrimitiveLineIndicesEXT
+                                  : spv::BuiltIn::PrimitiveTriangleIndicesEXT,
+        spv::StorageClass::Output);
     std::array<Id, IR::NUM_GENERICS> generics[2]{};
-    Id point_size{}, primitive_layer{}, primitive_viewport{}, primitive_id_output{};
+    Id& point_size{mesh_point_size};
+    Id primitive_layer{}, primitive_viewport{}, primitive_id_output{};
+    if (primitive_vertices == 1) {
+        point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count), spv::BuiltIn::PointSize,
+                                    spv::StorageClass::Output);
+    }
     const auto per_primitive_builtin = [&](Id& variable, spv::BuiltIn builtin) {
         if (!Sirit::ValidId(variable)) {
             variable = DefineVariable(*this, TypeArray(U32[1], primitive_count), builtin,
@@ -2405,14 +2705,29 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
                 Name(frag_color[index], fmt::format("frag_color{}", index));
             }
         }
-        if (info.stores_frag_depth) {
+        // The hardware tests the alpha the shader wrote, not the one rounded for the target.
+        if (Sirit::ValidId(frag_color[0]) && (runtime_info.unorm8_output_mask & 1) != 0 &&
+            runtime_info.color_output_types[0] == AttributeType::Float &&
+            ((runtime_info.alpha_test_func &&
+              *runtime_info.alpha_test_func != CompareFunction::Always) ||
+             runtime_info.alpha_to_coverage_footprint != 0)) {
+            frag_alpha_unrounded = AddGlobalVariable(
+                TypePointer(spv::StorageClass::Private, F32[1]), spv::StorageClass::Private);
+            Name(frag_alpha_unrounded, "frag_alpha_unrounded");
+            if (profile.supported_spirv >= 0x00010400) {
+                interfaces.push_back(frag_alpha_unrounded);
+            }
+        }
+        shader_depth_bias = runtime_info.depth_bias_in_shader && !info.stores_frag_depth;
+        if (info.stores_frag_depth || shader_depth_bias) {
             frag_depth = DefineOutput(*this, F32[1], std::nullopt);
             Decorate(frag_depth, spv::Decoration::BuiltIn, spv::BuiltIn::FragDepth);
         }
-        if (info.stores_sample_mask) {
+        if (info.stores_sample_mask || runtime_info.sample_mask_footprint != 0) {
             const Id array_type{TypeArray(U32[1], Const(1U))};
             sample_mask = DefineOutput(*this, array_type, std::nullopt);
             Decorate(sample_mask, spv::Decoration::BuiltIn, spv::BuiltIn::SampleMask);
+            guest_writes_sample_mask = info.stores_sample_mask;
         }
         break;
     default:

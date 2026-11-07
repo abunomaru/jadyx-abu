@@ -9,7 +9,9 @@
 #include <chrono>
 #include <algorithm>
 #include <string_view>
+#include <string>
 #include <type_traits>
+#include <vector>
 #include <fmt/ranges.h>
 #include "common/swap.h"
 
@@ -89,6 +91,7 @@ enum class Class : u8 {
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args);
 
 /// Returns true if a message of this class and level would pass the global filter.
+[[nodiscard]] bool IsLevelEnabled(Class log_class, Level log_level);
 
 template <typename... Args>
 void FmtLogMessage(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::format_string<Args...> format, const Args&... args) {
@@ -161,5 +164,14 @@ using TapSeen = bool (*)(Class log_class, Level log_level, const char* filename,
 using TapRecord = void (*)(const TapEntry& entry) noexcept;
 /// Installs (or, with nulls, removes) the tap. Costs one atomic load per entry when absent.
 void SetTap(TapSeen seen, TapRecord record) noexcept;
+/// A line kept by the in-memory log ring (the debug server's log tail).
+struct RingLine {
+    u64 sequence;
+    std::string text;
+};
+/// Keeps the last `capacity` formatted lines in memory; 0 turns the ring off and empties it.
+void SetRingCapacity(std::size_t capacity);
+/// The kept lines numbered above `after`, oldest first.
+[[nodiscard]] std::vector<RingLine> ReadRing(u64 after);
 
 } // namespace Common::Log

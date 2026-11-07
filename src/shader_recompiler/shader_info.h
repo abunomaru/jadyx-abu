@@ -175,6 +175,9 @@ struct StorageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     bool is_written;
+    /// When set, the buffer pointer is read from memory at this offset from the constant buffer
+    /// pointer, which is bound as its own descriptor.
+    u32 indirect_offset{~0U};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
@@ -231,10 +234,22 @@ struct TextureDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word above.
     u32 handle_program{~0U};
+    /// The handle arrives per primitive through the generic input IR::Attribute(cbuf_offset),
+    /// so the draw provides it (GraphicsPipeline::VertexTextureHandle); no constant buffer holds it.
+    bool varying_handle{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
 using TextureDescriptors = boost::container::small_vector<TextureDescriptor, 12>;
+
+/// The layout behind a raw 32-bit image load, for hosts that cannot view the image as R32.
+enum class RawImageLoad : u8 {
+    None,
+    A8B8G8R8_UNORM,
+    B8G8R8A8_UNORM,
+    A2B10G10R10_UNORM,
+    A8B8G8R8_UINT,
+};
 
 struct ImageDescriptor {
     TextureType type;
@@ -246,9 +261,11 @@ struct ImageDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    bool is_byte_addressed{};
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word.
     u32 handle_program{~0U};
+    RawImageLoad raw_load{};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };
@@ -262,9 +279,14 @@ struct MeshInfo {
     u32 payload_words{}; ///< Task output region / mesh input region, in 32-bit words
     u32 max_vertices{};
     u32 max_primitives{};
-    u32 topology{}; ///< SET_MESH_SHADER_A output topology (4 = triangles)
+    u32 topology{}; ///< SET_MESH_SHADER_A output topology (0 = points, 1 = lines, 4 = triangles)
     boost::container::static_vector<u32, 136> vertex_lines;
     boost::container::static_vector<u32, 136> primitive_lines;
+
+    /// Vertex indices per primitive, which is also its byte count in the map region.
+    [[nodiscard]] u32 PrimitiveVertices() const noexcept {
+        return topology == 0 ? 1 : topology == 1 ? 2 : 3;
+    }
 };
 
 struct Info {
@@ -295,6 +317,8 @@ struct Info {
     bool loads_indexed_attributes{};
 
     std::array<bool, 8> stores_frag_color{};
+    /// Components (bit 0 = R ... bit 3 = A) of each render target the fragment shader writes
+    std::array<u8, 8> frag_color_components{};
     bool stores_sample_mask{};
     bool stores_frag_depth{};
 
@@ -351,6 +375,8 @@ struct Info {
     // slower NVN fallback functions: untracked by the pass, or with no trackable low address.
     u32 global_memory_fallbacks{};
     u32 global_memory_unresolved{};
+    bool requires_coherent_global_memory{};
+    bool requires_coherent_image_memory{};
     /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
     /// is a candidate and its bound length (not an NVN size word) limits the range.
     bool native_global_bounds{};
@@ -359,6 +385,12 @@ struct Info {
     bool uses_rescaling_uniform{};
     bool uses_cbuf_indirect{};
     bool uses_render_area{};
+    /// A generated stage reads values the host sets per draw (Backend::SPIRV::STAGE_CONSTANTS_OFFSET)
+    bool uses_stage_constants{};
+    /// The fragment program discards by the polygon stipple pattern after the stage constants.
+    bool uses_polygon_stipple{};
+    /// The epilogue's logic op fetches the render target: a Texture2D after the stage's images.
+    bool uses_destination_read{};
 
     IR::Type used_constant_buffer_types{};
     IR::Type used_storage_buffer_types{};

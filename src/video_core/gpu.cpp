@@ -19,6 +19,7 @@
 #include "common/settings_enums.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
@@ -33,30 +34,22 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
+#include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/gpu_written_pages.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/frame_pipeline.h"
 #include "video_core/frame_trace.h"
 #include "video_core/perf_counters.h"
 #include "video_core/readback_trace.h"
+#include "video_core/gpu_timestamp.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
-
-namespace {
-constexpr u64 GpuClockMultiplier(Settings::GpuClock clock) {
-    switch (clock) {
-    case Settings::GpuClock::Boost:
-        return 256;
-    case Settings::GpuClock::Overclock:
-        return 512;
-    default:
-        return 1;
-    }
-}
-} // Anonymous namespace
 
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
@@ -67,7 +60,12 @@ struct GPU::Impl {
         , is_async{is_async_}
     {}
 
-    ~Impl() = default;
+    ~Impl() {
+        NotifyShutdown();
+        // Rasterizer teardown flushes commands and invalidates the bound engine's dirty flags.
+        // Keep channels, their scheduler references, and the graphics context alive until then.
+        renderer.reset();
+    }
 
     std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
         auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
@@ -201,6 +199,16 @@ struct GPU::Impl {
         });
     }
 
+    /// WaitForSyncOperation for at most timeout; false if the operation has not run by then.
+    [[nodiscard]] bool WaitForSyncOperationFor(const u64 fence,
+                                               std::chrono::microseconds timeout) {
+        std::unique_lock lck{sync_request_mutex};
+        return sync_request_cv.wait_for(lck, timeout, [this, fence] {
+            return CurrentSyncRequestFence() >= fence ||
+                   (shutting_down.load(std::memory_order_acquire) && !sync_request_active);
+        });
+    }
+
     void WaitForIdle() {
         if (shutting_down.load(std::memory_order_acquire)) return;
         const u64 fence = RequestSyncOperation([] {});
@@ -243,8 +251,8 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
-        const u64 gpu_tick = system.CoreTiming().GetGPUTicks();
-        return gpu_tick / GpuClockMultiplier(Settings::values.gpu_clock.GetValue());
+        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
+                                Settings::values.gpu_clock.GetValue());
     }
 
     void RendererFrameEndNotify() {
@@ -297,8 +305,18 @@ struct GPU::Impl {
         gpu_thread.Run(std::move(func), is_async);
     }
 
-    void MapInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), is_async, true);
+    void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
+        const u64 id = pending_maps.Add(gpu_addr, size);
+        gpu_thread.Run(
+            [this, id, func = std::move(func)] {
+                func();
+                pending_maps.Remove(id);
+            },
+            is_async, true);
+    }
+
+    bool IsMapPending(GPUVAddr gpu_addr, u64 size) const {
+        return pending_maps.Overlaps(gpu_addr, size);
     }
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
@@ -308,6 +326,12 @@ struct GPU::Impl {
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        // cpu_write_defer and jit_read_table trust a clear GpuWrittenPages granule to mean no GPU
+        // data to flush.
+        if (!raster_area.preemtive && VideoCommon::GpuWrittenPages::Enabled() &&
+            !VideoCommon::GpuWrittenPages::AnyMarked(addr, size)) {
+            VideoCore::Perf::Add(VideoCore::Perf::Counter::GpuFlushUnmarked, 1);
+        }
         const auto capture_memory = [&] {
             if (!VideoCommon::FullCapture::Active()) return;
             if (size > (16ULL << 20)) {
@@ -444,6 +468,7 @@ struct GPU::Impl {
         }
         pending_composite_fence = 0;
         earlier_composite_fence = 0;
+        overdue_composite_fence = 0;
         if (shutting_down.load(std::memory_order_relaxed)) {
             return;
         }
@@ -458,7 +483,32 @@ struct GPU::Impl {
         if (shutting_down.load(std::memory_order_relaxed)) {
             return;
         }
-        WaitForSyncOperation(fence);
+        using VideoCore::FramePipeline::Mode;
+        const Mode nowait = VideoCore::FramePipeline::VsyncNowait();
+        if (nowait == Mode::Off) {
+            WaitForSyncOperation(fence);
+            return;
+        }
+        // vsync_nowait: a late GPU thread must not make the guest's vsync late, or a game with a
+        // dynamic swap interval takes the vsync as missed and slows down (interval 2 -> 3).
+        if (const u64 overdue = std::exchange(overdue_composite_fence, 0); overdue != 0) {
+            // A composite already passed over: never more than three in flight (it, the one
+            // before pending and pending), and the oldest is the closest to done.
+            if (!WaitForSyncOperationFor(overdue, std::chrono::microseconds{0})) {
+                VideoCore::Perf::Add(VideoCore::Perf::Counter::VsyncComposeWaitsFull, 1);
+                WaitForSyncOperation(overdue);
+            }
+        }
+        constexpr std::chrono::microseconds MAX_WAIT{2000};
+        if (WaitForSyncOperationFor(fence, MAX_WAIT)) {
+            return;
+        }
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::VsyncComposeWaitsCut, 1);
+        if (nowait == Mode::Check) {
+            WaitForSyncOperation(fence);
+            return;
+        }
+        overdue_composite_fence = fence;
     }
 
     std::vector<u8> GetAppletCaptureBuffer() {
@@ -499,6 +549,8 @@ struct GPU::Impl {
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
     std::atomic<u64> last_sync_fence{}; // written under sync_request_mutex
+
+    VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
     bool sync_request_active{}; // protected by sync_request_mutex
@@ -517,6 +569,7 @@ struct GPU::Impl {
     std::mutex request_swap_mutex;
     u64 pending_composite_fence{};
     u64 earlier_composite_fence{}; // the request before pending_composite_fence, if not waited
+    u64 overdue_composite_fence{}; // vsync_nowait: an earlier composite not waited for in full
 
     std::atomic_bool flush_requested{};
 
@@ -565,6 +618,15 @@ void GPU::RequestFlushCommands() {
 
 void GPU::InvalidateGPUCache() {
     impl->InvalidateGPUCache();
+}
+
+bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
+    for (auto& manager : impl->system.GetGPUDirtyMemoryManager()) {
+        if (manager.Overlaps(addr, size)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void GPU::OnCommandListEnd() {
@@ -721,8 +783,12 @@ void GPU::RunInOrder(std::function<void()>&& func) {
     impl->RunInOrder(std::move(func));
 }
 
-void GPU::MapInOrder(std::function<void()>&& func) {
-    impl->MapInOrder(std::move(func));
+void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
+    impl->MapInOrder(gpu_addr, size, std::move(func));
+}
+
+bool GPU::IsMapPending(GPUVAddr gpu_addr, u64 size) const {
+    return impl->IsMapPending(gpu_addr, size);
 }
 
 void GPU::InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {

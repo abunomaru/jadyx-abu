@@ -26,6 +26,16 @@ constexpr u32 GOB_SIZE_SHIFT = GOB_SIZE_X_SHIFT + GOB_SIZE_Y_SHIFT + GOB_SIZE_Z_
 constexpr u32 SWIZZLE_X_BITS = 0b100101111;
 constexpr u32 SWIZZLE_Y_BITS = 0b011010000;
 
+/// The block height (log2 of GOBs) a block-linear surface of `rows` element rows is laid out
+/// with: the GPU halves the named one while the surface fits in half a block. The texture cache
+/// applies the same rule to every level, so the copy engines must too.
+[[nodiscard]] constexpr u32 FitBlockHeight(u32 rows, u32 block_height) {
+    while (block_height > 0 && rows <= (GOB_SIZE_Y << (block_height - 1))) {
+        --block_height;
+    }
+    return block_height;
+}
+
 /// Unswizzles a block linear texture into linear memory. A nonzero linear_pitch sets the bytes
 /// between output rows (at least the row's bytes); zero packs the rows tightly.
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
@@ -41,10 +51,11 @@ void SwizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_p
 std::size_t CalculateSize(bool tiled, u32 bytes_per_pixel, u32 width, u32 height, u32 depth,
                           u32 block_height, u32 block_depth);
 
-/// Copies an untiled subrectangle into a tiled surface.
+/// Copies an untiled subrectangle into a tiled surface, starting at slice origin_z.
 void SwizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
                     u32 height, u32 depth, u32 origin_x, u32 origin_y, u32 extent_x, u32 extent_y,
-                    u32 block_height, u32 block_depth, u32 pitch_linear, bool native_tiling = false);
+                    u32 block_height, u32 block_depth, u32 pitch_linear, u32 origin_z = 0,
+                    bool native_tiling = false);
 
 /// Copies a tiled subrectangle into a linear surface.
 void UnswizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,

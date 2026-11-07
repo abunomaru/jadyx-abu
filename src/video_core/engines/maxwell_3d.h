@@ -3211,6 +3211,12 @@ public:
     /// Stores a run of CB_DATA words (see ConstBufferRunLength) with one memory write. Registers,
     /// shadow RAM and memory end as CallMethod word by word would leave them, in every shadow mode.
     void StoreConstBufferRun(u32 method, const u32* words, u32 amount, bool increment_once);
+
+    /// GpuSplit's back (fast_maxwell3d): CallMethod for each of up to 64 single writes to the
+    /// constant buffer data registers, uploaded in one memory write within a device page.
+    void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
+                              u32 count);
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
@@ -3262,6 +3268,15 @@ public:
         RefreshParametersImpl();
     }
 
+    /// Re-reads parameters [first, first + count) of a call whose arguments may hold GPU writes,
+    /// for macros that read only those words on the CPU and hand the rest to the GPU.
+    void RefreshParameters(size_t first, size_t count) {
+        if (!current_macro_dirty) {
+            return;
+        }
+        RefreshParametersImpl(first, count);
+    }
+
     bool AnyParametersDirty() const {
         return current_macro_dirty;
     }
@@ -3296,6 +3311,12 @@ private:
     void ConsumeSinkImpl(Core::System& system) override;
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
+
+    /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.
+    void CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
+    void CallMethodFast(u32 method, u32 method_argument, bool is_last_call);
+    /// EDEN_NX2_PERF_VERIFY: CallMethodFast's register state against CallMethodSlow's.
+    void VerifyCallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;
@@ -3345,6 +3366,7 @@ private:
     void ProcessSyncPoint();
 
     void RefreshParametersImpl();
+    void RefreshParametersImpl(size_t first, size_t count);
 
     bool IsMethodExecutable(u32 method);
 
@@ -3399,10 +3421,14 @@ private:
     // the front owns the macro code and bindings (the back thread then leaves them alone).
     struct FrontState;
     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
+    bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                      u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/hardware_properties.h"
+
 namespace Core::JitPrewarm {
 
 enum class Miss : std::size_t {
@@ -18,8 +20,8 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(Miss::Count)> 
     "unlearned", "budget", "other-core", "fpcr-variant", "code-changed",
     "prewarm-rejected", "warmed-recompiled", "record-only", "outside-static-rx"
 };
-using MissSnapshot = std::array<std::array<std::uint64_t, MissNames.size()>, 4>;
-inline std::array<std::array<std::atomic<std::uint64_t>, MissNames.size()>, 4> miss_counters{};
+using MissSnapshot = std::array<std::array<std::uint64_t, MissNames.size()>, Hardware::NUM_CPU_CORES>;
+inline std::array<std::array<std::atomic<std::uint64_t>, MissNames.size()>, Hardware::NUM_CPU_CORES> miss_counters{};
 inline std::atomic_bool capture_active{};
 
 // Only compilation callbacks update these counters; no work on cached block execution.

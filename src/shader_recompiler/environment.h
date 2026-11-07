@@ -68,6 +68,8 @@ struct ConstBufferAddr {
     u32 count;
     bool has_secondary;
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
+    /// The handle is a fragment input instead of a constant buffer word; offset holds the attribute.
+    bool varying_handle{};
 };
 
 class Environment {
@@ -85,6 +87,12 @@ public:
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
     [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
+
+    /// Native programs: whether the 8 bytes at `indirect` past the pointer at (index, offset) are
+    /// a mapped GPU address (a pointer table the program loads its buffer pointer from).
+    [[nodiscard]] virtual bool IsCbufIndirectStorageBufferPointer(u32, u32, u32) {
+        return true;
+    }
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 
@@ -106,10 +114,16 @@ public:
 
     [[nodiscard]] virtual bool HasHLEMacroState() const = 0;
 
+    [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }
+
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;
 
     virtual void Dump(u64 pipeline_hash, u64 shader_hash) = 0;
+
+    /// Writes the guest code, as Dump does, to file_name in the log folder: kept for a shader that
+    /// failed to build so that it can be read offline.
+    virtual void DumpToLogFolder([[maybe_unused]] const std::string& file_name) {}
 
     /// Where the shader's code came from, for a log of a shader that failed to build.
     [[nodiscard]] virtual std::string DescribeCode() const {

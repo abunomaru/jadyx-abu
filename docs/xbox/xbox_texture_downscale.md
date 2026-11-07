@@ -1,5 +1,9 @@
 # Texturas servidas uno o dos niveles abajo (`texture_scale`)
 
+> **Retirado el 6 nov 2026** al sincronizar con Jadyx `main` (`451b027`): el upstream resuelve lo
+> mismo con `SetAstcDropTopLevel` (sesgo de niveles en el texture cache D3D12) y Permafrost. El
+> código de esta opción queda en la historia (`becbe0a`); este documento se conserva como registro.
+
 Candidato del 3 de noviembre de 2026. Implementa lo que el README deja como siguiente paso:
 «An option to lower the resolution of the largest textures. It costs sharpness, but it would leave
 enough room for the heaviest loads.» Esta revisión **no certifica** memoria ni FPS en la Series: el

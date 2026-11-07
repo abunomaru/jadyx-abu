@@ -5,11 +5,13 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -27,21 +29,28 @@
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/demote_return_pass.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/ir_opt/workgroup_split_pass.h"
 #include "shader_recompiler/program_header.h"
+#include "shader_recompiler/tessellation_emulation.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/frame_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/perf_counters.h"
+#include "video_core/renderer_d3d12/d3d12_async_pipelines.h"
 #include "video_core/renderer_d3d12/d3d12_local_memory_scratch.h"
 #include "video_core/renderer_d3d12/d3d12_maxwell_to_d3d12.h"
+#include "video_core/renderer_d3d12/d3d12_memory_reserve.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_cache.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_stats.h"
+#include "video_core/renderer_d3d12/d3d12_pso_blob_cache.h"
 #include "video_core/renderer_d3d12/d3d12_dxil_disk_cache.h"
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
 #include "video_core/renderer_d3d12/d3d12_shader_compiler.h"
 #include "video_core/renderer_d3d12/d3d12_stream_output.h"
+#include "video_core/renderer_d3d12/d3d12_pipeline_helper.h"
+#include "video_core/renderer_d3d12/d3d12_render_corrections.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/shader_environment.h"
@@ -200,6 +209,34 @@ Shader::CompareFunction MaxwellToCompareFunction(Maxwell::ComparisonOp compariso
     return Shader::CompareFunction::Always;
 }
 
+void ApplyVertexFetchFixups(Shader::IR::Program& program, const GraphicsPipelineCacheKey& key) {
+    using Shader::Optimization::VertexFetchFixup;
+    std::array<VertexFetchFixup, 32> fixups{};
+    bool any = false;
+    for (size_t index = 0; index < key.state.attributes.size(); ++index) {
+        const auto& attr = key.state.attributes[index];
+        if (attr.enabled == 0) {
+            continue;
+        }
+        VertexFetchFixup& fixup = fixups[index];
+        fixup.swap_red_blue =
+            attr.bgra != 0 &&
+            MaxwellToD3D12::FetchesBgraInShader(attr.Type(), attr.Size(), attr.offset,
+                                                key.state.vertex_strides[attr.buffer]);
+        const u32 components = MaxwellToD3D12::Vertex32BitComponents(attr.Size());
+        if (components != 0 && attr.Type() == Maxwell::VertexAttribute::Type::UNorm) {
+            fixup.normalize = VertexFetchFixup::Normalize::Unsigned;
+        } else if (components != 0 && attr.Type() == Maxwell::VertexAttribute::Type::SNorm) {
+            fixup.normalize = VertexFetchFixup::Normalize::Signed;
+        }
+        fixup.components = static_cast<u8>(components);
+        any |= fixup.swap_red_blue || fixup.normalize != VertexFetchFixup::Normalize::None;
+    }
+    if (any) {
+        Shader::Optimization::VertexFetchPass(program, fixups);
+    }
+}
+
 Shader::AttributeType CastAttributeType(const FixedPipelineState::VertexAttribute& attr) {
     if (attr.enabled == 0) {
         return Shader::AttributeType::Disabled;
@@ -209,6 +246,15 @@ Shader::AttributeType CastAttributeType(const FixedPipelineState::VertexAttribut
         // DXGI has no signed 10:10:10:2: fetched as a packed R32_UINT (VertexFormat) and normalized
         // in the shader. Game C packs normals like this; read as floats they were NaN.
         return Shader::AttributeType::SignedNormA2B10G10R10;
+    }
+    if (MaxwellToD3D12::Vertex32BitComponents(attr.Size()) != 0) {
+        // Fetched as integers and normalized by VertexFetchPass.
+        if (attr.Type() == Maxwell::VertexAttribute::Type::UNorm) {
+            return Shader::AttributeType::UnsignedInt;
+        }
+        if (attr.Type() == Maxwell::VertexAttribute::Type::SNorm) {
+            return Shader::AttributeType::SignedInt;
+        }
     }
     switch (attr.Type()) {
     case Maxwell::VertexAttribute::Type::UnusedEnumDoNotUseBecauseItWillGoAway:
@@ -229,10 +275,279 @@ Shader::AttributeType CastAttributeType(const FixedPipelineState::VertexAttribut
     return Shader::AttributeType::Float;
 }
 
+/// How points wider than a pixel, or with coordinates inside them, are drawn: D3D12 points are one
+/// pixel, so a generated geometry shader makes quads of them. Decides the generics the size and the
+/// coordinates travel in, and rewrites the guest programs to use them.
+struct PointGeometry {
+    bool enabled{};
+    std::optional<Shader::IR::Attribute> size_attr;
+    std::optional<Shader::IR::Attribute> coord_attr;
+};
+
+/// Primitive state D3D12 lacks, drawn by a generated geometry shader (PlanPrimitiveGeometry).
+struct PrimitiveGeometry {
+    enum class Kind { None, Lines, PolygonPoints, FillRectangle, ProvokingLast };
+    Kind kind{Kind::None};
+    /// Generic with the pixels from the line's start, for the fragment program's stipple.
+    std::optional<u32> stipple_generic;
+};
+
+PointGeometry PlanPointGeometry(std::span<Shader::IR::Program> programs,
+                                const GraphicsPipelineCacheKey& key, bool excluded) {
+    using Shader::IR::Attribute;
+    PointGeometry plan;
+    if (excluded || key.state.topology != Maxwell::PrimitiveTopology::Points ||
+        key.unique_hashes[1] == 0 || key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 ||
+        key.unique_hashes[4] != 0) {
+        return plan;
+    }
+    Shader::Info& vertex = programs[1].info;
+    Shader::Info& fragment = programs[5].info;
+    const bool reads_coord =
+        fragment.loads[Attribute::PointSpriteS] || fragment.loads[Attribute::PointSpriteT];
+    const bool writes_size = vertex.stores[Attribute::PointSize];
+    const float fixed_size = std::bit_cast<float>(key.state.point_size);
+    if (!reads_coord && !writes_size && fixed_size == 1.0f) {
+        return plan;
+    }
+    // A generated stage forwards position and generics only, so a point sent to another layer or
+    // viewport stays the host's.
+    if (vertex.stores[Attribute::Layer] || vertex.stores[Attribute::ViewportIndex]) {
+        return plan;
+    }
+    std::vector<Attribute> free_generics;
+    for (u32 index = Shader::IR::NUM_GENERICS; index-- > 0;) {
+        if (!vertex.stores.Generic(index) && !fragment.loads.Generic(index)) {
+            free_generics.push_back(Attribute::Generic0X + index * 4);
+        }
+    }
+    if (free_generics.size() < static_cast<size_t>(writes_size) + (reads_coord ? 1 : 0)) {
+        return plan;
+    }
+    plan.enabled = true;
+    if (writes_size) {
+        plan.size_attr = free_generics.back();
+        free_generics.pop_back();
+        vertex.stores.Set(Attribute::PointSize, false);
+        vertex.stores.Set(*plan.size_attr, true);
+        for (Shader::IR::Block* const block : programs[1].post_order_blocks) {
+            for (Shader::IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() == Shader::IR::Opcode::SetAttribute &&
+                    inst.Arg(0).Attribute() == Attribute::PointSize) {
+                    inst.SetArg(0, Shader::IR::Value(*plan.size_attr));
+                }
+            }
+        }
+    }
+    if (reads_coord) {
+        plan.coord_attr = free_generics.back();
+        fragment.loads.Set(Attribute::PointSpriteS, false);
+        fragment.loads.Set(Attribute::PointSpriteT, false);
+        for (Shader::IR::Block* const block : programs[5].post_order_blocks) {
+            for (Shader::IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() != Shader::IR::Opcode::GetAttribute) {
+                    continue;
+                }
+                const Attribute attr = inst.Arg(0).Attribute();
+                if (attr == Attribute::PointSpriteS || attr == Attribute::PointSpriteT) {
+                    const Attribute generic =
+                        *plan.coord_attr + (attr == Attribute::PointSpriteS ? 0 : 1);
+                    fragment.loads.Set(generic, true);
+                    inst.SetArg(0, Shader::IR::Value(generic));
+                }
+            }
+        }
+    }
+    return plan;
+}
+
+/// The swizzle a shader has to apply, or 0: a negated y is the viewport's job (SetViewports).
+u16 EmulatedViewportSwizzle(u16 swizzle) {
+    constexpr u16 IDENTITY = 0 | 2 << 4 | 4 << 8 | 6 << 12;
+    constexpr u16 Y_MASK = 7 << 4;
+    swizzle &= 0x7777;
+    if (((swizzle >> 4) & 7) == 3) {
+        swizzle = static_cast<u16>((swizzle & ~Y_MASK) | 2 << 4);
+    }
+    return swizzle == IDENTITY ? 0 : swizzle;
+}
+
+PrimitiveGeometry PlanPrimitiveGeometry(std::span<Shader::IR::Program> programs,
+                                        const GraphicsPipelineCacheKey& key, bool excluded) {
+    using Shader::IR::Attribute;
+    using Kind = PrimitiveGeometry::Kind;
+    PrimitiveGeometry plan;
+    if (excluded || key.unique_hashes[1] == 0 || key.unique_hashes[2] != 0 ||
+        key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0) {
+        return plan;
+    }
+    Shader::Info& vertex = programs[1].info;
+    Shader::Info& fragment = programs[5].info;
+    // Generated stages forward position and generics only.
+    if (vertex.stores[Attribute::Layer] || vertex.stores[Attribute::ViewportIndex]) {
+        return plan;
+    }
+    for (u32 index = 0; index < 8; ++index) {
+        if (vertex.stores[Attribute::ClipDistance0 + index]) {
+            return plan;
+        }
+    }
+    const auto& dynamic = key.state.dynamic_state;
+    if (dynamic.generated_lines != 0) {
+        plan.kind = Kind::Lines;
+        if (dynamic.line_stipple_enable != 0) {
+            for (u32 index = Shader::IR::NUM_GENERICS; index-- > 0;) {
+                if (!vertex.stores.Generic(index) && !fragment.loads.Generic(index)) {
+                    plan.stipple_generic = index;
+                    fragment.loads.Set(Attribute::Generic0X + index * 4, true);
+                    fragment.interpolation[index] = Shader::Interpolation::NoPerspective;
+                    break;
+                }
+            }
+        }
+    } else if (dynamic.generated_polygon_points != 0) {
+        plan.kind = Kind::PolygonPoints;
+    } else if (dynamic.generated_fill_rectangle != 0) {
+        plan.kind = Kind::FillRectangle;
+    } else if (key.state.provoking_vertex_last != 0) {
+        for (u32 index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+            if (fragment.interpolation[index] == Shader::Interpolation::Flat &&
+                fragment.loads.Generic(index) && vertex.stores.Generic(index)) {
+                plan.kind = Kind::ProvokingLast;
+                break;
+            }
+        }
+    }
+    return plan;
+}
+
+/// Gives each attribute group (attribute / 4) that stores writes and loads reads a slot of an
+/// emulated tessellation vertex (RuntimeInfo::tess_input_slots), position first, then the
+/// generics in order. Legacy loads take every group stores writes. Returns the slots taken.
+u32 AssignTessSlots(const Shader::VaryingState& stores, const Shader::VaryingState& loads,
+                    std::array<u8, 128>& slots) {
+    constexpr u32 POSITION_GROUP = static_cast<u32>(Shader::IR::Attribute::PositionX) / 4;
+    constexpr u32 FIRST_GENERIC_GROUP = static_cast<u32>(Shader::IR::Attribute::Generic0X) / 4;
+    const bool all = loads.Legacy();
+    u32 count = 0;
+    const auto assign = [&](u32 group) {
+        const auto base = static_cast<Shader::IR::Attribute>(group * 4);
+        if (stores.AnyComponent(base) && (all || loads.AnyComponent(base))) {
+            slots[group] = static_cast<u8>(++count);
+        }
+    };
+    assign(POSITION_GROUP);
+    for (u32 index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        assign(FIRST_GENERIC_GROUP + index);
+    }
+    return count;
+}
+
+/// The generic patches both the control shader writes and the evaluation shader reads get a slot
+/// of the record. Returns the slots taken.
+u32 AssignTessPatchSlots(const Shader::Info& control, const Shader::Info& eval,
+                         std::array<u8, 30>& slots) {
+    u32 count = 0;
+    for (size_t index = 0; index < slots.size(); ++index) {
+        if (control.uses_patches[index] && eval.uses_patches[index]) {
+            slots[index] = static_cast<u8>(++count);
+        }
+    }
+    return count;
+}
+
+/// The vertex layouts the stages of an emulated tessellation agree on, filled stage by stage.
+struct TessLayout {
+    TessEmulationPlan plan;
+    std::array<u8, 128> input_slots{};
+    std::array<u8, 128> output_slots{};
+    std::array<u8, 30> patch_slots{};
+    u32 input_vertex_slots{};
+    u32 output_vertex_slots{};
+    u32 record_patch_slots{};
+
+    /// Called with each stage, after ConvertLegacyToGeneric, so the producers' stores are generics.
+    void Apply(std::span<const Shader::IR::Program> programs, const GraphicsPipelineCacheKey& key,
+               const Shader::IR::Program& program, bool generates_tess_control,
+               bool has_any_geometry, Shader::RuntimeInfo& info) {
+        namespace Tess = Shader::TessellationEmulation;
+        const u32 control_points = key.state.patch_control_points_minus_one + 1;
+        switch (program.stage) {
+        case Shader::Stage::VertexB: {
+            // The generated control shader, made later from this stage, passes on what the
+            // evaluation shader reads.
+            const Shader::Info& consumer = generates_tess_control ? programs[3].info
+                                                                  : programs[2].info;
+            input_vertex_slots = AssignTessSlots(program.info.stores, consumer.loads, input_slots);
+            if (input_vertex_slots == 0) {
+                // The capture keeps one slot, so its buffer and stride are never empty.
+                input_slots[static_cast<u32>(Shader::IR::Attribute::PositionX) / 4] = 1;
+                input_vertex_slots = 1;
+            }
+            // The tessellated vertices go through the viewport, not these, and the guest's
+            // transform feedback captures the evaluation shader's.
+            info.convert_depth_mode = false;
+            info.xfb_varyings = {};
+            info.xfb_repeats.clear();
+            info.xfb_count = 0;
+            info.xfb_storage = false;
+            info.xfb_copy_outputs = false;
+            info.tess_capture = true;
+            info.tess_input_slots = input_slots;
+            info.tess_input_vertex_slots = input_vertex_slots;
+            plan.input_vertices = control_points;
+            plan.input_vertex_bytes = input_vertex_slots * Tess::SLOT_WORDS * 4;
+            break;
+        }
+        case Shader::Stage::TessellationControl: {
+            const Shader::IR::Program& eval = programs[3];
+            output_vertex_slots =
+                AssignTessSlots(program.info.stores, eval.info.loads, output_slots);
+            record_patch_slots = AssignTessPatchSlots(program.info, eval.info, patch_slots);
+            info.tess_emulation = Shader::TessEmulation::ControlCompute;
+            info.tess_input_slots = input_slots;
+            info.tess_input_vertex_slots = input_vertex_slots;
+            info.tess_input_vertices = control_points;
+            plan.output_vertices = std::max(program.invocations, 1U);
+            plan.patches_per_group = Tess::PatchesPerGroup(plan.output_vertices);
+            plan.record_words =
+                Tess::RecordWords(record_patch_slots, plan.output_vertices, output_vertex_slots);
+            break;
+        }
+        case Shader::Stage::TessellationEval:
+            info.tess_emulation = Shader::TessEmulation::EvalVertex;
+            info.convert_depth_mode = key.state.ndc_minus_one_to_one != 0 && !has_any_geometry;
+            plan.domain = static_cast<u32>(info.tess_primitive);
+            switch (info.tess_spacing) {
+            case Shader::TessSpacing::FractionalOdd:
+                plan.partitioning = 0;
+                break;
+            case Shader::TessSpacing::FractionalEven:
+                plan.partitioning = 1;
+                break;
+            case Shader::TessSpacing::Equal:
+                plan.partitioning = 2;
+                break;
+            }
+            plan.ccw = !info.tess_clockwise;
+            break;
+        default:
+            return;
+        }
+        // Both tessellation stages read a record laid out the same way.
+        info.tess_output_slots = output_slots;
+        info.tess_patch_slots = patch_slots;
+        info.tess_output_vertex_slots = output_vertex_slots;
+        info.tess_record_patch_slots = record_patch_slots;
+        info.tess_output_vertices = plan.output_vertices;
+    }
+};
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
-                                    const Shader::IR::Program* previous_program) {
+                                    const Shader::IR::Program* previous_program,
+                                    bool point_geometry) {
     Shader::RuntimeInfo info;
     if (previous_program) {
         info.previous_stage_stores = previous_program->info.stores;
@@ -244,7 +559,8 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
         info.previous_stage_stores.mask.set();
     }
     const Shader::Stage stage{program.stage};
-    const bool has_geometry{key.unique_hashes[4] != 0 && !programs[4].UsesNativeGeometryPassthrough()};
+    const bool has_geometry{point_geometry || (key.unique_hashes[4] != 0 &&
+                                               !programs[4].UsesNativeGeometryPassthrough())};
     const bool gl_ndc{key.state.ndc_minus_one_to_one != 0};
     const float point_size{std::bit_cast<float>(key.state.point_size)};
     switch (stage) {
@@ -270,7 +586,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             }
         }
         break;
+    case Shader::Stage::TessellationControl:
+        info.patch_vertices = key.state.patch_control_points_minus_one + 1;
+        break;
     case Shader::Stage::TessellationEval:
+        // The control stage's output patch.
+        if (previous_program && previous_program->stage == Shader::Stage::TessellationControl) {
+            info.patch_vertices = previous_program->invocations;
+        }
         info.tess_clockwise = key.state.tessellation_clockwise != 0;
         info.tess_primitive = [&key] {
             switch (static_cast<Maxwell::Tessellation::DomainType>(
@@ -308,6 +631,30 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             key.state.UnpackComparisonOp(key.state.alpha_test_func.Value()));
         info.alpha_test_reference = std::bit_cast<float>(key.state.alpha_test_ref);
         info.dual_source_blend = key.state.attachment0_dual_source_blend != 0;
+        if (GetUnormHalfDownRounding()) {
+            for (size_t index = 0; index < key.state.color_formats.size(); ++index) {
+                if (IsUnorm8RenderTarget(key.state.color_formats[index]) &&
+                    key.state.attachments[index].enable == 0) {
+                    info.unorm8_output_mask |= static_cast<u8>(1U << index);
+                }
+            }
+        }
+        if (EmulatesLogicOp(key.state)) {
+            info.logic_op_enable = true;
+            info.logic_op = static_cast<u8>(key.state.dynamic_state.logic_op.Value());
+            info.logic_op_bits = LogicOpChannelBits(key.state.color_formats[0]);
+        }
+        info.alpha_to_coverage_footprint = key.ShaderAlphaToCoverage();
+        info.sample_mask_footprint = key.SampleMaskFootprint();
+        info.blend_constant_factors = PlanBlendConstants(key.state).shader_factors;
+        if ((key.shader_flags & GraphicsPipelineCacheKey::SHADER_DEPTH_BIAS) != 0) {
+            // Maxwell's constant bias counts twice D3D12's units.
+            info.depth_bias_in_shader = true;
+            info.depth_bias_unit = DepthBiasUnit(key.state.depth_format.Value());
+            info.depth_bias_constant = std::bit_cast<f32>(key.depth_bias) / 2.0f;
+            info.depth_bias_slope = std::bit_cast<f32>(key.slope_scaled_depth_bias);
+            info.depth_bias_clamp = std::bit_cast<f32>(key.depth_bias_clamp);
+        }
         break;
     default:
         break;
@@ -339,10 +686,23 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 }
 
 /// Pipeline workers. Capped: each one holds a recompiler and a translator's worth of memory, and
-/// the console's game partition has 5 GB in total.
+/// the console's game partition has 5 GB in total. "pso_workers=" sets them for A/B runs.
 size_t GetTotalPipelineWorkers() {
+    if (const u32 configured = GetPipelineWorkers(); configured != 0) {
+        return configured;
+    }
     const size_t threads = std::max<size_t>(std::thread::hardware_concurrency(), 2) - 1;
     return std::min<size_t>(threads, 4);
+}
+
+/// Workers for the disk cache on the loading screen. Nothing else runs then but the loading
+/// animation, so every logical CPU builds; at low priority, the animation still goes first. They
+/// are gone once the game starts, which keeps the capped workers above. "pso_boot_workers=".
+size_t GetTotalPipelineBootWorkers() {
+    if (const u32 configured = GetPipelineBootWorkers(); configured != 0) {
+        return configured;
+    }
+    return std::max<size_t>(std::thread::hardware_concurrency(), 2);
 }
 
 /// Shader capabilities from D3D12's feature queries (logged at boot by Device::LogCapabilities).
@@ -470,6 +830,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_viewport_index_layer_non_geometry = caps.vp_and_rt_index_from_any_stage,
         .support_viewport_mask = false,
         .support_typeless_image_loads = caps.typed_uav_load_additional_formats,
+        .repack_raw_image_loads = true,
         // Terminal discard arms may continue as helpers after DemoteReturnPass.
         // OpKill would terminate those lanes before their derivative calculations.
         .support_demote_to_helper_invocation = true,
@@ -537,6 +898,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_conditional_barrier = false,
     };
     host_info.ApplyDescriptorLimitPolicy();
+    profile.sanitize_cube_directions = GetCubeDirectionSanitize();
+    profile.flush_lowered_fp16_denorms = GetHalfFloatFlush();
 
     LOG_INFO(Render,
              "D3D12: pipeline cache ready ({} workers, waves up to {} lanes, int64 {}, "
@@ -555,7 +918,7 @@ PipelineCache::~PipelineCache() {
 void PipelineCache::TickResidency(const CacheMemorySnapshot& snapshot, Scheduler& scheduler) {
     using Policy = PipelineResidencyPolicy;
     ++residency_frame;
-    const u64 idle_frames = Policy::IdleFrames(snapshot.app_used, snapshot.app_limit);
+    u64 idle_frames = Policy::IdleFrames(snapshot.app_used, snapshot.app_limit);
     const u64 ledger = Common::MemoryLedgerCommittedBytes();
     const auto verdict_before = release_probe.GetVerdict();
     release_probe.Tick(residency_frame, pipelines_evicted,
@@ -568,6 +931,23 @@ void PipelineCache::TickResidency(const CacheMemorySnapshot& snapshot, Scheduler
                  release_probe.Probed(), release_probe.Freed() / 1024,
                  pays ? "released under pressure"
                       : "kept under pressure (they cost no commit), released only in an emergency");
+    }
+    // A pipeline object that ran out of memory: idle ones are released as in an emergency for a
+    // while, and the memory reserve is committed again once the app is no longer short of it.
+    const u64 oom_events = MemoryReserve::OutOfMemoryEvents();
+    if (oom_events != seen_oom_events) {
+        seen_oom_events = oom_events;
+        oom_frame = residency_frame;
+        LOG_WARNING(Render, "D3D12: {} pipeline objects ran out of memory so far; releasing idle "
+                            "pipelines",
+                    oom_events);
+    }
+    const bool after_oom = oom_events != 0 && residency_frame - oom_frame < OOM_RETRY_FRAMES;
+    if (after_oom) {
+        idle_frames = Policy::EMERGENCY_IDLE_FRAMES;
+    } else if (oom_events != 0 && idle_frames >= Policy::IDLE_FRAMES &&
+               residency_frame % OOM_REARM_FRAMES == 0 && MemoryReserve::Held() == 0) {
+        MemoryReserve::Rearm();
     }
     const bool evict =
         (pipeline_eviction.load(std::memory_order_relaxed) && release_probe.MayRelease()) ||
@@ -596,12 +976,34 @@ void PipelineCache::TickResidency(const CacheMemorySnapshot& snapshot, Scheduler
     if (residency_frame - last_stats_frame >= STATS_FRAMES) {
         last_stats_frame = residency_frame;
         const auto resident = Common::ReadMemoryAccount(Common::MemoryAccount::PipelineStates);
+        const auto dxil_release = GraphicsPipeline::GetDxilReleaseStats();
         LOG_INFO(Render,
                  "D3D12: {} graphics pipelines, {} PSOs resident; {} released and {} rebuilt so "
-                 "far; {} drawn in recent sessions",
+                 "far; {} drawn in recent sessions; dormant DXIL left on disk {} ({} KiB), read "
+                 "back {}, failed {}",
                  residency_sweep.size(), resident.objects, pipelines_evicted, pipelines_woken,
-                 hot_pipelines.Size());
+                 hot_pipelines.Size(), dxil_release.released, dxil_release.released_bytes / 1024,
+                 dxil_release.reloaded, dxil_release.failed);
         LogPipelineStats("session");
+        if (PsoBlobCache::Enabled()) {
+            const PsoBlobCache::Stats blobs = GetPsoBlobCache().GetStats();
+            LOG_INFO(Render,
+                     "D3D12: driver PSO blobs: {} created from disk, {} without, {} stored "
+                     "({} KiB), {} refused by the driver",
+                     blobs.hits, blobs.misses, blobs.stored, blobs.bytes / 1024, blobs.rejected);
+        }
+        if (GetAsyncPipelines() != AsyncPipelines::Off ||
+            GetPsoBudget() != VideoCore::FramePipeline::Mode::Off) {
+            const PendingDrawStats pending = GetPendingDrawStats();
+            LOG_INFO(Render,
+                     "D3D12: draws while their pipeline was built (since the run began): {} "
+                     "skipped; waited {} small, {} full-screen, {} first to a target, {} within "
+                     "the frame's budget; pso_budget=check: {} the budget would skip, {} it "
+                     "would wait for",
+                     pending.skipped, pending.waited_small, pending.waited_full_screen,
+                     pending.waited_new_target, pending.waited_budget, pending.budget_would_skip,
+                     pending.budget_would_wait);
+        }
     }
 }
 
@@ -611,16 +1013,23 @@ void PipelineCache::TickPrewarm(const CacheMemorySnapshot& snapshot) {
         !PipelineResidencyPolicy::MayPrewarm(snapshot.app_used, snapshot.app_limit)) {
         return;
     }
+    const auto now = std::chrono::steady_clock::now();
+    if (prewarm_last && !prewarm_pacer.Rested(now)) {
+        return;
+    }
     prewarm_last = nullptr;
     while (prewarm_cursor < prewarm_order.size()) {
         GraphicsPipeline* const pipeline = prewarm_order[prewarm_cursor++];
         // Pipelines drawn meanwhile were woken by their draw and are no longer dormant; one
-        // released while idle since is left to its next draw.
-        if (!pipeline->WasEvicted() && pipeline->Wake(prewarm_thread)) {
+        // released while idle since is left to its next draw, unless a loading screen queued it
+        // to be built again.
+        const bool rebuild = prewarm_cursor > prewarm_rebuild_from;
+        if ((rebuild || !pipeline->WasEvicted()) && pipeline->Wake(prewarm_thread)) {
             // Counted as used now, so eviction does not take it back before its first draw.
             pipeline->Touch(residency_frame);
             pipeline->MarkPrewarmed();
             prewarm_last = pipeline;
+            prewarm_pacer.Queued(now);
             GetPipelineStats().prewarm_queued.fetch_add(1, std::memory_order_relaxed);
             break;
         }
@@ -631,7 +1040,53 @@ void PipelineCache::TickPrewarm(const CacheMemorySnapshot& snapshot) {
                  GetPipelineStats().prewarm_hits.load(std::memory_order_relaxed));
         prewarm_order = {};
         prewarm_cursor = 0;
+        prewarm_rebuild_from = SIZE_MAX;
     }
+}
+
+void PipelineCache::SetLoadingScreen(bool loading) {
+    using VideoCore::FramePipeline::Mode;
+    const Mode mode = GetPsoLoading();
+    if (mode == Mode::Off || loading == loading_screen) {
+        return;
+    }
+    loading_screen = loading;
+    if (mode == Mode::On) {
+        prewarm_pacer.rest = loading ? 0 : PrewarmPacer::REST;
+    }
+    if (!loading) {
+        LOG_INFO(Render, "D3D12: loading screen {} ended", loading_screens);
+        return;
+    }
+    ++loading_screens;
+    // Released pipelines the game drew in a kept session, unless the last loading screen's are
+    // still queued.
+    const bool queued = prewarm_rebuild_from != SIZE_MAX;
+    size_t released = 0;
+    if (!queued) {
+        if (mode == Mode::On) {
+            prewarm_rebuild_from = prewarm_order.size();
+        }
+        for (GraphicsPipeline* const pipeline : residency_sweep) {
+            if (pipeline->WasEvicted() && pipeline->IsDormant() &&
+                hot_pipelines.Known(pipeline->KeyHash())) {
+                ++released;
+                if (mode == Mode::On) {
+                    prewarm_order.push_back(pipeline);
+                }
+            }
+        }
+        if (mode == Mode::On && released == 0) {
+            prewarm_rebuild_from = SIZE_MAX;
+        }
+    }
+    LOG_INFO(Render,
+             "D3D12: loading screen {}: {} released pipelines of earlier sessions {}, {} dormant "
+             "PSOs left to prewarm{}",
+             loading_screens, released,
+             mode == Mode::On ? "queued to build again" : "would be built again (pso_loading=check)",
+             prewarm_order.size() - (std::min)(prewarm_cursor, prewarm_order.size()),
+             mode == Mode::On ? ", built back to back" : "");
 }
 
 void PipelineCache::LogPipelineStats(std::string_view when) const {
@@ -650,6 +1105,7 @@ void PipelineCache::LogPipelineStats(std::string_view when) const {
             {PipelineStage::WaitNew, "wait-new"},
             {PipelineStage::WaitDormant, "wait-dormant"},
             {PipelineStage::WaitEvicted, "wait-evicted"},
+            {PipelineStage::WaitCompute, "wait-compute"},
         }};
     std::string line;
     for (const auto& [stage, name] : names) {
@@ -744,7 +1200,12 @@ GraphicsPipeline* PipelineCache::LookupGraphicsPipeline() {
     // only rereads blocks whose Maxwell registers changed.
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
     graphics_key.RefreshStatic(maxwell3d->regs);
-    graphics_key.emulate_reduction = UsesReductionShader(graphics_key.unique_hashes) ? 1 : 0;
+    graphics_key.state.dynamic_state.shader_mirror_border.Assign(
+        !mirror_border_shaders.empty() &&
+        mirror_border_shaders.contains(graphics_key.unique_hashes[5]));
+    if (UsesReductionShader(graphics_key.unique_hashes)) {
+        graphics_key.shader_flags |= GraphicsPipelineCacheKey::SHADER_REDUCTION;
+    }
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
@@ -787,6 +1248,15 @@ void PipelineCache::EmulateReduction(const GraphicsPipelineCacheKey& key, u8 sta
     }
     if (added) {
         // The previous draw's pipeline must not be reused without the new key bit.
+        key_reuse.Forget();
+    }
+}
+
+void PipelineCache::EmulateMirrorBorder(const GraphicsPipelineCacheKey& key) {
+    if (mirror_border_shaders.insert(key.unique_hashes[5]).second) {
+        LOG_INFO(Render, "D3D12: shader {:016x} samples with a sampler that mirrors once to the "
+                         "border; using its emulating pipelines",
+                 key.unique_hashes[5]);
         key_reuse.Forget();
     }
 }
@@ -835,7 +1305,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     const bool emulate_reduction =
         !reduction_shaders.empty() && reduction_shaders.contains(key.unique_hash);
     // The two variants are independent: the emulation rewrites samples, the split ids and loops.
-    const u32 workgroup_split = WorkgroupSplitFor(*kepler_compute);
+    const u32 workgroup_split =
+        compute_not_split.contains(key.Hash()) ? 1 : WorkgroupSplitFor(*kepler_compute);
     auto& cache = emulate_reduction
                       ? (workgroup_split > 1 ? compute_reduction_split_cache
                                              : compute_reduction_cache)
@@ -848,19 +1319,22 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         VideoCore::Perf::ScopedTimer frontend{VideoCore::Perf::Counter::PipelineFrontendUs};
         pipeline = CreateComputePipeline(key, shader, emulate_reduction, workgroup_split);
     }
+    if (is_new && !pipeline && workgroup_split > 1 && compute_not_split.contains(key.Hash())) {
+        cache.erase(pair);
+        return CurrentComputePipeline();
+    }
     if (!pipeline) {
         BUG_TRACK_KEY(DrawSkipped, key.unique_hash,
                       "dispatches skipped: no pipeline for compute {:016x} (shader build failed)",
                       key.unique_hash);
         return nullptr;
     }
-    if (!pipeline->IsBuilt()) {
-        // Compute always waits, even with asynchronous shaders: a skipped dispatch leaves the
-        // buffers or images it writes stale for the rest of the frame and beyond.
-        VideoCore::Perf::ScopedTimer timer{VideoCore::Perf::Counter::PipelineStallUs,
-                                           VideoCore::Perf::Counter::PipelineStalls};
-        VideoCore::Perf::ScopedTimer wait{VideoCore::Perf::Counter::PipelineWaitUs};
-        pipeline->WaitBuilt();
+    // Still building, it is not waited for here: a skipped dispatch would leave the buffers or
+    // images it writes stale, so the dispatch is recorded anyway and the command recorder waits
+    // for the PSO (RasterizerD3D12::DispatchCompute).
+    if (pipeline->OutOfMemory() && residency_frame >= pipeline->retry_frame &&
+        !pipeline->RetryOutOfMemory()) {
+        pipeline->retry_frame = residency_frame + OOM_RETRY_FRAMES;
     }
     return pipeline.get();
 }
@@ -887,6 +1361,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     } else {
         GetDxilDiskCache().Close();
     }
+    GetPsoBlobCache().Open(PsoBlobCache::Enabled() ? base_dir / "d3d12_pso_blobs"
+                                                   : std::filesystem::path{});
     {
         std::ifstream file(hot_pipelines_filename, std::ios::binary);
         const std::vector<u8> bytes{std::istreambuf_iterator<char>(file),
@@ -904,12 +1380,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         std::vector<std::pair<size_t, GraphicsPipeline*>> dormant;
         bool has_loaded{};
     } state;
+    const size_t boot_worker_count = GetTotalPipelineBootWorkers();
+    Common::ThreadWorker boot_workers(boot_worker_count, "D3D12PipelineBoot", {},
+                                      Common::ThreadPlacement::Background);
 
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
-        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
+        boot_workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
             auto pipeline{CreateComputePipeline(pools, key, env_, false)};
             std::scoped_lock lock{state.mutex};
@@ -931,8 +1410,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         const bool build_pso = hot_pipelines.Prewarm(key.Hash(), file_index);
         state.prewarmed += build_pso ? 1 : 0;
 
-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback, build_pso,
-                           file_index]() mutable {
+        boot_workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback, build_pso,
+                                file_index]() mutable {
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
             for (auto& env : envs_) {
@@ -971,7 +1450,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     state.has_loaded = true;
     lock.unlock();
 
-    workers.WaitForRequests(stop_loading);
+    const auto build_start = std::chrono::steady_clock::now();
+    boot_workers.WaitForRequests(stop_loading);
+    LOG_INFO(Render, "D3D12: disk cache built by {} loading screen workers in {} ms",
+             boot_worker_count,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - build_start)
+                 .count());
     const auto preparation = VideoCore::Perf::Read();
     LOG_INFO(Render,
              "D3D12 PSO preparation after disk load (session totals): {} requests, {} hits, "
@@ -1052,11 +1537,26 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) {
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
+    if (residency_frame < pipeline->RetryFrame()) {
+        return nullptr; // its PSO ran out of memory: draws skipped until the retry is due
+    }
+    if (pipeline->IsDormant() && pipeline->TakeOutOfMemory()) {
+        // A build nobody waited for (async_pipelines) ran out of memory.
+        pipeline->SetRetryFrame(residency_frame + OOM_RETRY_FRAMES);
+        return nullptr;
+    }
     // Its PSO was never built (not drawn in recent sessions) or was released while idle. Queued
-    // like any build, but WaitBuilt below claims it unless a worker already started it.
+    // like any build, but WaitBuilt claims it unless a worker already started it.
     if (pipeline->Wake(workers)) {
         ++pipelines_woken;
     }
+    if (GetAsyncPipelines() != AsyncPipelines::Off) {
+        return pipeline; // the draw skips it or waits (WaitPending)
+    }
+    return WaitPending(pipeline);
+}
+
+GraphicsPipeline* PipelineCache::WaitPending(GraphicsPipeline* pipeline) {
     const PipelineStage cause = pipeline->WasEvicted() ? PipelineStage::WaitEvicted
                                 : pipeline->FromDisk() ? PipelineStage::WaitDormant
                                                        : PipelineStage::WaitNew;
@@ -1068,16 +1568,123 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) {
     VideoCore::Perf::ScopedTimer wait{VideoCore::Perf::Counter::PipelineWaitUs};
     pipeline->WaitBuilt();
     GetPipelineStats().Record(cause, SteadyMicros() - wait_start);
+    if (!pipeline->IsBuilt()) {
+        // Out of memory: idle pipelines are released meanwhile (TickResidency), and the draws
+        // skipped until this one is tried again.
+        (void)pipeline->TakeOutOfMemory();
+        pipeline->SetRetryFrame(residency_frame + OOM_RETRY_FRAMES);
+        return nullptr;
+    }
     return pipeline;
+}
+
+bool PipelineCache::WaitPendingFor(GraphicsPipeline* pipeline, u64 microseconds) {
+    VideoCore::Perf::ScopedTimer timer{VideoCore::Perf::Counter::PipelineStallUs,
+                                       VideoCore::Perf::Counter::PipelineStalls};
+    VideoCore::Perf::ScopedTimer wait{VideoCore::Perf::Counter::PipelineWaitUs};
+    return pipeline->WaitBuiltFor(microseconds);
 }
 
 namespace {
 // A shader that fails to build: whether its code came from the disk cache or from guest memory,
-// and from where in guest memory.
-void LogShaderSources(std::span<Shader::Environment* const> envs) {
+// and from where in guest memory. The first failures also keep their guest code in the log folder
+// (guest_fault_<first>_<second>_<stage>.ash), to read offline what the recompiler did not handle.
+void LogShaderSources(std::span<Shader::Environment* const> envs, u64 first_hash,
+                      u64 second_hash) {
+    constexpr int MAX_DUMPED_SOURCES = 16;
+    static std::atomic_int dumped;
+    const bool dump{dumped.fetch_add(1, std::memory_order_relaxed) < MAX_DUMPED_SOURCES};
     for (size_t i = 0; i < envs.size(); ++i) {
         LOG_ERROR(Render, "D3D12: failed shader stage {}: {}", i, envs[i]->DescribeCode());
+        if (dump) {
+            envs[i]->DumpToLogFolder(
+                fmt::format("guest_fault_{:016x}_{:016x}_{}.ash", first_hash, second_hash, i));
+        }
     }
+    if (dump) {
+        LOG_ERROR(Render, "D3D12: guest code of {:016x} {:016x} dumped to the log folder",
+                  first_hash, second_hash);
+    }
+}
+
+// The two shaders an emulated tessellation runs before the draw (TessEmulationPlan): the vertex
+// shader alone, storing to the capture and unflipped since the evaluation shader flips, and the
+// control shader as compute. Returns the bytes added to linked.
+u64 CompileTessEmulation(const ShaderCompiler& compiler,
+                         std::span<const std::vector<u32>, Maxwell::MaxShaderStage> spirv,
+                         bool emulate_reduction, u64 trace_pipeline,
+                         GraphicsPipeline::LinkedDxil& linked) {
+    const std::array<ShaderCompiler::PipelineStage, 1> capture{{
+        {.spirv = spirv[0], .stage = DXIL_SPIRV_SHADER_VERTEX},
+    }};
+    auto vertex = compiler.CompilePipeline(capture,
+                                           {.yz_flip = DXIL_SPIRV_YZ_FLIP_NONE,
+                                            .first_vertex_and_base_instance =
+                                                DXIL_SPIRV_SYSVAL_TYPE_RUNTIME_DATA,
+                                            .emulate_reduction = emulate_reduction},
+                                           trace_pipeline);
+    linked.tess_capture = std::move(vertex[0].dxil);
+    const std::array<ShaderCompiler::PipelineStage, 1> control{{
+        {.spirv = spirv[1], .stage = DXIL_SPIRV_SHADER_COMPUTE},
+    }};
+    auto compute = compiler.CompilePipeline(control, {.emulate_reduction = emulate_reduction},
+                                            trace_pipeline);
+    linked.tess_control = std::move(compute[0].dxil);
+    return linked.tess_capture.capacity() + linked.tess_control.capacity();
+}
+
+/// Where the fragment shader's per-primitive texture handle comes from: the vertex attribute the
+/// vertex shader copies to that output. Throws what cannot be drawn, like any unsupported shader.
+std::optional<GraphicsPipeline::VertexTextureHandle> FindVertexTextureHandle(
+    const std::array<Shader::IR::Program, Maxwell::MaxShaderProgram>& programs,
+    const GraphicsPipelineCacheKey& key) {
+    using Shader::IR::Attribute;
+    using Shader::IR::Opcode;
+    if (key.unique_hashes[5] == 0) {
+        return std::nullopt;
+    }
+    std::optional<u32> output;
+    for (const Shader::TextureDescriptor& desc : programs[5].info.texture_descriptors) {
+        if (!desc.varying_handle) {
+            continue;
+        }
+        if (output && *output != desc.cbuf_offset) {
+            throw Shader::NotImplementedException("Textures with two per-primitive handles");
+        }
+        output = desc.cbuf_offset;
+    }
+    if (!output) {
+        return std::nullopt;
+    }
+    if (key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0) {
+        throw Shader::NotImplementedException("Per-primitive handle after the vertex shader");
+    }
+    const Shader::IR::Inst* source{};
+    for (const Shader::IR::Block* const block : programs[1].post_order_blocks) {
+        for (const Shader::IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != Opcode::SetAttribute || !inst.Arg(0).IsImmediate() ||
+                static_cast<u32>(inst.Arg(0).Attribute()) != *output) {
+                continue;
+            }
+            if (source != nullptr || inst.Arg(1).IsImmediate()) {
+                throw Shader::NotImplementedException("Computed per-primitive handle");
+            }
+            source = inst.Arg(1).InstRecursive();
+        }
+    }
+    while (source != nullptr && (source->GetOpcode() == Opcode::BitCastF32U32 ||
+                                 source->GetOpcode() == Opcode::BitCastU32F32)) {
+        source = source->Arg(0).IsImmediate() ? nullptr : source->Arg(0).InstRecursive();
+    }
+    if (source == nullptr || source->GetOpcode() != Opcode::GetAttribute ||
+        !source->Arg(0).IsImmediate() || !Shader::IR::IsGeneric(source->Arg(0).Attribute())) {
+        throw Shader::NotImplementedException("Computed per-primitive handle");
+    }
+    const Attribute input{source->Arg(0).Attribute()};
+    return GraphicsPipeline::VertexTextureHandle{
+        .attribute = Shader::IR::GenericAttributeIndex(input),
+        .component = Shader::IR::GenericAttributeElement(input),
+    };
 }
 } // namespace
 
@@ -1152,16 +1759,51 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                : key.unique_hashes[3] != 0 ? 3
                                                            : 1;
     const bool captures_xfb{key.state.xfb_enabled != 0};
-    const bool native_xfb{captures_xfb && compiler.SupportsStreamOutput() &&
+    // The console's hull and domain stages emit nothing, so tessellation always runs through
+    // compute (tessellation_emulation.h), whose capture takes the stream output.
+    const bool emulates_tess{key.unique_hashes[3] != 0};
+    if (emulates_tess && !compiler.SupportsStreamOutput()) {
+        throw std::runtime_error("emulated tessellation needs stream output");
+    }
+    const bool native_xfb{captures_xfb && !emulates_tess && compiler.SupportsStreamOutput() &&
                           !transform_feedback_storage.load(std::memory_order_relaxed)};
     VideoCommon::TransformFeedbackVaryings xfb_varyings;
     if (captures_xfb) {
         xfb_varyings = VideoCommon::MakeTransformFeedbackVaryings(key.state.xfb_state);
-        if (!native_xfb && xfb_program != 1) {
+        if (emulates_tess) {
+            LOG_WARNING(Render, "D3D12: transform feedback after emulated tessellation is not "
+                                "written");
+        } else if (!native_xfb && xfb_program != 1) {
             LOG_WARNING(Render, "D3D12: transform feedback after tessellation or geometry "
                                 "shaders needs stream output; it is not written");
         }
     }
+
+    const auto vertex_texture_handle = FindVertexTextureHandle(programs, key);
+    const PointGeometry point_geometry = PlanPointGeometry(
+        programs, key, drops_geometry || captures_xfb || layer_source_program != nullptr);
+    const bool generates_tess_control{key.unique_hashes[2] == 0 && key.unique_hashes[3] != 0};
+    if (key.unique_hashes[1] != 0) {
+        ApplyVertexFetchFixups(programs[1], key);
+    }
+    if (key.state.dynamic_state.shader_mirror_border != 0 && key.unique_hashes[5] != 0) {
+        Shader::Optimization::MirrorBorderPass(programs[5]);
+    }
+    if (EmulatesLogicOp(key.state) && key.unique_hashes[5] != 0) {
+        programs[5].info.uses_destination_read =
+            LogicOpReadsDestination(key.state.dynamic_state.logic_op);
+    }
+    if (key.state.dynamic_state.shader_polygon_stipple != 0 && key.unique_hashes[5] != 0) {
+        programs[5].info.uses_polygon_stipple = true;
+        programs[5].info.uses_stage_constants = true;
+    }
+    const PrimitiveGeometry primitive_geometry = PlanPrimitiveGeometry(
+        programs, key,
+        point_geometry.enabled || drops_geometry || captures_xfb ||
+            layer_source_program != nullptr);
+    const bool generates_geometry{point_geometry.enabled ||
+                                  primitive_geometry.kind != PrimitiveGeometry::Kind::None};
+    const bool has_any_geometry{has_geometry_stage || generates_geometry};
 
     // Series corrupts native NoPerspective coordinates when clipping volumes
     // cross W=0. Preserve screen-linear semantics via smooth(a*clipW)/clipW.
@@ -1170,7 +1812,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     u32 lower_noperspective_mask{};
     if (key.unique_hashes[1] && key.unique_hashes[5] &&
         !key.unique_hashes[2] && !key.unique_hashes[3] && !key.unique_hashes[4] &&
-        layer_source_program == nullptr && !programs[5].info.loads_indexed_attributes) {
+        layer_source_program == nullptr && !generates_geometry &&
+        !programs[5].info.loads_indexed_attributes) {
         const auto& vertex_info = programs[1].info;
         const auto& fragment_info = programs[5].info;
         for (u32 index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
@@ -1190,11 +1833,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
     GraphicsPipeline::FragmentHelpers fragment_helpers{};
+    TessLayout tess_layout;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
          ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
                                        index == static_cast<u32>(Maxwell::ShaderType::Geometry);
-        if (key.unique_hashes[index] == 0 && !is_emulated_stage) {
+        const bool is_generated_stage =
+            (generates_tess_control &&
+             index == static_cast<u32>(Maxwell::ShaderType::TessellationInit)) ||
+            (generates_geometry && index == static_cast<u32>(Maxwell::ShaderType::Geometry));
+        if (key.unique_hashes[index] == 0 && !is_emulated_stage && !is_generated_stage) {
             continue;
         }
         if (drops_geometry && index == static_cast<u32>(Maxwell::ShaderType::Geometry))
@@ -1209,18 +1857,71 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             LOG_ERROR(Render, "D3D12: VertexA without VertexB is not implemented");
             return nullptr;
         }
+        if (is_generated_stage) {
+            // Here and not with the guest stages: they read what the vertex program ended up
+            // writing, legacy varyings already mapped to generics.
+            using Kind = PrimitiveGeometry::Kind;
+            if (index != static_cast<u32>(Maxwell::ShaderType::Geometry)) {
+                programs[index] = Shader::Maxwell::GenerateTessellationControl(
+                    pools.inst, pools.block, *previous_stage, programs[index + 1],
+                    key.state.patch_control_points_minus_one + 1);
+            } else if (primitive_geometry.kind == Kind::Lines) {
+                programs[index] = Shader::Maxwell::GenerateLineGeometry(
+                    pools.inst, pools.block, *previous_stage,
+                    primitive_geometry.stipple_generic
+                        ? std::optional{Shader::IR::Attribute::Generic0X +
+                                        *primitive_geometry.stipple_generic * 4}
+                        : std::nullopt);
+            } else if (primitive_geometry.kind == Kind::PolygonPoints) {
+                programs[index] = Shader::Maxwell::GeneratePolygonPointGeometry(
+                    pools.inst, pools.block, *previous_stage,
+                    std::bit_cast<float>(key.state.point_size));
+            } else if (primitive_geometry.kind == Kind::FillRectangle) {
+                programs[index] = Shader::Maxwell::GenerateFillRectangleGeometry(
+                    pools.inst, pools.block, *previous_stage, programs[5],
+                    key.state.provoking_vertex_last != 0 ? 2 : 0);
+            } else if (primitive_geometry.kind == Kind::ProvokingLast) {
+                programs[index] = Shader::Maxwell::GenerateProvokingLastGeometry(
+                    pools.inst, pools.block, *previous_stage,
+                    MaxwellToD3D12::PrimitiveTopologyType(key.state.topology) ==
+                            D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                        ? 2
+                        : 3);
+            } else {
+                programs[index] = Shader::Maxwell::GeneratePointGeometry(
+                    pools.inst, pools.block, *previous_stage, point_geometry.size_attr,
+                    point_geometry.coord_attr, std::bit_cast<float>(key.state.point_size));
+            }
+        }
         Shader::IR::Program& program{programs[index]};
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
-        auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};
+        auto runtime_info{
+            MakeRuntimeInfo(programs, key, program, previous_stage, generates_geometry)};
         runtime_info.lower_noperspective_mask = lower_noperspective_mask;
+        if (index == (has_any_geometry ? 4U : key.unique_hashes[3] != 0 ? 3U : 1U)) {
+            runtime_info.viewport_swizzle = EmulatedViewportSwizzle(key.state.viewport_swizzles[0]);
+        }
+        if (program.stage == Shader::Stage::Fragment) {
+            if (primitive_geometry.stipple_generic) {
+                runtime_info.line_stipple_generic = *primitive_geometry.stipple_generic + 1;
+                // The register holds the repeat count minus one.
+                runtime_info.line_stipple_factor = key.state.line_stipple_factor + 1;
+                runtime_info.line_stipple_pattern = key.state.line_stipple_pattern;
+            }
+            runtime_info.polygon_stipple = key.state.dynamic_state.shader_polygon_stipple != 0;
+        }
         if (captures_xfb && index == xfb_program && (native_xfb || index == 1)) {
             xfb_varyings.Apply(runtime_info);
             runtime_info.xfb_storage = !native_xfb;
             runtime_info.xfb_copy_outputs = native_xfb;
         }
         ConvertLegacyToGeneric(program, runtime_info);
+        if (emulates_tess) {
+            tess_layout.Apply(programs, key, program, generates_tess_control, has_any_geometry,
+                              runtime_info);
+        }
         Shader::Optimization::DemoteReturnVerdict demote_return{};
         const auto merged_demote_returns =
             Shader::Optimization::DemoteReturnPass(program, &demote_return);
@@ -1250,9 +1951,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         previous_stage = &program;
     }
     // Disk-cache keys may carry the bit from a session whose DLL emulated reduction.
-    const bool emulate_reduction = key.emulate_reduction != 0 && compiler.EmulatesReduction();
+    const bool emulate_reduction =
+        (key.shader_flags & GraphicsPipelineCacheKey::SHADER_REDUCTION) != 0 &&
+        compiler.EmulatesReduction();
     const PipelineLayout& layout =
-        root_signatures.Get(infos, false, native_xfb, emulate_reduction);
+        root_signatures.Get(infos, false, native_xfb || emulates_tess, emulate_reduction,
+                            PlanBlendConstants(key.state).InShader(), emulates_tess);
+    const TessEmulationPlan tess_plan = emulates_tess ? tess_layout.plan : TessEmulationPlan{};
 
     // SPIR-V to DXIL goes with the PSO build, on a worker: done here it stalled the GPU thread for
     // 150-490 ms per 300 frames when entering new areas (0.2.59 profile). Translating the guest
@@ -1260,14 +1965,25 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     auto compile_dxil = [this, spirv = std::move(spirv), stage_indices, dumps_dxil,
                          vertex_shader = key.unique_hashes[1],
                          fragment_shader = key.unique_hashes[5],
-                         pipeline_key = key.Hash(), native_xfb,
+                         pipeline_key = key.Hash(), native_xfb, emulates_tess,
                          emulate_reduction](u64 trace_pipeline, bool flatten_vertex) {
         boost::container::static_vector<ShaderCompiler::PipelineStage, Maxwell::MaxShaderStage>
             stages;
+        // The stage_indices entry of each stage, where its DXIL goes.
+        boost::container::static_vector<size_t, Maxwell::MaxShaderStage> dxil_indices;
         for (const size_t stage_index : stage_indices) {
-            // Stage indices 0-4 (VS, TCS, TES, GS, FS) match dxil_spirv_shader_stage's values.
+            if (emulates_tess && stage_index < 2) {
+                // The vertex and control shaders run before, on their own (TessEmulationPlan).
+                continue;
+            }
+            // Stage indices 0-4 (VS, TCS, TES, GS, FS) match dxil_spirv_shader_stage's values. An
+            // emulated evaluation shader is the vertex stage, and its DXIL goes in that slot.
+            const bool eval_as_vertex = emulates_tess && stage_index == 2;
             stages.push_back({.spirv = spirv[stage_index],
-                              .stage = static_cast<dxil_spirv_shader_stage>(stage_index)});
+                              .stage = eval_as_vertex
+                                           ? DXIL_SPIRV_SHADER_VERTEX
+                                           : static_cast<dxil_spirv_shader_stage>(stage_index)});
+            dxil_indices.push_back(eval_as_vertex ? 0 : stage_index);
         }
         // The guest viewport transform decides the flips per draw, through the runtime data
         // (RasterizerD3D12::UpdateViewports).
@@ -1281,11 +1997,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         for (const auto& stage : stages) {
             key_stages.push_back({stage.spirv, static_cast<u32>(stage.stage)});
         }
-        const std::array<u32, 7> key_options{
+        if (emulates_tess) {
+            // The capture and control shaders are not in the stage list: the key holds them.
+            key_stages.push_back({spirv[0], static_cast<u32>(DXIL_SPIRV_SHADER_VERTEX)});
+            key_stages.push_back({spirv[1], static_cast<u32>(DXIL_SPIRV_SHADER_COMPUTE)});
+        }
+        const std::array<u32, 8> key_options{
             static_cast<u32>(options.yz_flip), options.y_flip_mask, options.z_flip_mask,
             static_cast<u32>(options.first_vertex_and_base_instance),
             static_cast<u32>(options.flatten_vertex), static_cast<u32>(native_xfb),
-            static_cast<u32>(options.emulate_reduction)};
+            static_cast<u32>(options.emulate_reduction), static_cast<u32>(emulates_tess)};
         auto key = MakeLinkedShaderKey(std::span(key_stages.data(), key_stages.size()), key_options);
         const auto cached = linked_shaders.Get(std::move(key), [&] {
             std::unique_ptr<eden_spirv_to_dxil_stream_output> stream_output;
@@ -1294,13 +2015,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 stream_output = std::make_unique<eden_spirv_to_dxil_stream_output>();
                 linked_options.stream_output = stream_output.get();
             }
-            auto compiled = compiler.CompilePipeline(std::span(stages.data(), stages.size()),
-                                                     linked_options, trace_pipeline);
             ChargedDxilStages dxil;
+            // The disk cache records plain stage lists only.
+            const bool disk_cached = !native_xfb && !emulates_tess;
+            auto compiled = compiler.CompilePipeline(std::span(stages.data(), stages.size()),
+                                                     linked_options, trace_pipeline,
+                                                     disk_cached ? &dxil.linked.disk_key : nullptr);
             u64 bytes = 0;
             for (size_t i = 0; i < compiled.size(); ++i) {
                 bytes += compiled[i].dxil.capacity();
-                dxil.linked.stages[stage_indices[i]] = std::move(compiled[i].dxil);
+                dxil.linked.stages[dxil_indices[i]] = std::move(compiled[i].dxil);
+            }
+            if (emulates_tess) {
+                bytes += CompileTessEmulation(compiler, spirv, emulate_reduction, trace_pipeline,
+                                              dxil.linked);
             }
             if (stream_output) {
                 dxil.linked.stream_output = MakeStreamOutputDeclaration(*stream_output);
@@ -1320,11 +2048,19 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             for (const auto& stage : dxil.linked.stages) {
                 bytes += stage.capacity();
             }
-            return bytes + dxil.linked.stream_output.capacity() * sizeof(D3D12_SO_DECLARATION_ENTRY);
+            return bytes + dxil.linked.tess_capture.capacity() + dxil.linked.tess_control.capacity() +
+                   dxil.linked.stream_output.capacity() * sizeof(D3D12_SO_DECLARATION_ENTRY);
         });
         // Export the actual linked bytes even when another pipeline populated this cache entry.
         if (dumps_dxil) [[unlikely]] {
-            DumpDxil(vertex_shader, fragment_shader, pipeline_key, cached.value->linked.stages);
+            const auto& linked = cached.value->linked;
+            DumpDxil(vertex_shader, fragment_shader, pipeline_key, linked.stages);
+            if (emulates_tess) {
+                // After the five stages: 6 the vertex capture, 7 the control as compute.
+                const std::array<std::vector<u8>, 8> tess{
+                    {{}, {}, {}, {}, {}, {}, linked.tess_capture, linked.tess_control}};
+                DumpDxil(vertex_shader, fragment_shader, pipeline_key, tess);
+            }
         }
         VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::PipelineCacheResult,
                                    static_cast<u64>(cached.outcome), trace_pipeline);
@@ -1336,8 +2072,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     auto pipeline = std::make_unique<GraphicsPipeline>(device, texture_runtime, &shader_notify,
                                                        thread_worker, key, std::move(compile_dxil),
                                                        infos, layout, build_pso, &graphics_psos,
-                                                       lower_noperspective_mask);
+                                                       lower_noperspective_mask, tess_plan);
     pipeline->SetFragmentHelpers(fragment_helpers);
+    pipeline->SetGeneratesGeometry(generates_geometry);
+    pipeline->SetVertexTextureHandle(vertex_texture_handle);
     return pipeline;
 
 } catch (const Shader::Exception& exception) {
@@ -1347,7 +2085,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const Common::BugTracker::TapMute bug_tracker_mute;
     LOG_ERROR(Render, "D3D12: recompiling VS {:016x} PS {:016x} failed: {}", key.unique_hashes[1],
               key.unique_hashes[5], exception.what());
-    LogShaderSources(envs);
+    LogShaderSources(envs, key.unique_hashes[1], key.unique_hashes[5]);
     return nullptr;
 } catch (const std::exception& exception) {
     BUG_TRACK_KEY(ShaderCompile, key.unique_hashes[1] ^ std::rotl(key.unique_hashes[5], 1),
@@ -1436,28 +2174,38 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         } else {
             LOG_INFO(Render, "D3D12: compute shader {:016x} not split ({})", key.unique_hash,
                      Shader::Optimization::Name(verdict));
+            // Building it would repeat the plain pipeline: 130-190 ms in the driver, with the
+            // recorder waiting for it. The caller takes the plain one instead.
+            compute_not_split.insert(key.Hash());
+            return nullptr;
         }
     }
-    const std::vector<u32> code{EmitSPIRV(profile, program)};
+    std::vector<u32> code{EmitSPIRV(profile, program)};
     const bool dumped{IsDumpedShader(key.unique_hash)};
     if (dumped) [[unlikely]] {
         DumpShader(key.unique_hash, 0, program, code);
     }
 
-    const std::array<ShaderCompiler::PipelineStage, 1> stages{{
-        {.spirv = code, .stage = DXIL_SPIRV_SHADER_COMPUTE},
-    }};
-    auto compiled = compiler.CompilePipeline(stages, {.emulate_reduction = emulate_reduction});
-    if (dumped) [[unlikely]] {
-        // The emulating build overwrites the plain one: the DXIL that runs is the last dumped.
-        DumpDxil(0, key.unique_hash, key.Hash(), std::span{&compiled[0].dxil, 1});
-    }
+    // SPIR-V to DXIL goes with the PSO build, on a worker, as for graphics pipelines: the GPU
+    // thread only translates the guest shader, since that reads guest memory.
+    auto compile_dxil = [this, code = std::move(code), dumped, emulate_reduction,
+                         unique_hash = key.unique_hash, key_hash = key.Hash()] {
+        const std::array<ShaderCompiler::PipelineStage, 1> stages{{
+            {.spirv = code, .stage = DXIL_SPIRV_SHADER_COMPUTE},
+        }};
+        auto compiled = compiler.CompilePipeline(stages, {.emulate_reduction = emulate_reduction});
+        if (dumped) [[unlikely]] {
+            // The emulating build overwrites the plain one: the DXIL that runs is the last dumped.
+            DumpDxil(0, unique_hash, key_hash, std::span{&compiled[0].dxil, 1});
+        }
+        return std::move(compiled[0].dxil);
+    };
     const std::array<const Shader::Info*, 1> infos{&program.info};
     const PipelineLayout& layout = root_signatures.Get(infos, true, false, emulate_reduction);
 
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<ComputePipeline>(device, &shader_notify, thread_worker,
-                                             key.unique_hash, std::move(compiled[0].dxil),
+                                             key.unique_hash, std::move(compile_dxil),
                                              program.info, layout, emulate_reduction, split);
 
 } catch (const Shader::Exception& exception) {
@@ -1467,7 +2215,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     LOG_ERROR(Render, "D3D12: recompiling compute {:016x} failed: {}", key.unique_hash,
               exception.what());
     Shader::Environment* const compute_env[]{&env};
-    LogShaderSources(compute_env);
+    LogShaderSources(compute_env, key.unique_hash, 0);
     return nullptr;
 } catch (const std::exception& exception) {
     BUG_TRACK_KEY(ShaderCompile, key.unique_hash, "building compute pipeline {:016x} failed: {}",

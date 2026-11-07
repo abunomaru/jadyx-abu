@@ -6,9 +6,11 @@
 #include "video_core/renderer_d3d12/d3d12_cache_policy.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include <d3d12.h>
@@ -100,11 +102,17 @@ void DumpRecentGpuDetails(u64 count);
 /// is narrowed to the commands that cause it, logged with their arguments, including the calls
 /// DRED does not trace. Slow: diagnostic only.
 void SetCloseProbeEnabled(bool enabled);
+/// boot.cfg "present_queue=1": devices created from now on present on a direct queue of their
+/// own, so a frame's copy to the back buffer runs as soon as its rendering is done instead of
+/// after whatever the emulation submitted behind it.
+void SetPresentQueue(bool enabled);
 bool CloseProbeEnabled();
-/// Runs run(ctx, scratch) on the scratch lists, on the recording worker after the real call.
+/// Runs run(scratch) on the scratch lists, on the recording worker after the real call. Kept
+/// until the command's window closes: a failing window is run again call by call, to name the
+/// first one that makes Close fail.
 void ProbeAppend(ID3D12GraphicsCommandList* list,
-                 void (*run)(void* ctx, ID3D12GraphicsCommandList* scratch), void* ctx,
-                 const char* call, std::string arguments);
+                 std::function<void(ID3D12GraphicsCommandList*)> run, const char* call,
+                 std::string arguments);
 /// The real list is about to close: closes the scratch lists.
 void ProbeBeforeClose();
 /// Logs how the real list's Close went next to the scratch lists'.
@@ -127,6 +135,9 @@ using AppMemoryQuery = bool (*)(u64& used, u64& limit);
 /// Set by the frontend before the renderer is created; makes the caches' memory usage count the
 /// whole app (see Device::CacheMemoryUsage).
 void SetAppMemoryQuery(AppMemoryQuery query);
+/// The GPU's local memory in use and its budget at the caches' last pressure query (DXGI);
+/// false before the first one.
+bool LastGpuMemory(u64& used, u64& budget);
 
 class Device {
 public:
@@ -148,6 +159,19 @@ public:
     std::mutex& QueueMutex() const {
         return queue_mutex;
     }
+    /// The queue the swapchain presents on: a queue of its own with SetPresentQueue, else Queue().
+    ID3D12CommandQueue* PresentQueue() const {
+        return present_queue ? present_queue.Get() : queue.Get();
+    }
+    /// QueueMutex for PresentQueue().
+    std::mutex& PresentQueueMutex() const {
+        return present_queue ? present_queue_mutex : queue_mutex;
+    }
+    /// PresentQueue() is not Queue(): work on it is not ordered after the emulation's by
+    /// submission and has to wait for its fence.
+    [[nodiscard]] bool HasPresentQueue() const noexcept {
+        return present_queue != nullptr;
+    }
     IDXGIFactory4* Factory() const {
         return factory.Get();
     }
@@ -159,6 +183,9 @@ public:
         return device2.Get();
     }
     /// The depth bounds test (pipeline stream DEPTH_STENCIL1 plus OMSetDepthBounds).
+    /// Any tier of conservative rasterization: the console's own answer, asked once per pipeline.
+    [[nodiscard]] bool SupportsConservativeRaster() const;
+
     [[nodiscard]] bool SupportsDepthBounds() const {
         return depth_bounds;
     }
@@ -201,9 +228,12 @@ public:
 
 private:
     void LogCapabilities() const;
-    /// The GPU budget and usage the caches collect against. A discrete card's local budget is
-    /// widened into system memory (see the definition); a unified one's is DXGI's as is.
+    /// The GPU budget and usage the caches collect against, as of the last 100 ms refresh; does not
+    /// enter the kernel. A discrete card's local budget is widened into system memory (see
+    /// ReadCacheVideoMemory); a unified one's is DXGI's as is.
     [[nodiscard]] DXGI_QUERY_VIDEO_MEMORY_INFO QueryCacheVideoMemory() const;
+    [[nodiscard]] DXGI_QUERY_VIDEO_MEMORY_INFO ReadCacheVideoMemory() const;
+    void PublishCacheVideoMemory(const DXGI_QUERY_VIDEO_MEMORY_INFO& info);
 
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter1> adapter;
@@ -218,12 +248,17 @@ private:
     std::atomic_flag removal_reported;
     ComPtr<ID3D12CommandQueue> queue;
     mutable std::mutex queue_mutex;
+    ComPtr<ID3D12CommandQueue> present_queue; ///< null unless SetPresentQueue
+    mutable std::mutex present_queue_mutex;
     ComPtr<ID3D12Fence> fence;
     HANDLE fence_event{};
     u64 next_fence_value{1};
     std::string adapter_name;
     u64 initial_budget{}; ///< local video memory budget when the device was created
     bool discrete_memory{}; ///< not UMA: textures past the local budget can live in system memory
+    std::atomic<u64> cache_video_used{};
+    std::atomic<u64> cache_video_budget{};
+    std::jthread video_memory_thread; ///< last member: stops before the rest goes away
 };
 
 } // namespace D3D12

@@ -4,10 +4,12 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <optional>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -23,21 +25,27 @@
 #include "video_core/diagnostics/full_capture.h"
 #include "video_core/gpu_thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/frame_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/perf_counters.h"
 #include "video_core/renderer_d3d12/d3d12_barrier_batch.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"
+#include "video_core/renderer_d3d12/d3d12_render_corrections.h"
 #include "video_core/renderer_d3d12/d3d12_draw_targets.h"
 #include "video_core/renderer_d3d12/d3d12_draw_metrics.h"
 #include "video_core/renderer_d3d12/d3d12_driver_guard.h"
 #include "video_core/renderer_d3d12/d3d12_graphics_pipeline.h"
+#include "video_core/renderer_d3d12/d3d12_texture_replay.h"
 #include "video_core/renderer_d3d12/d3d12_log.h"
 #include "video_core/renderer_d3d12/d3d12_maxwell_to_d3d12.h"
+#include "video_core/renderer_d3d12/d3d12_memory_reserve.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_helper.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_stats.h"
+#include "video_core/renderer_d3d12/d3d12_pso_blob_cache.h"
 #include "video_core/renderer_d3d12/d3d12_root_signature.h"
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
+#include "video_core/renderer_d3d12/d3d12_shader_compiler.h"
 #include "video_core/renderer_d3d12/d3d12_stream_output.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
 #include "video_core/renderer_d3d12/diagnostics/d3d12_pipeline_diagnostics.h"
@@ -50,8 +58,82 @@
 namespace D3D12 {
 
 namespace {
+std::atomic_bool stage_view_cache{};
 std::atomic_bool draw_sampler_reuse{};
+std::atomic<TextureReplayMode> texture_replay_mode{TextureReplayMode::Off};
+std::atomic<u32> texture_replay_logged{};
+
+std::atomic<u64> dxil_released{};
+std::atomic<u64> dxil_released_bytes{};
+std::atomic<u64> dxil_reloaded{};
+std::atomic<u64> dxil_reload_failed{};
+
+/// DXIL read back from disk, charged like the linked shader cache's entries.
+struct ReloadedDxil {
+    GraphicsPipeline::LinkedDxil linked;
+    Common::MemoryCharge charge;
+};
 }
+void SetStageViewCache(bool enabled) {
+    stage_view_cache.store(enabled, std::memory_order_relaxed);
+}
+
+struct GraphicsPipeline::StageViewState {
+    VideoCommon::GraphicsBindingStamp stamp;
+    std::array<bool, NUM_STAGES> valid{};
+    std::array<std::vector<StageViewEntry>, NUM_STAGES> entries;
+};
+
+void SetTextureReplay(TextureReplayMode mode) {
+    texture_replay_mode.store(mode, std::memory_order_relaxed);
+}
+
+constexpr size_t FRAGMENT_STAGE = 4;
+
+/// The view's image as it is now, in a copy a draw can read while it writes the image.
+/// The emulated logic op reads its destination through it.
+[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE ColorSnapshotHandle(const ImageView& view,
+                                                              Shader::TextureType type) {
+    Image* const source = view.SourceImage();
+    if (!source) {
+        return view.Handle(type);
+    }
+    using SnapshotCopy = Image::SnapshotCopy;
+    const SnapshotCopy copy = source->PrepareColorSnapshot(
+        view.ReadsReinterpretedCopy(), view.range.base.level, view.range.extent.levels);
+    switch (copy) {
+    case SnapshotCopy::Failed:
+        return view.Handle(type);
+    case SnapshotCopy::Reused:
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::SnapshotReuses, 1);
+        break;
+    case SnapshotCopy::Partial:
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::LogicOpCopies, 1);
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::SnapshotLevelCopies, 1);
+        break;
+    case SnapshotCopy::Full:
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::LogicOpCopies, 1);
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::LogicOpCopyBytes, source->guest_size_bytes);
+        break;
+    }
+    return view.DepthFeedbackHandle(type);
+}
+
+struct GraphicsPipeline::TextureReplayState {
+    TextureReplayKey key;
+    /// Per texture descriptor, in binding order: its SRV and whether PrepareRead has work.
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> handles;
+    std::vector<u8> prepare;
+    u8 unemulated_reduction_stages{};
+    std::array<u32, 2> mirror_border_masks{};
+    /// Not stored when a texture aliases a colour target, which this keeps true on replay.
+    const Framebuffer* framebuffer{};
+    IntegerSamplerTable integer_samplers;
+    /// The rows' upload, bound again within the submission it was made for.
+    u64 integer_tick{~u64{0}};
+    D3D12_GPU_VIRTUAL_ADDRESS integer_address{};
+};
+
 void SetDrawSamplerReuse(bool enabled) {
     draw_sampler_reuse.store(enabled, std::memory_order_relaxed);
 }
@@ -104,30 +186,25 @@ D3D12_SHADER_BYTECODE Bytecode(const std::vector<u8>& code) {
             .BytecodeLength = code.size()};
 }
 
-/// True when some drawn target's color equation reads the blend constant and every such read is
-/// a constant-alpha factor. A mix of constant color and constant alpha cannot share D3D12's single
-/// constant; it keeps the color (the draw's RGB) and is reported.
-bool ReadsOnlyConstantAlpha(const FixedPipelineState& state, u8 drawn_targets) {
-    using MaxwellToD3D12::BlendConstantRead;
-    bool alpha = false;
-    bool color = false;
-    for (size_t index = 0; index < NumAttachments(state); ++index) {
-        const auto& blend = state.attachments[index];
-        if (blend.enable == 0 || (drawn_targets & (1U << index)) == 0) {
-            continue;
-        }
-        for (const auto factor : {blend.SourceRGBFactor(), blend.DestRGBFactor()}) {
-            const BlendConstantRead read = MaxwellToD3D12::ColorBlendConstantRead(factor);
-            alpha |= read == BlendConstantRead::Alpha;
-            color |= read == BlendConstantRead::Color;
-        }
+Shader::BlendConstantFactor ShaderBlendFactor(Maxwell::Blend::Factor factor) {
+    using Factor = Maxwell::Blend::Factor;
+    using Shader::BlendConstantFactor;
+    switch (factor) {
+    case Factor::BlendFactor_D3D:
+    case Factor::ConstantColor_GL:
+        return BlendConstantFactor::Color;
+    case Factor::OneMinusBlendFactor_D3D:
+    case Factor::OneMinusConstantColor_GL:
+        return BlendConstantFactor::OneMinusColor;
+    case Factor::BothSourceAlpha_D3D:
+    case Factor::ConstantAlpha_GL:
+        return BlendConstantFactor::Alpha;
+    case Factor::OneMinusBothSourceAlpha_D3D:
+    case Factor::OneMinusConstantAlpha_GL:
+        return BlendConstantFactor::OneMinusAlpha;
+    default:
+        return BlendConstantFactor::None;
     }
-    if (alpha && color) {
-        BUG_TRACK(UnsupportedState, "constant color and constant alpha blend factors in one "
-                                    "pipeline; constant alpha reads the color");
-        return false;
-    }
-    return alpha;
 }
 
 D3D12_DEPTH_STENCILOP_DESC StencilFace(const auto& face) {
@@ -139,7 +216,8 @@ D3D12_DEPTH_STENCILOP_DESC StencilFace(const auto& face) {
     };
 }
 
-D3D12_RENDER_TARGET_BLEND_DESC BlendTarget(const FixedPipelineState::BlendingAttachment& blend) {
+D3D12_RENDER_TARGET_BLEND_DESC BlendTarget(const FixedPipelineState::BlendingAttachment& blend,
+                                           bool source_in_shader) {
     const std::array mask = blend.Mask();
     const UINT8 write_mask = static_cast<UINT8>(
         (mask[0] ? D3D12_COLOR_WRITE_ENABLE_RED : 0) |
@@ -163,7 +241,9 @@ D3D12_RENDER_TARGET_BLEND_DESC BlendTarget(const FixedPipelineState::BlendingAtt
     return {
         .BlendEnable = TRUE,
         .LogicOpEnable = FALSE,
-        .SrcBlend = MaxwellToD3D12::BlendFactor(blend.SourceRGBFactor(), false),
+        .SrcBlend = source_in_shader
+                        ? D3D12_BLEND_ONE
+                        : MaxwellToD3D12::BlendFactor(blend.SourceRGBFactor(), false),
         .DestBlend = MaxwellToD3D12::BlendFactor(blend.DestRGBFactor(), false),
         .BlendOp = MaxwellToD3D12::BlendOp(blend.EquationRGB()),
         .SrcBlendAlpha = MaxwellToD3D12::BlendFactor(blend.SourceAlphaFactor(), true),
@@ -212,6 +292,20 @@ void GraphicsPipelineCacheKey::RefreshStatic(const Maxwell& regs) noexcept {
     depth_bias = bias ? std::bit_cast<u32>(regs.depth_bias) : 0;
     depth_bias_clamp = bias ? std::bit_cast<u32>(regs.depth_bias_clamp) : 0;
     slope_scaled_depth_bias = bias ? std::bit_cast<u32>(regs.slope_scale_depth_bias) : 0;
+    // A fragment shader that adds the bias keeps the fractional constant D3D12 truncates; it
+    // writes its depth, so the guest's early depth test cannot run with it.
+    const bool shader_bias = bias && GetShaderDepthBias() && state.depth_enabled != 0 &&
+                             state.early_z == 0 && unique_hashes[5] != 0 &&
+                             MaxwellToD3D12::SampleCount(state.msaa_mode) == 1 &&
+                             (regs.depth_bias != 0.0f || regs.slope_scale_depth_bias != 0.0f);
+    if (bias && GetDepthBiasRounding()) {
+        if (!shader_bias) {
+            depth_bias = std::bit_cast<u32>(EffectiveDepthBias(regs.depth_bias));
+        }
+        depth_bias_clamp = std::bit_cast<u32>(RoundDepthBiasStep(regs.depth_bias_clamp));
+        slope_scaled_depth_bias =
+            std::bit_cast<u32>(RoundDepthBiasStep(regs.slope_scale_depth_bias));
+    }
     const bool stencil = dynamic.stencil_enable != 0;
     stencil_read_mask = stencil ? static_cast<u8>(regs.stencil_front_func_mask) : 0;
     stencil_write_mask = stencil ? static_cast<u8>(regs.stencil_front_mask) : 0;
@@ -221,7 +315,115 @@ void GraphicsPipelineCacheKey::RefreshStatic(const Maxwell& regs) noexcept {
                                         ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
                                         : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF);
     }
-    emulate_reduction = 0;
+    shader_flags = 0;
+    // A single sample has no coverage to dither: the shader discards with the guest's footprint.
+    if (state.alpha_to_coverage_enabled != 0 && GetShaderAlphaToCoverage() &&
+        MaxwellToD3D12::SampleCount(state.msaa_mode) == 1) {
+        const u32 footprint = static_cast<u32>(regs.alpha_to_coverage_dither) + 1;
+        shader_flags |= static_cast<u8>(std::min(footprint, 3U) << SHADER_A2C_SHIFT);
+    }
+    if (shader_bias) {
+        shader_flags |= SHADER_DEPTH_BIAS;
+    }
+    // The mask is per position of a 2x2 footprint, which D3D12 lacks: positions that differ go to
+    // the fragment shader, except with alpha-to-coverage in the PSO, which D3D12 does not combine
+    // with a shader's coverage; the first position then stands for all. Registers never written
+    // read 0, which keeps every sample rather than none.
+    const auto samples_off = [](u32 mask) { return mask != 0 ? ~mask & 0xF : 0U; };
+    u32 mask_rest = 0;
+    if (MaxwellToD3D12::SampleCount(state.msaa_mode) > 1) {
+        const u32 first = samples_off(regs.sample_mask_pos.x0_y0);
+        shader_flags |= static_cast<u8>(first << SAMPLE_MASK_SHIFT);
+        if (state.alpha_to_coverage_enabled == 0) {
+            mask_rest = (samples_off(regs.sample_mask_pos.x1_y0) ^ first) |
+                        (samples_off(regs.sample_mask_pos.x0_y1) ^ first) << 4 |
+                        (samples_off(regs.sample_mask_pos.x1_y1) ^ first) << 8;
+        }
+    }
+    state.sample_mask_rest.Assign(mask_rest);
+
+    // What D3D12 has no state for goes to generated stages and the fragment shader.
+    auto& emulated = state.dynamic_state;
+    const auto topology_type = MaxwellToD3D12::PrimitiveTopologyType(state.topology);
+    const bool lines = topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE &&
+                       state.topology != Maxwell::PrimitiveTopology::LinesAdjacency &&
+                       state.topology != Maxwell::PrimitiveTopology::LineStripAdjacency;
+    const bool triangles = topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+                           state.topology != Maxwell::PrimitiveTopology::TrianglesAdjacency &&
+                           state.topology != Maxwell::PrimitiveTopology::TriangleStripAdjacency;
+    const float line_width =
+        regs.line_anti_alias_enable != 0 ? regs.line_width_smooth : regs.line_width_aliased;
+    emulated.generated_lines.Assign(
+        lines && (line_width > 1.0f || emulated.line_stipple_enable != 0) ? 1 : 0);
+    emulated.generated_polygon_points.Assign(
+        triangles && regs.polygon_mode_front == Maxwell::PolygonMode::Point ? 1 : 0);
+    emulated.generated_fill_rectangle.Assign(
+        triangles && regs.fill_via_triangle_mode != Maxwell::FillViaTriangleMode::Disabled ? 1 : 0);
+    emulated.shader_polygon_stipple.Assign(
+        triangles && regs.polygon_stipple_enabled != 0 && unique_hashes[5] != 0 ? 1 : 0);
+    // Whether a geometry shader is needed for it depends on the fragment program's flat inputs.
+    state.provoking_vertex_last.Assign(regs.provoking_vertex == Maxwell::ProvokingVertex::Last &&
+                                               (lines || triangles) && unique_hashes[5] != 0
+                                           ? 1
+                                           : 0);
+}
+
+BlendConstantPlan PlanBlendConstants(const FixedPipelineState& state) {
+    using MaxwellToD3D12::BlendConstantRead;
+    using Equation = Maxwell::Blend::Equation;
+    const u8 writable = WritableColorTargetMask(state.attachments);
+    // Min and max ignore their factors; integer targets do not blend.
+    const auto reads_factors = [&](size_t index) {
+        const auto format = static_cast<Tegra::RenderTargetFormat>(state.color_formats[index]);
+        const auto& blend = state.attachments[index];
+        const Equation equation = blend.EquationRGB();
+        return blend.enable != 0 && (writable & (1U << index)) != 0 &&
+               format != Tegra::RenderTargetFormat::NONE &&
+               !VideoCore::Surface::IsPixelFormatInteger(
+                   VideoCore::Surface::PixelFormatFromRenderTargetFormat(format)) &&
+               equation != Equation::Min_D3D && equation != Equation::Max_D3D &&
+               equation != Equation::Min_GL && equation != Equation::Max_GL;
+    };
+    bool alpha = false;
+    bool color = false;
+    bool dest_alpha = false;
+    bool dest_color = false;
+    for (size_t index = 0; index < NumAttachments(state); ++index) {
+        if (!reads_factors(index)) {
+            continue;
+        }
+        const auto& blend = state.attachments[index];
+        const BlendConstantRead source = MaxwellToD3D12::ColorBlendConstantRead(blend.SourceRGBFactor());
+        const BlendConstantRead dest = MaxwellToD3D12::ColorBlendConstantRead(blend.DestRGBFactor());
+        dest_alpha |= dest == BlendConstantRead::Alpha;
+        dest_color |= dest == BlendConstantRead::Color;
+        alpha |= source == BlendConstantRead::Alpha || dest == BlendConstantRead::Alpha;
+        color |= source == BlendConstantRead::Color || dest == BlendConstantRead::Color;
+    }
+    BlendConstantPlan plan;
+    if (!alpha || !color) {
+        plan.hardware_alpha = alpha;
+        return plan;
+    }
+    if (dest_alpha && dest_color) {
+        BUG_TRACK(UnsupportedState, "destination blend factors of constant color and constant "
+                                    "alpha in one pipeline; constant alpha reads the color");
+        return plan;
+    }
+    plan.hardware_alpha = dest_alpha;
+    const BlendConstantRead hardware =
+        dest_alpha ? BlendConstantRead::Alpha : BlendConstantRead::Color;
+    for (size_t index = 0; index < NumAttachments(state); ++index) {
+        if (!reads_factors(index)) {
+            continue;
+        }
+        const auto factor = state.attachments[index].SourceRGBFactor();
+        const BlendConstantRead source = MaxwellToD3D12::ColorBlendConstantRead(factor);
+        if (source != BlendConstantRead::None && source != hardware) {
+            plan.shader_factors[index] = ShaderBlendFactor(factor);
+        }
+    }
+    return plan;
 }
 
 GraphicsPipeline::GraphicsPipeline(const Device& device_,
@@ -232,9 +434,11 @@ GraphicsPipeline::GraphicsPipeline(const Device& device_,
                                    CompileDxil compile_dxil,
                                    const std::array<const Shader::Info*, NUM_STAGES>& infos,
                                    const PipelineLayout& layout_, bool build_pso,
-                                   GraphicsPsoCache* pso_cache_, u32 lower_noperspective_mask_)
+                                   GraphicsPsoCache* pso_cache_, u32 lower_noperspective_mask_,
+                                   const TessEmulationPlan& tess_plan_)
     : device{device_}, texture_runtime{texture_runtime_}, key{key_}, key_hash{key_.Hash()},
-      layout{layout_}, lower_noperspective_mask{lower_noperspective_mask_}, pso_cache{pso_cache_},
+      layout{layout_}, lower_noperspective_mask{lower_noperspective_mask_}, tess_plan{tess_plan_},
+      pso_cache{pso_cache_},
       from_disk{worker_thread == nullptr} {
     u8 valid_targets{};
     for (size_t index = 0; index < key.state.color_formats.size(); ++index) {
@@ -254,7 +458,7 @@ GraphicsPipeline::GraphicsPipeline(const Device& device_,
     }
     depth_bounds = device.SupportsDepthBounds() && key.state.depth_enabled != 0 &&
                    key.state.dynamic_state.depth_bounds_enable != 0;
-    blend_constant_alpha = ReadsOnlyConstantAlpha(key.state, bound_color_targets);
+    blend_constants = PlanBlendConstants(key.state);
     if (key.state.xfb_enabled != 0) {
         for (size_t index = 0; index < stream_output_strides.size(); ++index) {
             stream_output_strides[index] = key.state.xfb_state.layouts[index].stride;
@@ -352,7 +556,11 @@ GraphicsPipeline::GraphicsPipeline(const Device& device_,
         }
         FT::Mark(FT::Event::PipelineBuildDone, trace_pipeline, pipeline_state.Get() != nullptr);
         // Without a PSO yet, a pipeline whose DXIL failed is still ready: its draws are skipped.
-        Publish(compiled && !build_pso ? State::Dormant : State::Ready);
+        // Most pipelines loaded at boot stay dormant, so their DXIL waits on disk instead.
+        if (compiled && !build_pso) {
+            ReleaseDxil();
+        }
+        Publish((compiled && !build_pso) || out_of_memory ? State::Dormant : State::Ready);
         if (shader_notify) {
             shader_notify->MarkShaderComplete();
         }
@@ -410,8 +618,13 @@ bool GraphicsPipeline::Wake(Common::ThreadWorker& worker) {
         return false;
     }
     QueueBuild(&worker, [this] {
-        Build();
-        Publish(State::Ready);
+        // Without its DXIL the pipeline stays ready with no PSO: its draws are skipped. Out of
+        // memory, it keeps the DXIL and stays dormant to be woken again.
+        out_of_memory = false;
+        if (dxil || ReloadDxil()) {
+            Build();
+        }
+        Publish(out_of_memory ? State::Dormant : State::Ready);
     });
     return true;
 }
@@ -422,13 +635,74 @@ bool GraphicsPipeline::Evict(Scheduler& scheduler) {
         !dxil) {
         return false;
     }
+    ReleaseDxil();
     build_state.store(State::Dormant, std::memory_order::release);
     evicted = true;
     // Keep the shared entry discoverable and charged until its last submitted use retires.
     // Other guest variants may still own it or acquire it while this fence is pending.
     scheduler.DeferRelease(std::move(pipeline_state),
-                           [retired = std::move(shared_pso)] {});
+                           [retired = std::move(shared_pso), back = std::move(cull_back_state),
+                            front = std::move(cull_front_states),
+                            capture = std::move(tess_capture_state),
+                            control = std::move(tess_control_state)] {});
     return true;
+}
+
+void GraphicsPipeline::ReleaseDxil() {
+    // Pipelines sharing the linked entry, the linked shader cache and live PSO cache entries may
+    // still hold the bytes; they are freed with the last one.
+    if (!dxil || !dxil->disk_key || !dxil->stream_output.empty()) {
+        return;
+    }
+    u64 bytes = 0;
+    u8 mask = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!dxil->stages[stage].empty()) {
+            mask |= static_cast<u8>(1U << stage);
+            bytes += dxil->stages[stage].size();
+        }
+    }
+    released_dxil = dxil->disk_key;
+    released_stage_mask = mask;
+    dxil.reset();
+    dxil_released.fetch_add(1, std::memory_order_relaxed);
+    dxil_released_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+bool GraphicsPipeline::ReloadDxil() {
+    if (!released_dxil) {
+        return false;
+    }
+    auto stages = ShaderCompiler::LoadPipeline(*released_dxil,
+                                               static_cast<size_t>(std::popcount(released_stage_mask)));
+    if (!stages) {
+        dxil_reload_failed.fetch_add(1, std::memory_order_relaxed);
+        BUG_TRACK_KEY(ShaderCompile, key.Hash(),
+                      "reading back the DXIL of VS {:016x} PS {:016x} from the disk cache failed",
+                      key.unique_hashes[1], key.unique_hashes[5]);
+        return false;
+    }
+    auto reloaded = std::make_shared<ReloadedDxil>();
+    u64 bytes = 0;
+    size_t next = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if ((released_stage_mask >> stage) & 1) {
+            bytes += (*stages)[next].dxil.capacity();
+            reloaded->linked.stages[stage] = std::move((*stages)[next++].dxil);
+        }
+    }
+    reloaded->linked.disk_key = released_dxil;
+    reloaded->charge = Common::MemoryCharge(Common::MemoryAccount::ShaderBytecode, bytes);
+    dxil = SharedDxilStages(reloaded, &reloaded->linked);
+    dxil_reloaded.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+GraphicsPipeline::DxilReleaseStats GraphicsPipeline::GetDxilReleaseStats() noexcept {
+    return {.released = dxil_released.load(std::memory_order_relaxed),
+            .released_bytes = dxil_released_bytes.load(std::memory_order_relaxed),
+            .reloaded = dxil_reloaded.load(std::memory_order_relaxed),
+            .failed = dxil_reload_failed.load(std::memory_order_relaxed)};
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
@@ -461,7 +735,7 @@ void GraphicsPipeline::WaitBuilt() {
     std::shared_ptr<PendingBuild> build;
     {
         std::scoped_lock lock{build_mutex};
-        if (build_state.load(std::memory_order::relaxed) == State::Ready) {
+        if (build_state.load(std::memory_order::relaxed) != State::Building) {
             return;
         }
         build = pending;
@@ -473,8 +747,16 @@ void GraphicsPipeline::WaitBuilt() {
         RunClaimed(*build);
     }
     std::unique_lock lock{build_mutex};
+    // A build that ran out of memory ends dormant rather than ready.
     build_condvar.wait(lock, [this] {
-        return build_state.load(std::memory_order::relaxed) == State::Ready;
+        return build_state.load(std::memory_order::relaxed) != State::Building;
+    });
+}
+
+bool GraphicsPipeline::WaitBuiltFor(u64 microseconds) {
+    std::unique_lock lock{build_mutex};
+    return build_condvar.wait_for(lock, std::chrono::microseconds{microseconds}, [this] {
+        return build_state.load(std::memory_order::relaxed) != State::Building;
     });
 }
 
@@ -498,6 +780,25 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
     texture_cache.SynchronizeDescriptors(false);
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
 
+    // stage_view_cache=1: what each stage resolved stays valid under the same binding stamp.
+    const bool cache_views = stage_view_cache.load(std::memory_order_relaxed);
+    VideoCommon::GraphicsBindingStamp stamp{};
+    if (cache_views) {
+        stamp = texture_cache.CurrentGraphicsBindingStamp();
+        if (!stage_views) {
+            stage_views = std::make_unique<StageViewState>();
+        }
+        if (stage_views->stamp != stamp) {
+            stage_views->valid = {};
+        }
+    }
+    std::array<bool, NUM_STAGES> reused{};
+    std::array<std::pair<u32, u32>, NUM_STAGES> view_ranges{};
+    std::array<u32, NUM_STAGES> first_samplers{};
+    boost::container::small_vector<u32, 32> tsc_handles;
+    std::array<std::pair<u32, u32>, NUM_STAGES> tsc_ranges{};
+    bool any_reused = false;
+
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!HasStage(stage)) {
@@ -513,12 +814,91 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
         }
         const auto& cbufs = maxwell3d.state.shader_stages[stage].const_buffers;
         const auto read_handle = [&](const auto& desc, u32 index) {
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(desc)>,
+                                         Shader::TextureDescriptor>) {
+                if (desc.varying_handle) [[unlikely]] {
+                    return Tegra::Texture::TexturePair(out.vertex_texture_handle, via_header_index);
+                }
+            }
             return ReadTextureHandle(gpu_memory, desc, index, via_header_index,
                                      [&](u32 cbuf) { return cbufs[cbuf].address; });
         };
-        GatherStageViews(info, texture_cache, false, read_handle, views, samplers, sampler_cache);
+        const u32 first_view = static_cast<u32>(views.size());
+        first_samplers[stage] = static_cast<u32>(samplers.size());
+        if (cache_views && stage_views->valid[stage] &&
+            ReuseStageViews(info, texture_cache, read_handle, stage_views->entries[stage], views,
+                            samplers)) {
+            reused[stage] = true;
+            any_reused = true;
+        } else if (cache_views) {
+            // The TSC handles are not kept by the views: record them for StoreStageViews.
+            const u32 first_tsc = static_cast<u32>(tsc_handles.size());
+            const auto read_and_record = [&](const auto& desc, u32 index) {
+                const auto handle = read_handle(desc, index);
+                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(desc)>,
+                                             Shader::TextureDescriptor>) {
+                    tsc_handles.push_back(handle.second);
+                }
+                return handle;
+            };
+            GatherStageViews(info, texture_cache, false, read_and_record, views, samplers,
+                             sampler_cache);
+            tsc_ranges[stage] = {first_tsc, static_cast<u32>(tsc_handles.size())};
+        } else {
+            GatherStageViews(info, texture_cache, false, read_handle, views, samplers,
+                             sampler_cache);
+        }
+        view_ranges[stage] = {first_view, static_cast<u32>(views.size())};
     }
-    texture_cache.FillImageViews(std::span(views.data(), views.size()), false, has_images);
+    if (!any_reused) {
+        texture_cache.FillImageViews(std::span(views.data(), views.size()), false, has_images);
+    } else {
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            const auto [first, last] = view_ranges[stage];
+            if (!reused[stage] && first != last) {
+                texture_cache.FillImageViews(std::span(views.data() + first, last - first), false,
+                                             has_images);
+            }
+        }
+        // Resolving the others changed the images (deleted some...): resolve every view again.
+        if (texture_cache.CurrentGraphicsBindingStamp().epoch != stamp.epoch) {
+            texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                         has_images);
+        }
+    }
+    if (cache_views) {
+        const VideoCommon::GraphicsBindingStamp after = texture_cache.CurrentGraphicsBindingStamp();
+        if (after.epoch != stamp.epoch) {
+            // Images changed while the views were resolved: views prepared before may be stale.
+            stage_views->valid = {};
+            stage_views->stamp = {};
+        } else {
+            stage_views->stamp = after;
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (!HasStage(stage)) {
+                    continue;
+                }
+                if (reused[stage]) {
+                    VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::StageViewReuses, 1);
+                    continue;
+                }
+                const StageBindings& info = *stage_infos[stage];
+                const bool cacheable = StageViewsCacheable(info);
+                stage_views->valid[stage] = cacheable;
+                if (!cacheable) {
+                    continue;
+                }
+                VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::StageViewMisses, 1);
+                const auto [first, last] = view_ranges[stage];
+                const auto [first_tsc, last_tsc] = tsc_ranges[stage];
+                StoreStageViews(info, std::span(views.data() + first, last - first),
+                                std::span(samplers.data() + first_samplers[stage],
+                                          samplers.size() - first_samplers[stage]),
+                                std::span(tsc_handles.data() + first_tsc, last_tsc - first_tsc),
+                                stage_views->entries[stage]);
+            }
+        }
+    }
     if (VideoCore::Perf::DetailedGpuProfileEnabled()) {
         DrawMetrics::sampler_resolve_requests.fetch_add(samplers.size(), std::memory_order_relaxed);
         DrawMetrics::sampler_resolve_reused.fetch_add(sampler_cache.Hits(), std::memory_order_relaxed);
@@ -558,6 +938,7 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
         target_lap.Lap(VideoCore::Perf::Counter::DrawFramebufferNs);
     }
     lap.Lap(VideoCore::Perf::Counter::DrawTargetsNs);
+    const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     const auto& dynamic = key.state.dynamic_state;
     const bool writable_depth =
         (dynamic.depth_test_enable != 0 && dynamic.depth_write_enable != 0) ||
@@ -578,8 +959,37 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
     ImageTransitionList image_transitions;
     bool uses_render_area = false;
     const bool has_sampler_table = layout.IntegerSamplerIndex() != PipelineLayout::NO_TABLE;
-    const bool emulates_reduction = key.emulate_reduction != 0;
+    const bool emulates_reduction =
+        (key.shader_flags & GraphicsPipelineCacheKey::SHADER_REDUCTION) != 0;
     IntegerSamplerTable integer_samplers;
+
+    // texture_replay: a draw resolving the same views and samplers as the pipeline's last one,
+    // under the same stamp and depth target, binds what that draw computed per texture.
+    const TextureReplayMode replay_mode = texture_replay_mode.load(std::memory_order_relaxed);
+    TextureReplayState* replay = nullptr;
+    bool replay_matches = false;
+    VideoCommon::GraphicsBindingStamp replay_stamp{};
+    if (replay_mode != TextureReplayMode::Off && !out.trace_all_views && !out.trace_views &&
+        !out.trace_filters && !out.trace_types && !GpuDiagnosticsEnabled() &&
+        !VideoCommon::FullCapture::Active()) {
+        if (!texture_replay) {
+            texture_replay = std::make_unique<TextureReplayState>();
+        }
+        replay = texture_replay.get();
+        replay_stamp = texture_cache.CurrentGraphicsBindingStamp();
+        replay_matches = replay->framebuffer == framebuffer &&
+                         replay->key.Matches(replay_stamp, depth_image, writable_depth, views, samplers);
+    }
+    const bool replaying = replay_matches && replay_mode == TextureReplayMode::On;
+    // What the full path binds, kept to replay it later or, in check mode, to compare.
+    const bool recording = replay && !replaying;
+    boost::container::small_vector<D3D12_CPU_DESCRIPTOR_HANDLE, 32> recorded_handles;
+    boost::container::small_vector<u8, 32> recorded_prepare;
+    u8 texture_unemulated = 0;
+    std::array<u32, 2> mirror_border_masks{};
+    bool aliased_depth = false;
+    size_t texture_index = 0;
+
     u32 stage_binding = 0;
     const SamplerId* samplers_it = samplers.data();
     const ImageViewInOut* views_it = views.data();
@@ -598,18 +1008,37 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index, ++texture_binding) {
                 const VideoCommon::ImageViewId view_id = (views_it++)->id;
+                if (replaying) {
+                    const size_t t = texture_index++;
+                    if (texture_replay->prepare[t] != 0) {
+                        texture_cache.GetImageView(view_id).PrepareRead(desc.type);
+                    }
+                    queue.AddCopy(texture_replay->handles[t]);
+                    ++samplers_it;
+                    image_transitions.emplace_back(view_id, false);
+                    continue;
+                }
                 const ImageView& image_view = texture_cache.GetImageView(view_id);
                 const bool aliases_depth = depth_image != VideoCommon::ImageId{} &&
                                            image_view.image_id == depth_image;
+                aliased_depth |= aliases_depth;
                 if (aliases_depth && writable_depth && !depth_feedback_attempted) {
                     depth_feedback_attempted = true;
                     depth_feedback_ready = image_view.SourceImage()->PrepareDepthFeedback() != nullptr;
                 }
+                D3D12_CPU_DESCRIPTOR_HANDLE handle;
+                // A color target the draw also samples is read in place, as upstream does: the
+                // guest only orders such reads after its writes across a texture barrier.
                 if (aliases_depth && depth_feedback_ready) {
-                    queue.AddCopy(image_view.DepthFeedbackHandle(desc.type));
+                    handle = image_view.DepthFeedbackHandle(desc.type);
                 } else {
                     image_view.PrepareRead(desc.type);
-                    queue.AddCopy(image_view.Handle(desc.type));
+                    handle = image_view.Handle(desc.type);
+                }
+                queue.AddCopy(handle);
+                if (recording) {
+                    recorded_handles.push_back(handle);
+                    recorded_prepare.push_back(image_view.NeedsPrepareRead(desc.type) ? 1 : 0);
                 }
                 const SamplerId sampler_id = *(samplers_it++);
                 const Sampler& sampler = texture_cache.GetSampler(sampler_id);
@@ -618,7 +1047,16 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
                 }
                 if (!emulates_reduction && sampler.EmulatedReduction() != 0 &&
                     ReducibleTexture(desc)) {
-                    out.unemulated_reduction_stages |= static_cast<u8>(1u << stage);
+                    texture_unemulated |= static_cast<u8>(1u << stage);
+                }
+                if (const u32 axes = sampler.MirrorBorderAxes();
+                    axes != 0 && stage == FRAGMENT_STAGE && !desc.is_integer) {
+                    const size_t descriptor = &desc - info.texture_descriptors.data();
+                    if (descriptor < Shader::Optimization::MIRROR_BORDER_MAX_DESCRIPTORS) {
+                        const u32 bit = u32{1} << descriptor;
+                        mirror_border_masks[0] |= (axes & 1) != 0 ? bit : 0;
+                        mirror_border_masks[1] |= (axes & 2) != 0 ? bit : 0;
+                    }
                 }
                 image_transitions.emplace_back(view_id, false);
                 if (out.trace_all_views) out.trace_all_views->push_back(
@@ -642,6 +1080,11 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
         }
         PushStorageImages(info, texture_cache, queue, views_it, image_transitions);
         uses_render_area |= info.uses_render_area;
+        if (info.uses_destination_read) {
+            // The emulated logic op's destination, the last binding of the last stage.
+            ImageView& target = texture_cache.GetImageView(framebuffer->ColorViewId(0));
+            queue.AddCopy(ColorSnapshotHandle(target, Shader::TextureType::Color2D));
+        }
     }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
@@ -687,7 +1130,70 @@ void GraphicsPipeline::Configure(bool is_indexed, const PipelineBindContext& con
 
     out.resource_table = queue.Table();
     std::ranges::copy(queue.RootConstantBuffers(), out.root_cbvs.begin());
-    out.integer_samplers = integer_samplers.Upload(buffer_cache);
+    const u64 tick = context.scheduler.CurrentTick();
+    if (replaying) {
+        VideoCore::Perf::Add(VideoCore::Perf::Counter::TextureReplays, 1);
+        TextureReplayState& state = *texture_replay;
+        out.unemulated_reduction_stages |= state.unemulated_reduction_stages;
+        mirror_border_masks = state.mirror_border_masks;
+        if (state.integer_samplers.Empty()) {
+            out.integer_samplers = 0;
+        } else {
+            if (state.integer_tick != tick) {
+                state.integer_address = state.integer_samplers.Upload(buffer_cache);
+                state.integer_tick = tick;
+            }
+            out.integer_samplers = state.integer_address;
+        }
+    } else {
+        out.unemulated_reduction_stages |= texture_unemulated;
+        out.integer_samplers = integer_samplers.Upload(buffer_cache);
+    }
+    if (recording) {
+        TextureReplayState& state = *texture_replay;
+        if (replay_matches) {
+            // Check mode: what a replay would have bound against what the full path bound.
+            const bool same =
+                state.handles.size() == recorded_handles.size() &&
+                std::equal(recorded_handles.begin(), recorded_handles.end(), state.handles.begin(),
+                           [](auto a, auto b) { return a.ptr == b.ptr; }) &&
+                std::equal(recorded_prepare.begin(), recorded_prepare.end(),
+                           state.prepare.begin(), state.prepare.end()) &&
+                state.unemulated_reduction_stages == texture_unemulated &&
+                state.mirror_border_masks == mirror_border_masks &&
+                state.integer_samplers.SameRows(integer_samplers);
+            if (same) {
+                VideoCore::Perf::Add(VideoCore::Perf::Counter::TextureReplays, 1);
+            } else {
+                VideoCore::Perf::Add(VideoCore::Perf::Counter::TextureReplayMismatches, 1);
+                if (texture_replay_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Render,
+                                "texture_replay=check: pipeline {} would have bound {} texture "
+                                "descriptors that differ from the {} bound in full",
+                                static_cast<const void*>(this), state.handles.size(),
+                                recorded_handles.size());
+                }
+                state.key.valid = false;
+            }
+        } else if (aliased_depth ||
+                   texture_cache.CurrentGraphicsBindingStamp() != replay_stamp) {
+            // Feedback depends on its snapshot; changed images may resolve to new views.
+            state.key.valid = false;
+        } else {
+            state.key.Store(replay_stamp, depth_image, writable_depth, views, samplers);
+            state.framebuffer = framebuffer;
+            state.handles.assign(recorded_handles.begin(), recorded_handles.end());
+            state.prepare.assign(recorded_prepare.begin(), recorded_prepare.end());
+            state.unemulated_reduction_stages = texture_unemulated;
+            state.mirror_border_masks = mirror_border_masks;
+            state.integer_samplers = integer_samplers;
+            state.integer_tick = tick;
+            state.integer_address = out.integer_samplers;
+        }
+    }
+    out.mirror_border_masks = mirror_border_masks;
+    out.unemulated_mirror_border =
+        (mirror_border_masks[0] | mirror_border_masks[1]) != 0 && dynamic.shader_mirror_border == 0;
     lap.Lap(VideoCore::Perf::Counter::DrawSamplersNs);
 
     // Push constants: no resolution scaling yet (all rescaling bits clear, down factor 1), then
@@ -715,6 +1221,9 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsPipeline::Describe(
     desc.DS = Bytecode(stages[2]);
     desc.GS = Bytecode(stages[3]);
     desc.PS = Bytecode(stages[4]);
+    // The pixel shader adds the bias (SHADER_DEPTH_BIAS); without one the PSO keeps it.
+    const bool shader_bias =
+        (key.shader_flags & GraphicsPipelineCacheKey::SHADER_DEPTH_BIAS) != 0 && !stages[4].empty();
 
     // Native transform feedback: the last pre-rasterization stage streams out the captured
     // outputs where its Xfb decorations place them. Rasterizer discard keeps the capture and
@@ -754,6 +1263,12 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsPipeline::Describe(
         if (fetch.parts > 1) {
             format = fetch.part_format;
         }
+        // The bgra bit fetches the first and third bytes swapped; DXGI has that only for UNORM.
+        if (attribute.bgra != 0) {
+            if (format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            }
+        }
         for (u32 part = 0; part < fetch.parts; ++part) {
             elements.push_back({
                 .SemanticName = "TEXCOORD",
@@ -767,13 +1282,23 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsPipeline::Describe(
             });
         }
     }
-    desc.InputLayout = {.pInputElementDescs = elements.empty() ? nullptr : elements.data(),
-                        .NumElements = static_cast<UINT>(elements.size())};
+    // An emulated evaluation shader reads its domain points and patches from buffers; the
+    // vertex shader that fetches these runs in the capture pipeline (BuildTessEmulation).
+    if (!tess_plan.Active()) {
+        desc.InputLayout = {.pInputElementDescs = elements.empty() ? nullptr : elements.data(),
+                            .NumElements = static_cast<UINT>(elements.size())};
+    }
     desc.IBStripCutValue = static_cast<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(key.strip_cut);
 
     const bool has_tessellation = !stages[1].empty() || !stages[2].empty();
     desc.PrimitiveTopologyType = MaxwellToD3D12::PrimitiveTopologyType(state.topology);
-    if (has_tessellation) {
+    if (tess_plan.Active()) {
+        // The tessellator's index list: segments for isolines, triangles otherwise.
+        const bool isolines =
+            tess_plan.domain == static_cast<u32>(Shader::TessPrimitive::Isolines);
+        desc.PrimitiveTopologyType = isolines ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                              : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    } else if (has_tessellation) {
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
     } else if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
         BUG_TRACK(UnsupportedState, "patch topology without tessellation drawn as points");
@@ -783,37 +1308,60 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsPipeline::Describe(
     }
 
     const auto polygon_mode = FixedPipelineState::UnpackPolygonMode(state.polygon_mode);
-    if (polygon_mode == Maxwell::PolygonMode::Point) {
+    if (polygon_mode == Maxwell::PolygonMode::Point && stages[3].empty()) {
         WarnOnce(warned_point_fill, "point fill mode");
     }
-    if (state.conservative_raster_enable != 0) {
+    // D3D12 does not allow it with wireframe or line primitives.
+    const bool conservative_raster =
+        state.conservative_raster_enable != 0 && device.SupportsConservativeRaster() &&
+        polygon_mode == Maxwell::PolygonMode::Fill &&
+        desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if (state.conservative_raster_enable != 0 && !conservative_raster) {
         WarnOnce(warned_conservative, "conservative rasterization");
     }
     // The y-flip happens in the shader (spirv_to_dxil yz_flip), so primitives keep the winding they
     // have in Vulkan's framebuffer space and the front face maps directly.
     desc.RasterizerState = {
         .FillMode = MaxwellToD3D12::FillMode(polygon_mode),
-        .CullMode = MaxwellToD3D12::CullMode(dynamic.cull_enable != 0, dynamic.CullFace()),
+        // Points have no back face; the quads the point geometry shader makes of them would. Same
+        // for the quads made of lines, of polygon vertices and of bounding boxes.
+        .CullMode = (state.topology == Maxwell::PrimitiveTopology::Points ||
+                     (!stages[3].empty() && (dynamic.generated_lines != 0 ||
+                                             dynamic.generated_polygon_points != 0 ||
+                                             dynamic.generated_fill_rectangle != 0))) &&
+                            key.unique_hashes[2] == 0 && key.unique_hashes[3] == 0 &&
+                            key.unique_hashes[4] == 0
+                        ? D3D12_CULL_MODE_NONE
+                        : MaxwellToD3D12::CullMode(dynamic.cull_enable != 0, dynamic.CullFace()),
         .FrontCounterClockwise = dynamic.FrontFace() == Maxwell::FrontFace::CounterClockWise,
-        .DepthBias = static_cast<INT>(std::bit_cast<f32>(key.depth_bias) / 2.0f),
-        .DepthBiasClamp = std::bit_cast<f32>(key.depth_bias_clamp),
-        .SlopeScaledDepthBias = std::bit_cast<f32>(key.slope_scaled_depth_bias),
+        .DepthBias = shader_bias ? 0 : static_cast<INT>(std::bit_cast<f32>(key.depth_bias) / 2.0f),
+        .DepthBiasClamp = shader_bias ? 0.0f : std::bit_cast<f32>(key.depth_bias_clamp),
+        .SlopeScaledDepthBias =
+            shader_bias ? 0.0f : std::bit_cast<f32>(key.slope_scaled_depth_bias),
         .DepthClipEnable = dynamic.depth_clamp_disabled != 0,
         .MultisampleEnable = FALSE,
         .AntialiasedLineEnable = state.smooth_lines != 0,
         .ForcedSampleCount = 0,
-        .ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
+        .ConservativeRaster = conservative_raster ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+                                                  : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
     };
 
-    if (dynamic.logic_op_enable != 0) {
+    const bool shader_logic_op = EmulatesLogicOp(state) && !stages[4].empty();
+    if (dynamic.logic_op_enable != 0 && !shader_logic_op) {
         WarnOnce(warned_logic_op, "logic op");
     }
     const size_t num_attachments = DrawColorTargetCount(NumAttachments(state), bound_color_targets);
-    desc.BlendState.AlphaToCoverageEnable = state.alpha_to_coverage_enabled != 0;
+    desc.BlendState.AlphaToCoverageEnable =
+        state.alpha_to_coverage_enabled != 0 && key.ShaderAlphaToCoverage() == 0;
     desc.BlendState.IndependentBlendEnable = TRUE;
     desc.NumRenderTargets = static_cast<UINT>(num_attachments);
     for (size_t index = 0; index < num_attachments; ++index) {
-        desc.BlendState.RenderTarget[index] = BlendTarget(state.attachments[index]);
+        desc.BlendState.RenderTarget[index] =
+            BlendTarget(state.attachments[index],
+                        blend_constants.shader_factors[index] != Shader::BlendConstantFactor::None);
+        if (index == 0 && shader_logic_op) {
+            desc.BlendState.RenderTarget[0].BlendEnable = FALSE; // A logic op replaces blending.
+        }
         const auto format = static_cast<Tegra::RenderTargetFormat>(state.color_formats[index]);
         desc.RTVFormats[index] = DrawColorTargetFormat(
             format == Tegra::RenderTargetFormat::NONE
@@ -845,7 +1393,7 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsPipeline::Describe(
         .BackFace = StencilFace(dynamic.back),
     };
 
-    desc.SampleMask = UINT_MAX;
+    desc.SampleMask = key.SampleMask();
     desc.SampleDesc = {.Count = MaxwellToD3D12::SampleCount(state.msaa_mode), .Quality = 0};
 
     return desc;
@@ -1050,6 +1598,9 @@ void GraphicsPipeline::Build(bool flatten_on_fault) try {
     const bool bounds_test = depth_bounds && desc.DSVFormat != DXGI_FORMAT_UNKNOWN;
     auto host_key = MakeGraphicsPsoKey(desc, dxil);
     host_key.state.push_back(bounds_test ? 1U : 0U);
+    // The driver's blob of this PSO from an earlier session (pso_blobs); not through the stream.
+    const bool use_blob = !bounds_test && PsoBlobCache::Enabled();
+    const u64 blob_hash = use_blob ? PsoBlobCache::StableHash(host_key) : 0;
     const u64 index_bytes = sizeof(GraphicsPsoCache::Entry) + 128 +
                             host_key.state.capacity() * sizeof(u32);
     HRESULT hr = S_OK;
@@ -1081,12 +1632,36 @@ void GraphicsPipeline::Build(bool flatten_on_fault) try {
     const auto create_pso = [&](ComPtr<ID3D12PipelineState>& handle) {
         DWORD fault = 0;
         HRESULT result;
+        const std::vector<u8> blob =
+            use_blob ? GetPsoBlobCache().Load(blob_hash) : std::vector<u8>{};
+        desc.CachedPSO = {blob.data(), blob.size()};
         {
             std::shared_lock build_lock{PipelineBuildMutex()};
             result = try_create(handle, fault);
         }
+        desc.CachedPSO = {};
+        if (!blob.empty() && FAILED(result) && result != E_OUTOFMEMORY &&
+            result != DRIVER_FAULT_HRESULT) {
+            // A blob of another driver version or adapter: dropped, and the PSO made from scratch.
+            handle.Reset();
+            GetPsoBlobCache().Reject(blob_hash);
+            std::shared_lock build_lock{PipelineBuildMutex()};
+            result = try_create(handle, fault);
+            if (SUCCEEDED(result)) {
+                GetPsoBlobCache().Store(blob_hash, handle.Get());
+            }
+        } else if (use_blob && blob.empty() && SUCCEEDED(result)) {
+            GetPsoBlobCache().Store(blob_hash, handle.Get());
+        }
         if (result == DRIVER_FAULT_HRESULT) {
             log_driver_fault(fault, handle);
+        }
+        if (result == E_OUTOFMEMORY) {
+            MemoryReserve::NoteOutOfMemory();
+            if (MemoryReserve::Release()) {
+                std::shared_lock build_lock{PipelineBuildMutex()};
+                result = try_create(handle, fault);
+            }
         }
         return result;
     };
@@ -1173,17 +1748,24 @@ void GraphicsPipeline::Build(bool flatten_on_fault) try {
                   static_cast<u32>(desc.DSVFormat), ShaderFeatureFlags(stages[0]),
                   ShaderFeatureFlags(stages[4]));
         if (hr == E_OUTOFMEMORY) {
-            VideoCommon::GPUThread::ReportException("D3D12 graphics PSO allocation exhausted memory");
+            // Built again once memory is back: the pipeline stays dormant with its DXIL.
+            out_of_memory = true;
         } else if (FirstFailure(key.Hash())) {
             // Every pipeline object with these shaders fails again; diagnose the first, alone in
             // the driver so that other builds do not decide its variants.
             std::unique_lock build_lock{PipelineBuildMutex()};
             if (hr == DRIVER_FAULT_HRESULT) {
                 DumpFaultedPipeline(key.unique_hashes[1], key.unique_hashes[5], stages);
+                ProbeFaultedPixelShader(device.Get(), desc, key.unique_hashes[5]);
             }
             DiagnoseFailedPipeline(device.Get(), desc);
         }
         pipeline_state.Reset();
+        return;
+    }
+    if (tess_plan.Active() && !BuildTessEmulation(elements)) {
+        pipeline_state.Reset();
+        shared_pso.reset();
         return;
     }
     if (GpuDiagnosticsEnabled()) {
@@ -1209,6 +1791,106 @@ void GraphicsPipeline::Build(bool flatten_on_fault) try {
     shared_pso.reset();
     LOG_ERROR(Render, "D3D12: graphics pipeline preparation failed with an unknown exception");
     VideoCommon::GPUThread::ReportException("D3D12 graphics pipeline preparation failed");
+}
+
+bool GraphicsPipeline::BuildTessEmulation(std::span<const D3D12_INPUT_ELEMENT_DESC> elements) {
+    // The vertex shader alone over the guest's vertices, one point each, storing to the capture
+    // buffer. Its points land behind the viewer, with nothing to write to anyway.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC capture{};
+    capture.pRootSignature = layout.Handle();
+    capture.VS = Bytecode(dxil->tess_capture);
+    capture.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    capture.SampleMask = UINT_MAX;
+    capture.RasterizerState = {.FillMode = D3D12_FILL_MODE_SOLID,
+                               .CullMode = D3D12_CULL_MODE_NONE,
+                               .DepthClipEnable = TRUE};
+    capture.InputLayout = {.pInputElementDescs = elements.empty() ? nullptr : elements.data(),
+                           .NumElements = static_cast<UINT>(elements.size())};
+    capture.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    capture.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    capture.SampleDesc = {.Count = 1, .Quality = 0};
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC control{
+        .pRootSignature = layout.Handle(),
+        .CS = Bytecode(dxil->tess_control),
+    };
+    HRESULT hr;
+    {
+        std::shared_lock build_lock{PipelineBuildMutex()};
+        hr = device.Get()->CreateGraphicsPipelineState(&capture, IID_PPV_ARGS(&tess_capture_state));
+        if (SUCCEEDED(hr)) {
+            hr = device.Get()->CreateComputePipelineState(&control,
+                                                          IID_PPV_ARGS(&tess_control_state));
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        return true;
+    }
+    tess_capture_state.Reset();
+    tess_control_state.Reset();
+    BUG_TRACK_KEY(PipelineRejected, key.Hash(),
+                  "tessellation emulation pipelines rejected (HRESULT 0x{:08X}) for VS {:016x} "
+                  "TCS {:016x}; its draws are skipped",
+                  static_cast<u32>(hr), key.unique_hashes[1], key.unique_hashes[2]);
+    const Common::BugTracker::TapMute bug_tracker_mute;
+    LOG_ERROR(Render,
+              "D3D12: tessellation emulation pipelines failed (HRESULT 0x{:08X}) for VS {:016x} "
+              "TCS {:016x}",
+              static_cast<u32>(hr), key.unique_hashes[1], key.unique_hashes[2]);
+    return false;
+}
+
+ID3D12PipelineState* GraphicsPipeline::CulledHandle(D3D12_CULL_MODE mode, u8 back_read_mask,
+                                                    u8 back_write_mask) {
+    const bool back_faces = mode == D3D12_CULL_MODE_FRONT;
+    const u16 masks = static_cast<u16>(back_read_mask | back_write_mask << 8);
+    // std::addressof: operator& on a WRL ComPtr converts by releasing the object it holds, and the
+    // commands already recorded with that object run later.
+    ComPtr<ID3D12PipelineState>* slot = std::addressof(cull_back_state);
+    if (back_faces) {
+        const auto it = std::ranges::find_if(
+            cull_front_states, [masks](const auto& entry) { return entry.first == masks; });
+        slot = it != cull_front_states.end()
+                   ? std::addressof(it->second)
+                   : std::addressof(cull_front_states.emplace_back(masks, nullptr).second);
+    }
+    ComPtr<ID3D12PipelineState>& handle = *slot;
+    if (handle) {
+        return handle.Get();
+    }
+    const bool reloaded = !dxil;
+    if (reloaded && !ReloadDxil()) {
+        return nullptr;
+    }
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    auto desc = Describe(elements);
+    desc.RasterizerState.CullMode = mode;
+    if (back_faces && desc.DepthStencilState.StencilEnable) {
+        desc.DepthStencilState.StencilReadMask = back_read_mask;
+        desc.DepthStencilState.StencilWriteMask = back_write_mask;
+    }
+    const bool bounds_test = depth_bounds && desc.DSVFormat != DXGI_FORMAT_UNKNOWN;
+    DWORD fault = 0;
+    HRESULT result;
+    {
+        std::shared_lock build_lock{PipelineBuildMutex()};
+        result = CallDriverGuarded(
+            [&] {
+                if (bounds_test) {
+                    return CreateWithDepthBounds(device.Get2(), desc, handle);
+                }
+                return device.Get()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&handle));
+            },
+            fault);
+    }
+    if (result == DRIVER_FAULT_HRESULT) {
+        handle.Detach(); // whatever the driver left there is not an object to release
+    } else if (FAILED(result)) {
+        handle.Reset();
+    }
+    if (reloaded) {
+        ReleaseDxil();
+    }
+    return handle.Get();
 }
 
 void SetPsoCostProbe(bool enabled) {

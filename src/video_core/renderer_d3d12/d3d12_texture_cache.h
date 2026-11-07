@@ -125,6 +125,14 @@ public:
     u64 GetDeviceLocalMemory() const;
     u64 GetDeviceMemoryUsage() const;
     std::optional<VideoCommon::TextureGcPolicy> GetTextureGcPolicy(bool second_pass);
+    /// Over the texture cap: the image lives in a heap mostly free, so evicting it helps empty one.
+    [[nodiscard]] bool InSparseHeap(const Image& image) const;
+    [[nodiscard]] bool HasSparseHeaps() const noexcept { return has_sparse_heaps; }
+    /// Bytes of live images one frame may move out of sparse heaps (SetHeapCompaction).
+    [[nodiscard]] u64 HeapCompactionBudget() const noexcept;
+    /// Moves the image out of its sparse heap into free space of a fuller one. The caller drops
+    /// the image's views: their descriptors name the old resource.
+    bool RelocateImage(Image& image);
     [[nodiscard]] u64 DepthFeedbackCopies() const noexcept { return depth_feedback_copies; }
     bool CanReportMemoryUsage() const { return true; }
     std::optional<size_t> GetSamplerHeapBudget() const { return SamplerHeap::CAPACITY; }
@@ -161,8 +169,8 @@ public:
 
     bool CanAccelerateImageUpload(Image& image) const noexcept;
     bool CanUploadMSAA() const noexcept { return false; }
-    /// Decodes an ASTC image with the compute shader (images flagged AcceleratedUpload): map
-    /// holds the guest's swizzled blocks.
+    /// Images flagged AcceleratedUpload: map holds the guest's swizzled blocks, which a compute
+    /// shader decodes (ASTC) or unswizzles (Image::IsGpuUnswizzled).
     void AccelerateImageUpload(Image& image, const StagingBufferRef& map,
                                std::span<const VideoCommon::SwizzleParameters> swizzles, u32, u32);
     void InsertUploadMemoryBarrier() {}
@@ -225,9 +233,19 @@ private:
                            u32 src_subresource, const Region2D& dst_region,
                            const Region2D& src_region);
     void EnsureAstcBcScratch(u64 size);
+    /// AccelerateImageUpload of a block-linear color image: each band of each level and layer is
+    /// unswizzled into a scratch footprint and copied into the image.
+    void UnswizzleImageUpload(Image& image, const StagingBufferRef& map,
+                              std::span<const VideoCommon::SwizzleParameters> swizzles);
+    /// AccelerateImageUpload of an Image::IsGpuBcDecoded image (d3d12_bcn_gpu_decoder.cpp).
+    void BcnImageUpload(Image& image, const StagingBufferRef& map,
+                        std::span<const VideoCommon::SwizzleParameters> swizzles);
     /// A blit whose source and destination are the same image (a mip chain built level by level,
     /// a copy between layers or regions): the source region goes through a scratch texture.
     void BlitWithinImage(ImageView& dst, ImageView& src, const Region2D& dst_region,
+                         const Region2D& src_region, Tegra::Engines::Fermi2D::Filter filter);
+    /// A blit with a multisampled source or target. Regions are in pixels of the images.
+    bool BlitMultisample(ImageView& dst, ImageView& src, const Region2D& dst_region,
                          const Region2D& src_region, Tegra::Engines::Fermi2D::Filter filter);
     void EnsureSelfBlitScratch(DXGI_FORMAT format, u32 width, u32 height);
     void TransitionSelfBlitScratch(D3D12_RESOURCE_STATES next);
@@ -249,7 +267,10 @@ private:
     CachePressure pressure_level{};
     CacheMemorySnapshot pressure_snapshot{};
     bool pressure_sampled{};
-    bool over_texture_cap{}; ///< texture heaps above texture_memory_cap, sampled each frame
+    bool over_texture_cap{}; ///< texture heaps above texture_cap, sampled each frame
+    u64 texture_cap{}; ///< this frame's cap: texture_memory_cap grown into the headroom
+    std::vector<bool> sparse_heaps; ///< by heap index, refreshed each GC frame over the cap
+    bool has_sparse_heaps{};
     u64 gc_pending_bytes{};
     u64 gc_peak_pending_bytes{};
     u64 gc_queued{}, gc_ready{}, gc_stale{}, gc_sync{};
@@ -343,19 +364,44 @@ public:
     [[nodiscard]] DXGI_FORMAT FootprintFormat() const noexcept { return footprint_format; }
     /// How the guest data is laid out for transfers (converted formats: what the CPU decodes to).
     [[nodiscard]] const FormatInfo& TransferFormat() const noexcept { return format; }
+    /// Guest levels the resource leaves out at its top (SetAstcDropTopLevel): guest level l is
+    /// resource level l - LevelBias(), and the levels above it are neither uploaded nor copied.
+    [[nodiscard]] u32 LevelBias() const noexcept { return level_bias; }
     /// A block-compressed image decoded on upload (arrays or unaligned base extent): its resource
     /// holds plain texels, so it does not copy to or from block-compressed images.
     [[nodiscard]] bool IsBcDecoded() const noexcept {
         return format.converted && !VideoCore::Surface::IsPixelFormatASTC(info.format);
     }
+    /// In a CPU-writable heap: its first upload is written in place (SetCpuTextureWrites).
+    [[nodiscard]] bool CpuWritable() const noexcept {
+        return cpu_writable;
+    }
+    /// The texture heap the resource is placed in; SIZE_MAX for a committed resource.
+    [[nodiscard]] size_t HeapIndex() const noexcept;
+    /// Copies the resource on the GPU into free space of a heap in use that `avoid` does not
+    /// mark (by heap index) and keeps the copy; the old one goes once the GPU is done with it.
+    /// False when nothing fits. Views made before the move still name the old resource.
+    bool Relocate(const std::vector<bool>& avoid);
     /// An ASTC image the compute shader decodes into RGBA8 (see AccelerateImageUpload).
     [[nodiscard]] bool IsGpuDecoded() const noexcept {
         return gpu_decoded;
     }
-    /// Top mip levels the host copy omits (texture_scale=): the guest's level N is the host's
-    /// N - DroppedLevels(). Views and uploads add the offset back; see d3d12_texture_downscale.h.
-    [[nodiscard]] u32 DroppedLevels() const noexcept {
-        return dropped_levels;
+    /// A BC image kept as plain texels (IsBcDecoded) that a compute shader decodes on upload
+    /// (SetBcGpuDecode).
+    [[nodiscard]] bool IsGpuBcDecoded() const noexcept {
+        return gpu_bc_decoded;
+    }
+    /// A big block-linear color image a compute shader unswizzles on upload (SetGpuUnswizzle).
+    [[nodiscard]] bool IsGpuUnswizzled() const noexcept {
+        return gpu_unswizzled;
+    }
+    /// async_pipelines: whether a draw was recorded to it as a target. Until then, a draw to it
+    /// gives it its first content and waits for its pipeline.
+    [[nodiscard]] bool TargetDrawn() const noexcept {
+        return target_drawn;
+    }
+    void MarkTargetDrawn() const noexcept {
+        target_drawn = true;
     }
     /// Whether a texture copy between the two resources moves meaningful data: not when one
     /// holds data the host converted (decoded BCn arrays, ASTC) and the other a different block
@@ -413,6 +459,23 @@ public:
     /// Snapshot before a draw that samples and writes this depth/stencil attachment. Reuses the
     /// allocation; copies on the GPU without waiting. Null keeps the read-only fallback on failure.
     [[nodiscard]] Image* PrepareDepthFeedback();
+    /// A copy of the image as it is now, in the storage depth feedback uses.
+    [[nodiscard]] Image* TakeSnapshot();
+    /// What bringing the snapshot up to date took.
+    enum class SnapshotCopy : u8 { Failed, Reused, Partial, Full };
+    /// A copy of a render target as a view of levels [first_level, first_level + num_levels)
+    /// reads it now, read through ImageView::DepthFeedbackHandle: the shared snapshot with those
+    /// levels brought up to date, or for a view of the reinterpreted copy a copy of that, whose
+    /// format the view's SRV takes. Leaves the image in RENDER_TARGET.
+    [[nodiscard]] SnapshotCopy PrepareColorSnapshot(bool reinterpreted_view, s32 first_level,
+                                                    s32 num_levels);
+    /// Transition for binding level as a color target: the snapshot of the other levels stays
+    /// valid.
+    void TransitionColorTarget(s32 level, BarrierBatch* batch);
+    /// The copy PrepareColorSnapshot(true) takes; null before the first.
+    [[nodiscard]] ID3D12Resource* ReinterpretedSnapshot() const noexcept {
+        return reinterpreted_snapshot.Get();
+    }
     [[nodiscard]] Image* DepthFeedback() const noexcept { return depth_feedback.get(); }
 
     /// This image's texels in another typeless family of the same texel size, for views D3D12
@@ -452,6 +515,10 @@ private:
     /// Staging layout of one BufferImageCopy (see d3d12_texture_cache.cpp).
     struct CopyLayout;
     [[nodiscard]] CopyLayout Layout(const VideoCommon::BufferImageCopy& copy) const;
+    /// Writes the copies straight into the CPU-writable resource; false (nothing to rely on) when
+    /// the driver refuses one, and the caller goes through staging.
+    [[nodiscard]] bool WriteInPlace(const u8* mapped_at_base,
+                                    std::span<const VideoCommon::BufferImageCopy> copies);
     /// Guest bytes the copies move (for the performance counters).
     [[nodiscard]] u64 TransferBytes(std::span<const VideoCommon::BufferImageCopy> copies) const;
     /// False (logged once) when this image's data cannot be transferred yet.
@@ -495,9 +562,16 @@ private:
     std::shared_ptr<TextureResourceAllocator::Allocation> resource_allocation;
     FormatInfo format{};
     bool gpu_decoded{};
-    u32 dropped_levels{}; ///< Levels the host copy omits (sampled images, texture_scale=).
+    bool gpu_bc_decoded{};
+    bool gpu_unswizzled{};
+    mutable bool target_drawn{};
+    u32 level_bias{};
     DXGI_FORMAT footprint_format{}; ///< format GetCopyableFootprints uses for plane 0
     D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
+    /// In a CPU-writable heap (SetCpuTextureWrites): its first upload may be written in place.
+    bool cpu_writable{};
+    /// No GPU work has used it yet: every transition clears it, and so does the first upload.
+    bool untouched{true};
     /// A placed render target or depth stencil whose heap memory another resource may have used:
     /// D3D12 requires an aliasing barrier and a discard before its first use.
     bool needs_placed_init{};
@@ -510,6 +584,13 @@ private:
     BcBlockCoverage guest_blocks_coverage;
     u64 guest_blocks_version{};
     bool guest_blocks_upload_pending{};
+    /// Allocates the snapshot on first use and copies the stale levels among wanted into it
+    /// (the whole resource when all are stale or it is multisampled); clears their stale bits.
+    /// Leaves the image in COPY_SOURCE when it copied.
+    [[nodiscard]] Image* RefreshSnapshot(u64 wanted, SnapshotCopy* copy);
+    /// Transition for binding level as a target: marks only that level stale, unless the
+    /// transition itself rewrites the whole image.
+    void TransitionTarget(s32 level, D3D12_RESOURCE_STATES next, BarrierBatch* batch);
     std::unique_ptr<Image> depth_feedback;
     bool depth_feedback_failed{};
     /// Levels written since the depth feedback snapshot, one bit each.
@@ -528,6 +609,9 @@ private:
     u64 reinterpreted_version{};
     /// The copy was rendered to and the image does not have those texels yet.
     bool reinterpreted_ahead{};
+    /// PrepareColorSnapshot of the reinterpreted copy, in its format; kept in a shader resource
+    /// state between snapshots.
+    ComPtr<ID3D12Resource> reinterpreted_snapshot;
 };
 
 class ImageView : public VideoCommon::ImageViewBase {
@@ -594,15 +678,28 @@ public:
     /// Records what reading Handle(texture_type) needs first (a 3D image read as a 2D array
     /// refreshes its slice copy); call before the draw or dispatch, outside any other copy.
     void PrepareRead(Shader::TextureType texture_type) const;
+    /// Whether PrepareRead(texture_type) has anything to do for this view.
+    [[nodiscard]] bool NeedsPrepareRead(Shader::TextureType texture_type) const noexcept;
+    /// PREPARE_* bits of what PrepareRead(texture_type) does: one predicate for both.
+    static constexpr u8 PREPARE_REINTERPRETED = 1 << 0;
+    static constexpr u8 PREPARE_SLICE_ARRAY = 1 << 1;
+    static constexpr u8 PREPARE_VOLUME = 1 << 2;
+    static constexpr u8 PREPARE_CUBE = 1 << 3;
+    [[nodiscard]] u8 PrepareReadWork(Shader::TextureType texture_type) const noexcept;
 
     /// Same format, swizzle and subresources as Handle(), on the prepared depth snapshot.
     [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE DepthFeedbackHandle(
         Shader::TextureType texture_type) const;
 
-    /// Texture2DArray SRV of the stencil plane of the view's first level and layer, the value
-    /// in every component, for blits that copy stencil. Null when the image has no stencil.
+    /// Texture2DArray SRV (Texture2DMSArray on a multisampled image) of the stencil plane of the
+    /// view's first level and layer, the value in every component, for blits that copy stencil.
+    /// Null when the image has no stencil.
     /// Created on first use.
     [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StencilHandle() const;
+
+    /// Texture2DMSArray SRV of the view's first layer, whatever layer that is, for blits from a
+    /// multisampled image. Null for other images. Created on first use.
+    [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE MultisampleHandle() const;
 
     /// A sampler's border color as samples through this view return it (SampledBorderColor).
     [[nodiscard]] std::array<u32, 4> SampledBorder(const std::array<u32, 4>& raw) const noexcept {
@@ -637,6 +734,7 @@ private:
     mutable std::unique_ptr<std::array<D3D12_CPU_DESCRIPTOR_HANDLE, Shader::NUM_TEXTURE_TYPES>>
         depth_feedback_srvs;
     mutable D3D12_CPU_DESCRIPTOR_HANDLE stencil_srv{};
+    mutable D3D12_CPU_DESCRIPTOR_HANDLE multisample_srv{};
     D3D12_CPU_DESCRIPTOR_HANDLE uav{};
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
     bool rtv_on_copy{};
@@ -654,10 +752,44 @@ void SetBcArrayDecode(bool enabled);
 /// Whether ASTC images kept as RGBA8 are decoded by the compute shader (the default) rather than
 /// the CPU. Applies to images created from now on.
 void SetAstcGpuDecode(bool enabled);
+/// Whether BC images kept as plain texels (SetBcArrayDecode, unaligned extents, the small guest
+/// palette) are decoded by the compute shader (the default) rather than the CPU; BC6H always
+/// takes the CPU. Applies to images created from now on.
+void SetBcGpuDecode(bool enabled);
+/// Large mipmapped ASTC textures leave out their top level, a quarter of the memory each: the
+/// guest's level 1 becomes the resource's top ("astc_mip0=drop"; off by default). Shaders that
+/// sample them see half the detail and textureSize reports half. Applies to images created from
+/// now on.
+void SetAstcDropTopLevel(bool enabled);
+/// Block-linear color textures of 64 KiB and more unswizzled by a compute shader on upload (the
+/// default) rather than the CPU ("gpu_unswizzle=0"). Applies to images created from now on.
+void SetGpuUnswizzle(bool enabled);
+/// Textures whose first upload the CPU wrote in place (SetCpuTextureWrites), the bytes written,
+/// and the writes the driver refused (those went through staging).
+struct InPlaceTextureStats {
+    u64 images;
+    u64 bytes;
+    u64 refused;
+};
+[[nodiscard]] InPlaceTextureStats GetInPlaceTextureStats() noexcept;
+/// Over the texture cap, each frame moves up to this many bytes of live images out of mostly
+/// free heaps into free space of fuller ones, so the free heaps empty and trim releases them
+/// ("heap_compaction_mib="; 0, the default, keeps them in place).
+void SetHeapCompaction(u64 bytes_per_frame);
+/// Images moved out of sparse heaps and their bytes.
+struct HeapCompactionStats {
+    u64 images;
+    u64 bytes;
+};
+[[nodiscard]] HeapCompactionStats GetHeapCompactionStats() noexcept;
 /// Texture memory above which clean textures are evicted before the app runs short (0: none).
 void SetTextureMemoryCap(u64 bytes);
-/// Sampled-image mip levels the host copy may omit ("texture_scale=0|1|2"): 0 keeps every level.
-void SetTextureDownscale(u32 levels);
+/// Free app memory the textures leave alone; the cap grows into the headroom above it (0: off).
+void SetTextureMemoryLine(u64 bytes);
+/// The memory coordinator: the textures give way (idle ones evicted sooner, drained heaps freed).
+void SetTextureYield(bool yield);
+/// The texture heaps and this frame's cap, as of the last frame.
+void GetTextureMemoryUse(u64& heap_bytes, u64& cap);
 /// One-shot diagnostic: compare the first GPU BC3 result with the existing CPU pipeline.
 void SetAstcGpuVerify(bool enabled);
 /// Diagnostic ("stencil_blit_verify=1"): the first scaled depth-stencil blits read both stencil
@@ -704,6 +836,9 @@ public:
     /// EDEN_SAMPLER_REDUCTION_* the shader must apply: the guest asked for a filtered MIN/MAX
     /// reduction this device cannot create, so the descriptor filters normally.
     [[nodiscard]] u32 EmulatedReduction() const noexcept { return emulated_reduction; }
+    /// Axes (bit 0 u, bit 1 v) that mirror once and clamp to the border: D3D12 has no such mode, so
+    /// the descriptor clamps to the border and the shader mirrors (MirrorBorderPass).
+    [[nodiscard]] u32 MirrorBorderAxes() const noexcept { return mirror_border_axes; }
 
 private:
     TextureCacheRuntime* runtime{};
@@ -711,9 +846,10 @@ private:
     u64 key{};
     D3D12_FILTER filter{};
     D3D12_SAMPLER_DESC desc{};
-    std::array<u64, 4> guest_raw{}; ///< Original TSC words, diagnostic comparison only.
+    std::array<u64, 4> guest_raw{}; ///< Original TSC words: integer border bits, diagnostics.
     u32 emulated_reduction{}; ///< EDEN_SAMPLER_REDUCTION_*
     u32 emulated_filter{};    ///< EDEN_SAMPLER_FILTER_* bits, with emulated_reduction only
+    u32 mirror_border_axes{};
 };
 
 class Framebuffer {
@@ -739,6 +875,9 @@ public:
     [[nodiscard]] SlotVector<Image>* Images() const noexcept { return images; }
     [[nodiscard]] ImageId ColorImageId(size_t index) const noexcept {
         return index < NUM_RT ? color_images[index] : ImageId{};
+    }
+    [[nodiscard]] VideoCommon::ImageViewId ColorViewId(size_t index) const noexcept {
+        return color_views[index];
     }
     [[nodiscard]] bool HasStencil() const noexcept { return has_stencil; }
     /// RTV format of render target index (UNKNOWN when empty) and the DSV format.
@@ -773,11 +912,15 @@ public:
     /// Transitions the attachments to RENDER_TARGET and DEPTH_WRITE, or the depth buffer to
     /// DEPTH_SAMPLED_STATE when the draw also samples it (bind DepthTarget(true) then), with one
     /// ResourceBarrier call for all of them.
-    void PrepareAttachments(Scheduler& scheduler, bool depth_sampled = false) const;
+    /// color_targets: the color attachments the pipeline binds; the others are left as they
+    /// are, since the draw neither writes nor binds them.
+    void PrepareAttachments(Scheduler& scheduler, bool depth_sampled = false,
+                            u8 color_targets = 0xFF) const;
 
 private:
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, NUM_RT> colors{};
     std::array<ImageId, NUM_RT> color_images{};
+    std::array<VideoCommon::ImageViewId, NUM_RT> color_views{};
     std::array<DXGI_FORMAT, NUM_RT> color_formats{};
     std::array<VideoCommon::SubresourceBase, NUM_RT> color_bases{};
     std::array<u32, NUM_RT> color_layers{};

@@ -22,6 +22,7 @@
 #include "video_core/renderer_d3d12/d3d12_barrier_batch.h"
 #include "video_core/renderer_d3d12/d3d12_checkpoint_readback.h"
 #include "video_core/renderer_d3d12/d3d12_blit_image.h"
+#include "video_core/renderer_d3d12/d3d12_render_corrections.h"
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/render_targets.h"
@@ -48,6 +49,7 @@ std::optional<D3D12_RESOURCE_STATES> Image::DiagnosticState(ID3D12Resource* trac
 
 void Image::DiagnosticTransition(ID3D12Resource* tracked_resource, D3D12_RESOURCE_STATES next) {
     if (!tracked_resource) throw std::runtime_error("null diagnostic resource");
+    untouched = false;
     auto* tracked = tracked_resource == Handle() ? &state : tracked_resource == reinterpreted.Get()
         ? &reinterpreted_state : tracked_resource == slice_array.Get() ? &slice_array_state
         : tracked_resource == volume.Get() ? &volume_state
@@ -69,9 +71,6 @@ using namespace Common::Literals;
 bool TextureCacheRuntime::CanCheckpointImage(
     const Image& image, std::span<const VideoCommon::BufferImageCopy> copies) const {
     constexpr u64 Limit = 8ULL * 1024 * 1024;
-    // A served-down image has no host bytes for its largest levels, and Pulse captures the guest
-    // process (not the renderer's textures), so the fast path must not touch it.
-    if (image.DroppedLevels() != 0) return false;
     if (image.guest_size_bytes > Limit || image.unswizzled_size_bytes > Limit) return false;
     std::vector<Image::GcCopy> plan;
     const u64 size = image.PlanGcDownload(copies, plan);
@@ -124,6 +123,27 @@ void SetAstcGpuDecode(bool enabled) {
     gpu_astc_decode.store(enabled, std::memory_order_relaxed);
 }
 
+void SetBcGpuDecode(bool enabled) {
+    gpu_bc_decode.store(enabled, std::memory_order_relaxed);
+}
+
+void SetAstcDropTopLevel(bool enabled) {
+    astc_drop_top_level.store(enabled, std::memory_order_relaxed);
+}
+
+void SetGpuUnswizzle(bool enabled) {
+    gpu_unswizzle.store(enabled, std::memory_order_relaxed);
+}
+
+void SetHeapCompaction(u64 bytes_per_frame) {
+    heap_compaction_budget.store(bytes_per_frame, std::memory_order_relaxed);
+}
+
+HeapCompactionStats GetHeapCompactionStats() noexcept {
+    return {heap_compaction_moved.load(std::memory_order_relaxed),
+            heap_compaction_bytes.load(std::memory_order_relaxed)};
+}
+
 
 void SetAstcGpuFresh(bool enabled) {
     gpu_astc_fresh.store(enabled, std::memory_order_relaxed);
@@ -133,9 +153,17 @@ void SetTextureMemoryCap(u64 bytes) {
     texture_memory_cap.store(bytes, std::memory_order_relaxed);
 }
 
-void SetTextureDownscale(u32 levels) {
-    TextureDetail::texture_downscale_levels.store((std::min)(levels, 2U),
-                                                  std::memory_order_relaxed);
+void SetTextureMemoryLine(u64 bytes) {
+    texture_memory_line.store(bytes, std::memory_order_relaxed);
+}
+
+void SetTextureYield(bool yield) {
+    texture_yield.store(yield, std::memory_order_relaxed);
+}
+
+void GetTextureMemoryUse(u64& heap_bytes, u64& cap) {
+    heap_bytes = texture_heap_published.load(std::memory_order_relaxed);
+    cap = texture_cap_published.load(std::memory_order_relaxed);
 }
 
 void SetAstcGpuSync(bool enabled) {
@@ -227,6 +255,12 @@ void TextureCacheRuntime::TrimCheckpointTransfers(u64 keep) {
     scheduler.Finish(); // the trimmed buffers are released after the work recorded so far
 }
 bool TextureCacheRuntime::CanAccelerateImageUpload(Image& image) const noexcept {
+    if (image.IsGpuUnswizzled()) {
+        return blit_helper && blit_helper->CanUnswizzle();
+    }
+    if (image.IsGpuBcDecoded()) {
+        return blit_helper && blit_helper->CanDecodeBcn();
+    }
     return image.IsGpuDecoded() && blit_helper && blit_helper->CanDecodeAstc() &&
            (image.TransferFormat().copy_format == PixelFormat::A8B8G8R8_UNORM ||
             blit_helper->CanEncodeBc());
@@ -376,7 +410,7 @@ void TextureCacheRuntime::TickFrame() {
             LOG_INFO(Render, "D3D12: texture memory: pressure {}, over cap {}, cap {} MiB, "
                      "app {}/{} MiB, gpu {}/{} MiB",
                      static_cast<int>(pressure_level), over_texture_cap,
-                     texture_memory_cap.load(std::memory_order_relaxed) / 1_MiB,
+                     texture_cap / 1_MiB,
                      pressure_snapshot.app_used / 1_MiB, pressure_snapshot.app_limit / 1_MiB,
                      pressure_snapshot.gpu_used / 1_MiB, pressure_snapshot.gpu_budget / 1_MiB);
             LOG_INFO(Render, "D3D12: {}", texture_allocator.Census(6));
@@ -395,9 +429,18 @@ void TextureCacheRuntime::TickFrame() {
     // them while a loading screen ran out of memory.
     // Over the texture cap the heaps the GC drained are released too, after they settle, so the
     // cap bounds the heaps and not only the textures living in them.
-    if (const u64 cap = texture_memory_cap.load(std::memory_order_relaxed); cap != 0) {
+    // The cap was sized when the guest left little memory free. Now it is only a floor: in a game
+    // that leaves headroom the textures keep whatever sits above the line, and evict back down
+    // to the floor as the headroom shrinks, before guest swap and the pressure levels act.
+    if (const u64 floor = texture_memory_cap.load(std::memory_order_relaxed); floor != 0) {
         // Every frame: the free ranges of hundreds of heaps are only walked for the log line.
         const u64 heap_bytes = texture_allocator.HeapBytes();
+        const u64 cap = TextureCapForHeadroom(
+            floor, texture_memory_line.load(std::memory_order_relaxed), heap_bytes,
+            pressure_snapshot);
+        texture_cap = cap;
+        texture_heap_published.store(heap_bytes, std::memory_order_relaxed);
+        texture_cap_published.store(cap, std::memory_order_relaxed);
         // 64 MiB below the cap before leaving it, so one heap more or less does not flip it.
         const bool over = over_texture_cap ? heap_bytes + 64_MiB > cap : heap_bytes > cap;
         if (over != over_texture_cap) {
@@ -412,8 +455,10 @@ void TextureCacheRuntime::TickFrame() {
         }
     } else {
         over_texture_cap = false;
+        texture_cap = 0;
     }
-    const bool release_idle = pressure_level >= CachePressure::Critical || over_texture_cap;
+    const bool release_idle = pressure_level >= CachePressure::Critical || over_texture_cap ||
+                              texture_yield.load(std::memory_order_relaxed);
     texture_allocator.TrimEmptyHeaps(
         pressure_level >= CachePressure::Emergency ? TextureResourceAllocator::TrimMode::All
         : release_idle                             ? TextureResourceAllocator::TrimMode::Settled
@@ -445,15 +490,37 @@ std::optional<VideoCommon::TextureGcPolicy> TextureCacheRuntime::GetTextureGcPol
                                     pressure_snapshot.app_limit ? pressure_snapshot.AppFree() : UINT64_MAX,
                                     static_cast<u64>(pressure_level));
     }
+    if (!second_pass) {
+        // At half used or less: 0.3.9.62 stayed over a 512 MiB cap with 750-910 MiB of heaps for
+        // 480-520 MiB live, its free space spread over heaps that each kept a few survivors.
+        sparse_heaps = over_texture_cap ? texture_allocator.SparseHeaps(50) : std::vector<bool>{};
+        has_sparse_heaps = std::find(sparse_heaps.begin(), sparse_heaps.end(), true) !=
+                           sparse_heaps.end();
+    }
     if (!pressure_snapshot.Known()) return std::nullopt;
     // Over the texture cap the clean textures nobody sampled for a while go before the app runs
     // short: they decode again from guest memory when used, and render targets are kept.
     CachePressure level = pressure_level;
+    // Yielding to the guest: below Critical the yield's shorter age applies, over the cap or not.
+    if (level < CachePressure::Critical && texture_yield.load(std::memory_order_relaxed)) {
+        return CachePressureController::YieldPolicy();
+    }
     if (level == CachePressure::Normal && over_texture_cap) {
         level = CachePressure::Pressure;
     }
     return CachePressureController::Policy(level, second_pass,
         CachePressureController::RequiresImmediateRecovery(pressure_snapshot));
+}
+bool TextureCacheRuntime::InSparseHeap(const Image& image) const {
+    if (!image.resource_allocation) return false;
+    const size_t heap = TextureResourceAllocator::HeapOf(*image.resource_allocation);
+    return heap < sparse_heaps.size() && sparse_heaps[heap];
+}
+u64 TextureCacheRuntime::HeapCompactionBudget() const noexcept {
+    return has_sparse_heaps ? heap_compaction_budget.load(std::memory_order_relaxed) : 0;
+}
+bool TextureCacheRuntime::RelocateImage(Image& image) {
+    return InSparseHeap(image) && image.Relocate(sparse_heaps);
 }
 u64 TextureCacheRuntime::GetDeviceLocalMemory() const { return device.CacheMemoryBudget(); }
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
@@ -515,30 +582,56 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_,
     const bool unaligned_native = runtime_.device.SupportsUnalignedBlockTextures();
     const bool unaligned_bc_extent =
         !unaligned_native && (info_.size.width % 4 != 0 || info_.size.height % 4 != 0);
+    // Small BC1-3 textures read the guest's palette (SetSmallBcGuestPalette).
+    const bool guest_palette =
+        GetSmallBcGuestPalette() && IsSmallGuestPaletteBc(info_.format, guest_size_bytes);
     if (!native_blocks && info_.type == ImageType::e2D && info_.num_samples == 1 &&
-        (unaligned_bc_extent || (decode_bc_arrays.load(std::memory_order_relaxed) &&
-                                 info_.resources.layers > 1))) {
+        (unaligned_bc_extent || guest_palette ||
+         (decode_bc_arrays.load(std::memory_order_relaxed) && info_.resources.layers > 1))) {
         if (const std::optional<FormatInfo> decoded = DecodedBcFormat(info_.format)) {
             format = *decoded;
+            // The compute shader writes the texels from the guest blocks on upload; the CPU
+            // decode (ConvertImage on the GPU thread) took up to hundreds of ms on area loads.
+            const BlitImageHelper* const helper = runtime->blit_helper;
+            gpu_bc_decoded = gpu_bc_decode.load(std::memory_order_relaxed) && helper &&
+                             helper->CanDecodeBcn() && CanDecodeBcnOnGpu(info_.format);
+            static std::atomic<u32> gpu_images{};
+            static std::atomic<u32> cpu_images{};
+            const u32 count = (gpu_bc_decoded ? gpu_images : cpu_images)
+                                  .fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 4 || count % 64 == 0) {
+                LOG_INFO(Render, "D3D12: decoded BC {} {}x{} ({} layers) on the {}: {} on the GPU, "
+                         "{} on the CPU", info_.format, info_.size.width, info_.size.height,
+                         info_.resources.layers, gpu_bc_decoded ? "GPU" : "CPU",
+                         gpu_images.load(std::memory_order_relaxed),
+                         cpu_images.load(std::memory_order_relaxed));
+            }
         }
     }
     if (VideoCore::Surface::IsPixelFormatASTC(info_.format)) {
         // Per image: arrays may stay RGBA8 when the rest is recompressed (see
         // VideoCommon::SetAstcArrayRecompression).
-        format = AstcFormat(info_.format, VideoCommon::AstcRecompressionFor(info_));
-        // How much the opaque images re-encoded as BC1 save (VideoCommon::SetOpaqueAstcToBc1).
+        format = AstcFormatFor(info_);
+        // How much the opaque images re-encoded as BC1 and the alpha masks as BC4 save
+        // (VideoCommon::SetOpaqueAstcToBc1).
         static std::atomic<u32> astc_images{};
         static std::atomic<u32> bc1_images{};
-        static std::atomic<u64> bc1_saved_bytes{};
-        if (format.copy_format == PixelFormat::BC1_RGBA_UNORM && info_.astc_opaque) {
-            bc1_images.fetch_add(1, std::memory_order_relaxed);
-            bc1_saved_bytes.fetch_add(converted_size_bytes, std::memory_order_relaxed);
+        static std::atomic<u32> bc4_images{};
+        static std::atomic<u64> half_saved_bytes{};
+        if ((format.copy_format == PixelFormat::BC1_RGBA_UNORM && info_.astc_opaque) ||
+            format.copy_format == PixelFormat::BC4_UNORM) {
+            (format.copy_format == PixelFormat::BC4_UNORM ? bc4_images : bc1_images)
+                .fetch_add(1, std::memory_order_relaxed);
+            half_saved_bytes.fetch_add(converted_size_bytes, std::memory_order_relaxed);
         }
         if (const u32 count = astc_images.fetch_add(1, std::memory_order_relaxed) + 1;
             count <= 4 || count % 64 == 0) {
-            LOG_INFO(Render, "D3D12: {} ASTC images, {} without alpha as BC1 ({} MiB saved)",
+            LOG_INFO(Render,
+                     "D3D12: {} ASTC images, {} without alpha as BC1, {} alpha masks as BC4 "
+                     "({} MiB saved)",
                      count, bc1_images.load(std::memory_order_relaxed),
-                     bc1_saved_bytes.load(std::memory_order_relaxed) >> 20);
+                     bc4_images.load(std::memory_order_relaxed),
+                     half_saved_bytes.load(std::memory_order_relaxed) >> 20);
         }
         // GPU mode decodes RGBA8 images straight into the image. BC1 and BC3 ones, arrays
         // included, go through the bounded scratch texture and the GPU BC encoder, one layer at a
@@ -550,48 +643,34 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_,
                       info_.num_samples == 1 &&
                       (format.copy_format == PixelFormat::A8B8G8R8_UNORM ||
                        ((format.copy_format == PixelFormat::BC3_UNORM ||
-                         format.copy_format == PixelFormat::BC1_RGBA_UNORM) &&
+                         format.copy_format == PixelFormat::BC1_RGBA_UNORM ||
+                         format.copy_format == PixelFormat::BC4_UNORM) &&
                         helper->CanEncodeBc()));
     }
     if (format.converted) {
         flags |= VideoCommon::ImageFlagBits::Converted | VideoCommon::ImageFlagBits::CostlyLoad;
     }
-    if (gpu_decoded) {
+    // Big block-linear color uploads: the CPU copies the guest bytes as they are and a compute
+    // shader unswizzles them. Only where the host keeps the guest's texel blocks unchanged.
+    const BlitImageHelper* const unswizzler = runtime->blit_helper;
+    gpu_unswizzled =
+        !native_blocks && !format.converted && !gpu_decoded &&
+        gpu_unswizzle.load(std::memory_order_relaxed) && unswizzler &&
+        unswizzler->CanUnswizzle() && info_.type == ImageType::e2D && info_.num_samples == 1 &&
+        guest_size_bytes >= GPU_UNSWIZZLE_MIN_BYTES &&
+        VideoCore::Surface::GetFormatType(info_.format) == SurfaceType::ColorTexture &&
+        VideoCore::Surface::BytesPerBlock(format.copy_format) ==
+            VideoCore::Surface::BytesPerBlock(info_.format) &&
+        VideoCore::Surface::DefaultBlockWidth(format.copy_format) ==
+            VideoCore::Surface::DefaultBlockWidth(info_.format) &&
+        VideoCore::Surface::DefaultBlockHeight(format.copy_format) ==
+            VideoCore::Surface::DefaultBlockHeight(info_.format);
+    if (gpu_decoded || gpu_bc_decoded || gpu_unswizzled) {
         flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
     }
     const auto type = VideoCore::Surface::GetFormatType(info_.format);
     const bool is_color = type == SurfaceType::ColorTexture;
     const bool is_msaa = info_.num_samples > 1;
-    // A sampled image may be served a level or two down (texture_scale= in boot.cfg): the host
-    // copy is created at the edge the guest's level `dropped` has, and views and transfers add
-    // the offset back. The guest keeps its full-size copy, so no texel is resampled. Render
-    // targets, depth, MSAA, converted images and single-level chains stay at full size.
-    if (const u32 max_drop =
-            TextureDetail::texture_downscale_levels.load(std::memory_order_relaxed);
-        max_drop != 0 && info_.type == ImageType::e2D && info_.num_samples == 1 && is_color &&
-        !format.converted && !gpu_decoded && info_.resources.levels > 1) {
-        TextureDownscale::Shape shape{};
-        shape.width = info_.size.width;
-        shape.height = info_.size.height;
-        shape.levels = info_.resources.levels;
-        shape.layers = info_.resources.layers;
-        shape.block_width = VideoCore::Surface::DefaultBlockWidth(format.copy_format);
-        shape.block_height = VideoCore::Surface::DefaultBlockHeight(format.copy_format);
-        shape.bytes_per_block = VideoCore::Surface::BytesPerBlock(format.copy_format);
-        const auto plan =
-            TextureDownscale::PlanFor(shape, max_drop, TextureDownscale::ALLOWANCE_BYTES);
-        if (plan.dropped_levels != 0) {
-            dropped_levels = plan.dropped_levels;
-            static std::atomic<u32> logged_downscale{0};
-            if (logged_downscale.fetch_add(1, std::memory_order_relaxed) < 8) {
-                LOG_INFO(Render,
-                         "D3D12: image {} @{:x} served {} level(s) down: {}x{} in {} MiB of {} "
-                         "levels",
-                         info_.format, gpu_addr, dropped_levels, plan.width, plan.height,
-                         plan.bytes >> 20, plan.levels);
-            }
-        }
-    }
     D3D12_RESOURCE_FLAGS resource_flags{};
     if (is_color && info_.type != ImageType::e1D &&
         runtime->SupportsView(format.view, D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
@@ -602,24 +681,37 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_,
         resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     }
     // Multisampled resources cannot have UAVs.
-    // The ASTC decoder writes through an R8G8B8A8_UNORM UAV, sRGB images included.
+    // The ASTC and BCn decoders write through UNORM or SNORM UAVs, sRGB images included.
     const bool decoder_writes_image =
-        gpu_decoded && format.copy_format == PixelFormat::A8B8G8R8_UNORM;
+        (gpu_decoded && format.copy_format == PixelFormat::A8B8G8R8_UNORM) || gpu_bc_decoded;
     if (is_color && !is_msaa &&
         (decoder_writes_image || runtime->SupportsView(format.view, D3D12_FORMAT_SUPPORT1_NONE,
                                               D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))) {
         resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
+    // SetAstcDropTopLevel: big sampled ASTC textures with their own smaller levels, whose
+    // level 1 is still whole blocks.
+    static constexpr u32 DROP_TOP_LEVEL_MIN_SIZE = 1024;
+    if (VideoCore::Surface::IsPixelFormatASTC(info_.format) &&
+        astc_drop_top_level.load(std::memory_order_relaxed) && info_.type == ImageType::e2D &&
+        info_.num_samples == 1 && info_.resources.levels >= 2 &&
+        std::max(info_.size.width, info_.size.height) >= DROP_TOP_LEVEL_MIN_SIZE &&
+        (info_.size.width >> 1) % 4 == 0 && (info_.size.height >> 1) % 4 == 0) {
+        level_bias = 1;
+        static std::atomic<u32> dropped_images{};
+        static std::atomic<u64> dropped_bytes{};
+        const u64 top_bytes = converted_size_bytes -
+                              converted_size_bytes / 4; // ~3/4 of a mip chain is its top
+        const u32 count = dropped_images.fetch_add(1, std::memory_order_relaxed) + 1;
+        const u64 bytes = dropped_bytes.fetch_add(top_bytes, std::memory_order_relaxed) + top_bytes;
+        if (count <= 4 || count % 64 == 0) {
+            LOG_INFO(Render, "D3D12: {} ASTC images without their top level ({} MiB saved)",
+                     count, bytes >> 20);
+        }
+    }
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info_.num_samples);
-    // The level the host copy starts at: the guest's level `dropped_levels` (texture_scale=).
-    const u32 stored_width = dropped_levels != 0
-                                 ? TextureDownscale::MipEdge(info_.size.width, dropped_levels)
-                                 : info_.size.width;
-    const u32 stored_height = dropped_levels != 0
-                                  ? TextureDownscale::MipEdge(info_.size.height, dropped_levels)
-                                  : info_.size.height;
-    u64 width = std::max<u64>(1, stored_width >> samples_x);
-    u32 height = std::max(1U, stored_height >> samples_y);
+    u64 width = std::max<u64>(1, (info_.size.width >> level_bias) >> samples_x);
+    u32 height = std::max(1U, (info_.size.height >> level_bias) >> samples_y);
     // D3D12 requires block-compressed top levels to be whole blocks unless the device supports
     // unaligned ones; the guest's may not be. Converted formats keep the padding their encoders
     // write.
@@ -633,7 +725,7 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_,
         .Dimension = Dimension(info_.type), .Alignment = 0, .Width = width, .Height = height,
         .DepthOrArraySize = static_cast<u16>(info_.type == ImageType::e3D ? info_.size.depth
                                                                           : info_.resources.layers),
-        .MipLevels = static_cast<u16>(info_.resources.levels - dropped_levels),
+        .MipLevels = static_cast<u16>(info_.resources.levels - static_cast<s32>(level_bias)),
         .Format = format.resource,
         .SampleDesc = {.Count = info_.num_samples, .Quality = 0},
         .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN, .Flags = resource_flags,
@@ -641,7 +733,16 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_,
     {
         VideoCore::Perf::ScopedTimer timer{VideoCore::Perf::Counter::ResourceCreateUs,
                                            VideoCore::Perf::Counter::ResourcesCreated};
-        auto allocated = runtime->texture_allocator.Create(desc, D3D12_RESOURCE_STATE_COMMON);
+        // Plain sampled textures may sit where the CPU writes them (SetCpuTextureWrites).
+        const bool plain = resource_flags == D3D12_RESOURCE_FLAG_NONE && !is_msaa &&
+                           !gpu_decoded && !gpu_bc_decoded;
+        auto allocated = runtime->texture_allocator.Create(
+            desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            {.bytes = VideoCore::Surface::BytesPerBlock(format.copy_format),
+             .width = block_w,
+             .height = block_h},
+            plain);
+        cpu_writable = allocated.cpu_writable;
         resource = std::move(allocated.resource);
         resource_allocation = std::move(allocated.allocation);
         needs_placed_init = allocated.placed &&
@@ -702,6 +803,9 @@ void Image::ReleaseResources() {
     if (runtime && reinterpreted) {
         runtime->scheduler.DeferRelease(std::move(reinterpreted));
     }
+    if (runtime && reinterpreted_snapshot) {
+        runtime->scheduler.DeferRelease(std::move(reinterpreted_snapshot));
+    }
     guest_blocks.reset();
     depth_feedback.reset();
 }
@@ -718,7 +822,11 @@ Image& Image::operator=(Image&& other) noexcept {
         resource_allocation = std::move(other.resource_allocation);
         format = other.format;
         gpu_decoded = other.gpu_decoded;
-        dropped_levels = other.dropped_levels;
+        gpu_bc_decoded = other.gpu_bc_decoded;
+        gpu_unswizzled = other.gpu_unswizzled;
+        cpu_writable = other.cpu_writable;
+        untouched = other.untouched;
+        level_bias = other.level_bias;
         footprint_format = other.footprint_format;
         state = other.state;
         needs_placed_init = other.needs_placed_init;
@@ -745,11 +853,71 @@ Image& Image::operator=(Image&& other) noexcept {
         reinterpreted_state = other.reinterpreted_state;
         reinterpreted_version = other.reinterpreted_version;
         reinterpreted_ahead = other.reinterpreted_ahead;
+        reinterpreted_snapshot = std::move(other.reinterpreted_snapshot);
     }
     return *this;
 }
 
-Image* Image::PrepareDepthFeedback() {
+Image::SnapshotCopy Image::PrepareColorSnapshot(bool reinterpreted_view, s32 first_level,
+                                                s32 num_levels) {
+    if (!reinterpreted_view) {
+        const s32 begin = std::clamp(first_level, 0, 63);
+        const s32 end = std::clamp(first_level + std::max(num_levels, 1), begin + 1, 64);
+        const u64 below_end = end >= 64 ? ~u64{} : (u64{1} << end) - 1;
+        const u64 wanted = below_end & ~((u64{1} << begin) - 1);
+        const u64 stale_before = depth_feedback_stale;
+        SnapshotCopy copy;
+        if (!RefreshSnapshot(wanted, &copy)) {
+            return SnapshotCopy::Failed;
+        }
+        if (copy != SnapshotCopy::Reused) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+                LOG_INFO(Render,
+                         "D3D12: color snapshot {} {}x{}x{}, {} levels, {} layers, {} samples; "
+                         "view levels {}+{}; stale {:#x}; {}",
+                         info.format, info.size.width, info.size.height, info.size.depth,
+                         info.resources.levels, info.resources.layers, info.num_samples,
+                         first_level, num_levels, stale_before,
+                         copy == SnapshotCopy::Full ? "full copy" : "level copy");
+            }
+        }
+        // Back to the target state without outdating the snapshot: nothing wrote the image.
+        TransitionTarget(-1, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+        return copy;
+    }
+    // The view's SRV is in the reinterpreted copy's family, which a copy of the image (in the
+    // image's own) does not take: the snapshot is of the copy instead.
+    if (!runtime || !reinterpreted) {
+        return SnapshotCopy::Failed;
+    }
+    constexpr D3D12_RESOURCE_STATES READ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    auto* const commands = runtime->scheduler.CommandList();
+    if (reinterpreted_snapshot) {
+        TransitionBuffer(commands, reinterpreted_snapshot.Get(), READ,
+                         D3D12_RESOURCE_STATE_COPY_DEST);
+    } else {
+        D3D12_RESOURCE_DESC desc = reinterpreted->GetDesc();
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
+        if (FAILED(runtime->device.Get()->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&reinterpreted_snapshot)))) {
+            reinterpreted_snapshot.Reset();
+            return SnapshotCopy::Failed;
+        }
+    }
+    RefreshReinterpreted();
+    TransitionReinterpreted(D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commands->CopyResource(reinterpreted_snapshot.Get(), reinterpreted.Get());
+    TransitionBuffer(commands, reinterpreted_snapshot.Get(), D3D12_RESOURCE_STATE_COPY_DEST, READ);
+    Transition(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    return SnapshotCopy::Full;
+}
+
+Image* Image::RefreshSnapshot(u64 wanted, SnapshotCopy* copy) {
+    *copy = SnapshotCopy::Failed;
     if (depth_feedback_failed || !runtime || !resource) {
         return nullptr;
     }
@@ -760,24 +928,32 @@ Image* Image::PrepareDepthFeedback() {
             depth_feedback_failed = true;
             return nullptr;
         }
-        LOG_INFO(Render, "D3D12: depth feedback snapshot allocated ({} {}x{}, {} samples)",
-                 info.format, info.size.width, info.size.height, info.num_samples);
+        // A new allocation holds nothing of the image yet.
+        depth_feedback_stale = ~u64{};
+    }
+    if (reinterpreted_ahead || needs_placed_init) {
+        // The transition to COPY_SOURCE rewrites the whole image before the copy.
+        depth_feedback_stale = ~u64{};
     }
     // The direct queue orders earlier draws, this copy and the next draw; no CPU fence is needed.
     const s32 levels = info.resources.levels;
     const u64 all_levels = levels >= 64 ? ~u64{} : (u64{1} << levels) - 1;
-    const u64 stale = depth_feedback_stale & all_levels;
+    const u64 stale = depth_feedback_stale & wanted & all_levels;
     if (stale == 0) {
+        *copy = SnapshotCopy::Reused;
         return depth_feedback.get();
     }
     Transition(D3D12_RESOURCE_STATE_COPY_SOURCE);
     depth_feedback->Transition(D3D12_RESOURCE_STATE_COPY_DEST);
     auto* const commands = runtime->scheduler.CommandList();
     if (stale == all_levels || info.num_samples > 1) {
-        // CopyResource preserves every mip, layer and both depth/stencil planes, including MSAA.
+        // CopyResource preserves every mip, layer and both depth/stencil planes, including MSAA,
+        // whose levels copy only as a whole resource.
         commands->CopyResource(depth_feedback->Handle(), Handle());
+        depth_feedback_stale = 0;
+        *copy = SnapshotCopy::Full;
     } else {
-        // A depth pyramid rendered level by level: only the levels drawn since the last
+        // A pyramid rendered level by level: only the wanted levels drawn since the last
         // snapshot, each copied whole as depth-stencil subresources must be.
         const s32 layers = info.type == ImageType::e3D ? 1 : info.resources.layers;
         const u32 planes = IsDepthStencilPlanar() ? 2 : 1;
@@ -799,41 +975,84 @@ Image* Image::PrepareDepthFeedback() {
                 }
             }
         }
+        depth_feedback_stale &= ~stale;
+        *copy = SnapshotCopy::Partial;
     }
     depth_feedback->Transition(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Transition(D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    depth_feedback_stale = 0;
-    ++runtime->depth_feedback_copies;
     return depth_feedback.get();
 }
 
-void Image::TransitionDepthTarget(s32 level, D3D12_RESOURCE_STATES next, BarrierBatch* batch) {
+Image* Image::TakeSnapshot() {
+    SnapshotCopy copy;
+    return RefreshSnapshot(~u64{}, &copy);
+}
+
+Image* Image::PrepareDepthFeedback() {
+    const bool allocated = depth_feedback != nullptr;
+    SnapshotCopy copy;
+    Image* const snapshot = RefreshSnapshot(~u64{}, &copy);
+    if (!snapshot) {
+        return nullptr;
+    }
+    if (!allocated) {
+        LOG_INFO(Render, "D3D12: depth feedback snapshot allocated ({} {}x{}, {} samples)",
+                 info.format, info.size.width, info.size.height, info.num_samples);
+    }
+    if (copy == SnapshotCopy::Reused) {
+        return snapshot;
+    }
+    TransitionTarget(-1, D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr);
+    ++runtime->depth_feedback_copies;
+    VideoCore::Perf::Add(VideoCore::Perf::Counter::DepthFeedbackCopies, 1);
+    return snapshot;
+}
+
+void Image::TransitionTarget(s32 level, D3D12_RESOURCE_STATES next, BarrierBatch* batch) {
     const u64 stale = depth_feedback_stale;
+    // Writing back the reinterpreted copy or initializing a placed resource rewrites every level.
+    const bool rewrites = reinterpreted_ahead || needs_placed_init;
     Transition(next, batch);
-    if ((next & D3D12_RESOURCE_STATE_DEPTH_WRITE) != 0 && level >= 0 && level < 64) {
+    if (rewrites) {
+        return;
+    }
+    constexpr D3D12_RESOURCE_STATES TARGET_WRITES =
+        D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    if ((next & TARGET_WRITES) == 0 || level == -1) {
+        // level -1: the caller only returns the image to its target state after a snapshot;
+        // the draw's own transition marks the level it writes.
+        depth_feedback_stale = stale;
+    } else if (level >= 0 && level < 64) {
         depth_feedback_stale = stale | (u64{1} << level);
     }
 }
 
+void Image::TransitionDepthTarget(s32 level, D3D12_RESOURCE_STATES next, BarrierBatch* batch) {
+    TransitionTarget(level, next, batch);
+}
+
+void Image::TransitionColorTarget(s32 level, BarrierBatch* batch) {
+    TransitionTarget(level, D3D12_RESOURCE_STATE_RENDER_TARGET, batch);
+}
+
 u32 Image::Subresource(s32 level, s32 layer, u32 plane) const noexcept {
-    // Guest level -> host level: the host copy starts `dropped_levels` levels down. Clamped so a
-    // stale caller can never address past the resource (views do the same before binding).
-    const u32 host_levels = static_cast<u32>(info.resources.levels) - dropped_levels;
-    const u32 host_level =
-        (std::min)(static_cast<u32>(level) + dropped_levels, host_levels - 1);
+    // Callers skip the levels a level bias leaves out; clamp in case one does not.
+    const u32 levels = static_cast<u32>(info.resources.levels) - level_bias;
     const u32 layers = info.type == ImageType::e3D ? 1U : static_cast<u32>(info.resources.layers);
-    return host_level + static_cast<u32>(layer) * host_levels + plane * host_levels * layers;
+    const u32 resource_level =
+        static_cast<u32>(std::max<s32>(0, level - static_cast<s32>(level_bias)));
+    return resource_level + static_cast<u32>(layer) * levels + plane * levels * layers;
 }
 
 void Image::Transition(D3D12_RESOURCE_STATES next, BarrierBatch* batch) {
     if (!resource) return;
+    untouched = false;
     constexpr D3D12_RESOURCE_STATES WRITE_STATES =
         D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
         D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_COPY_DEST |
         D3D12_RESOURCE_STATE_RESOLVE_DEST;
     if ((next & WRITE_STATES) != 0 || reinterpreted_ahead || needs_placed_init) {
-        // Any write but a depth target's (TransitionDepthTarget) outdates the whole snapshot.
+        // Any write but a target's (TransitionTarget) outdates the whole snapshot.
         depth_feedback_stale = ~u64{};
     }
     if (reinterpreted_ahead || needs_placed_init) {
@@ -951,6 +1170,48 @@ void Image::InitializePlacedResource() {
     commands->DiscardResource(resource.Get());
     state = target;
     ++write_version;
+}
+
+size_t Image::HeapIndex() const noexcept {
+    return resource_allocation ? TextureResourceAllocator::HeapOf(*resource_allocation) : SIZE_MAX;
+}
+
+bool Image::Relocate(const std::vector<bool>& avoid) {
+    // A pending GC readback copies out of the current resource.
+    if (!resource || !resource_allocation || gc_readback) return false;
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    auto moved = runtime->texture_allocator.CreateInUsedHeaps(
+        desc, D3D12_RESOURCE_STATE_COPY_DEST, cpu_writable, avoid);
+    if (!moved.resource) return false;
+    // Also writes back a reinterpreted copy drawn to and initializes a target never drawn.
+    Transition(D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto* const commands = runtime->scheduler.CommandList();
+    // The range may have held another resource; copying the whole resource initializes a placed
+    // render target or depth stencil, every mip, layer, plane and sample.
+    const D3D12_RESOURCE_BARRIER alias{
+        .Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+        .Aliasing = {.pResourceBefore = nullptr, .pResourceAfter = moved.resource.Get()}};
+    commands->ResourceBarrier(1, &alias);
+    commands->CopyResource(moved.resource.Get(), resource.Get());
+    const u64 bytes = runtime->device.Get()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    runtime->texture_allocator.DeferRelease(
+        {std::move(resource), std::move(resource_allocation), true});
+    resource = std::move(moved.resource);
+    resource_allocation = std::move(moved.allocation);
+    cpu_writable = moved.cpu_writable;
+    untouched = false;
+    needs_placed_init = false;
+    state = D3D12_RESOURCE_STATE_COPY_DEST;
+    uav_work = 0;
+    left_uav_in_work = 0;
+    ++write_version;
+    const u64 count = heap_compaction_moved.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 total = heap_compaction_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    if (count == 1 || count % 256 == 0) {
+        LOG_INFO(Render, "D3D12: {} textures moved out of sparse heaps ({} MiB)", count,
+                 total / 1_MiB);
+    }
+    return true;
 }
 
 ID3D12Resource* Image::SliceArray() {

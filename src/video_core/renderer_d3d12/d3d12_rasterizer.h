@@ -24,6 +24,7 @@
 #include "video_core/renderer_d3d12/d3d12_conditional_rendering.h"
 #include "video_core/renderer_d3d12/d3d12_query_cache.h"
 #include "video_core/renderer_d3d12/d3d12_stream_output.h"
+#include "video_core/renderer_d3d12/d3d12_tess_emulation.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
 #include "video_core/renderer_d3d12/diagnostics/d3d12_draw_hunt.h"
 #include "video_core/renderer_d3d12/diagnostics/d3d12_material_trace.h"
@@ -37,6 +38,8 @@ struct FramebufferConfig;
 namespace D3D12 {
 
 void SetMaterialGpuProbeEnabled(bool enabled);
+/// Draws recorded before the command list is submitted (512 by default), for A/B tests.
+void SetSubmitDraws(u32 draws);
 
 class AccelerateDMA final : public Tegra::Engines::AccelerateDMAInterface {
 public:
@@ -92,6 +95,8 @@ public:
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(PAddr, u64) override;
     bool OnCPUWrite(PAddr, u64) override;
+    /// GPU thread, before a cache is used: applies the guest writes cpu_write_defer queued.
+    void DrainCpuWrites();
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr, u64) override;
     void ModifyGPUMemory(size_t, GPUVAddr, u64) override;
@@ -125,8 +130,6 @@ public:
     void InitializeChannel(Tegra::Control::ChannelState&) override;
     void BindChannel(Tegra::Control::ChannelState&) override;
     void ReleaseChannel(s32) override;
-
-    [[nodiscard]] bool AnyCommandQueued() const noexcept { return true; }
 
     /// A guest image the display can sample directly (see RendererD3D12::Composite).
     struct DisplayTexture {
@@ -208,9 +211,42 @@ private:
     // d3d12_rasterizer_clear.cpp and diagnostics/d3d12_draw_trace.cpp (SetDrawTrace).
 
     /// Records changed state and then the draw. Command-list state is invalidated on every reset.
-    void RecordDraw(const GraphicsPipeline& pipeline, const PipelineBindings& bindings,
+    /// Draw, with the texture handle of pipelines that take it per primitive once it is known.
+    void DrawRun(bool is_indexed, u32 instance_count, std::optional<u32> vertex_texture_handle);
+    /// Splits a draw of such a pipeline into runs of primitives with one handle, in guest order,
+    /// reading the handles from the vertex buffer.
+    void DrawVertexTextureRuns(const GraphicsPipeline& pipeline, bool is_indexed,
+                               u32 instance_count);
+    void RecordDraw(GraphicsPipeline& pipeline, const PipelineBindings& bindings,
                     const Framebuffer& framebuffer, const DrawParams& params,
                     Maxwell::PrimitiveTopology topology);
+    /// Records a bound draw. D3D12 has one stencil reference and one pair of masks, so when the
+    /// guest gives each face its own, the faces are drawn apart, each with a pipeline that culls
+    /// the other.
+    template <typename Draw>
+    void DrawStencilFaces(GraphicsPipeline& pipeline, Maxwell::PrimitiveTopology topology,
+                          Draw&& draw) {
+        const auto& regs = maxwell3d->regs;
+        if (regs.stencil_enable == 0 || regs.stencil_two_side_enable == 0 ||
+            (regs.stencil_front_ref == regs.stencil_back_ref &&
+             static_cast<u8>(regs.stencil_front_func_mask) ==
+                 static_cast<u8>(regs.stencil_back_func_mask) &&
+             static_cast<u8>(regs.stencil_front_mask) == static_cast<u8>(regs.stencil_back_mask))) {
+            draw();
+            return;
+        }
+        if (BeginStencilFaces(pipeline, topology)) {
+            draw();
+            NextStencilFace(pipeline);
+        }
+        draw();
+    }
+    /// Prepares the first draw of DrawStencilFaces; false if that draw is the only one.
+    [[nodiscard]] bool BeginStencilFaces(GraphicsPipeline& pipeline,
+                                         Maxwell::PrimitiveTopology topology);
+    void NextStencilFace(GraphicsPipeline& pipeline);
+    /// The pipeline drawing only back faces, with the guest's back-face stencil masks.
+    [[nodiscard]] ID3D12PipelineState* BackFaces(GraphicsPipeline& pipeline);
     /// RecordDraw without the draw (ExecuteIndirect replaces it).
     void BindDrawState(const GraphicsPipeline& pipeline, const PipelineBindings& bindings,
                        const Framebuffer& framebuffer, const DrawParams& params,
@@ -225,7 +261,24 @@ private:
     /// differ from the ones the command list holds for the bound root signature.
     void SetGraphicsRootArguments(CommandStream* cmd, const GraphicsPipeline& pipeline,
                                   const PipelineBindings& bindings, const DrawParams& params);
+    /// The stage constants of a draw (the tess levels, or the line width and viewport size),
+    /// with the mirrored border masks.
+    [[nodiscard]] std::array<f32, STAGE_CONSTANT_WORDS> StageConstants(
+        const GraphicsPipeline& pipeline, const PipelineBindings& bindings) const;
+    /// A draw of a pipeline that emulates tessellation (TessEmulation), on the state
+    /// BindDrawState bound.
+    /// Capture slots of an instance of the current indexed draw: its largest index plus one.
+    [[nodiscard]] u32 TessIndexSlots() const;
+    void RecordTessellatedDraw(GraphicsPipeline& pipeline, const PipelineBindings& bindings,
+                               const DrawParams& params);
+    /// The guest root arguments of the draw, as compute ones, for its control shader.
+    void SetTessControlRootArguments(CommandStream* cmd, const GraphicsPipeline& pipeline,
+                                     const PipelineBindings& bindings);
     void ApplyPendingStateInvalidation();
+    /// A configured draw whose pipeline is still building: whether it waited for it (true, the
+    /// pipeline is ready) or is skipped (async_pipelines). UINT32_MAX vertices when unknown.
+    [[nodiscard]] bool WaitPendingPipeline(GraphicsPipeline* pipeline, u32 vertices, u32 instances,
+                                           bool indexed);
     /// Indirect draws of topologies rewritten on the CPU: reads the arguments and draws directly.
     void DrawIndirectOnCpu(const IndirectParams& params);
     [[nodiscard]] ViewportState ComputeViewports(
@@ -276,6 +329,7 @@ private:
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
+    const Device& device;
     Scheduler& scheduler;
     StagingBufferPool& staging;
     BufferCacheRuntime& buffer_runtime;
@@ -285,6 +339,7 @@ private:
     BlitImageHelper& blit_helper;
     IndirectArgumentRing indirect_args;
     StreamOutput stream_output;
+    TessEmulation tess_emulation;
     std::vector<u32> indirect_words; ///< CPU part of the ExecuteIndirect records
     GuestDescriptorQueue descriptor_queue;
     BufferCache buffer_cache;
@@ -319,8 +374,10 @@ private:
     } command_state;
     bool channel_bound{};
     bool state_invalidation_pending{};
-    // QueryCache owns the scheduler callback lifetime and clears every submission callback in its
-    // destructor. Keep it after the state captured by our reset callback, so it is destroyed first.
+    // The query runtime owns the scheduler callback lifetime and clears every submission callback
+    // in its destructor. Keep it after the state captured by our reset callback, so it is destroyed
+    // first, and before the cache built on it, which it outlives.
+    QueryCacheRuntime query_runtime;
     QueryCache query_cache;
     ConditionalRendering conditional_rendering;
     AccelerateDMA accelerate_dma;
@@ -339,10 +396,17 @@ private:
     bool logged_byte_count_draw{};
     /// Draws, clears and dispatches since the last FlushCommands submission.
     u32 draw_counter{};
+    /// cpu_write_defer: queued writes into memory that became GPU-modified meanwhile, invalidated
+    /// at the next InvalidateGPUCache as OnCPUWrite's deferred writes are.
+    std::vector<std::pair<DAddr, u64>> cpu_writes_after_gpu;
+    std::vector<std::pair<DAddr, u64>> cpu_writes_drained;
+    /// pso_loading: VideoCore::Perf Draws at the last composite.
+    u64 composite_draws{};
+    LoadingDetector loading_detector;
     /// Diagnostic: what the draws between a ZPass counter reset and its report did.
     struct ZPassDiag {
         u32 attempted{}, recorded{}, conditional{}, culled{}, no_pipeline{}, rejected{},
-            skipped_shader{}, empty{};
+            skipped_shader{}, empty{}, pending{};
         std::array<u64, 4> vs{}, ps{};
         std::array<u32, 4> depth_test{};
     } zpass_diag;

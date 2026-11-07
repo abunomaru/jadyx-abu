@@ -6,7 +6,10 @@
 
 #include <optional>
 
+#include "common/logging.h"
+#include "video_core/frame_pipeline.h"
 #include "video_core/frame_trace.h"
+#include "video_core/perf_counters.h"
 
 #include <boost/container/small_vector.hpp>
 
@@ -82,6 +85,9 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
     // Determine the number of vsync periods to wait before composing again.
     std::optional<s32> swap_interval{};
     bool has_acquired_buffer{};
+    // A new frame of the game, not only of the overlay (frame generation leaves the latter out).
+    bool game_acquired{};
+    s64 game_queue_time{};
 
     // Acquire all necessary framebuffers.
     for (auto& layer : display.stack.layers) {
@@ -92,9 +98,7 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
             auto fb_it = m_framebuffers.find(consumer_id);
             if (fb_it != m_framebuffers.end() && fb_it->second.is_acquired) {
                 const u64 frames_since_last_acquire = m_frame_number - fb_it->second.last_acquire_frame;
-                const s32 expected_interval = NormalizeSwapInterval(nullptr, fb_it->second.item.swap_interval);
-
-                if (frames_since_last_acquire < static_cast<u64>(expected_interval)) {
+                if (frames_since_last_acquire < static_cast<u64>(fb_it->second.pacing_interval)) {
                     should_try_acquire = false;
                 }
             }
@@ -112,13 +116,18 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
             continue;
         }
 
+        const auto& buffer = m_framebuffers[consumer_id];
+        const auto& item = buffer.item;
+
         // If we acquired a new buffer, we need to present.
         if (result == CacheStatus::BufferAcquired) {
             has_acquired_buffer = true;
+            if (!layer->is_overlay) {
+                game_acquired = true;
+                game_queue_time = (std::max)(game_queue_time, item.queue_time_ns);
+            }
         }
 
-        const auto& buffer = m_framebuffers[consumer_id];
-        const auto& item = buffer.item;
         const auto& igbp_buffer = *item.graphic_buffer;
 
         if (layer->visible) {
@@ -135,6 +144,7 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
                 .crop_rect = item.crop,
                 .acquire_fence = item.fence,
                 .layer_stack_mask = layer->layer_stack_mask,
+                .vsync_index = m_frame_number,
             });
             composed_consumers.push_back(consumer_id);
         }
@@ -161,6 +171,10 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
 
     // If any new buffers were acquired, we can present.
     if (has_acquired_buffer && !composition_stack.empty()) {
+        for (HwcLayer& composed : composition_stack) {
+            composed.new_frame = game_acquired;
+            composed.queue_time_ns = game_queue_time;
+        }
         // Sort back-to-front: lower z first, higher z last so top-most draws last (on top).
         std::stable_sort(composition_stack.begin(), composition_stack.end(),
                          [&](const HwcLayer& l, const HwcLayer& r) { return l.z_index < r.z_index; });
@@ -170,6 +184,12 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
         for (const ConsumerId consumer_id : composed_consumers) {
             m_framebuffers[consumer_id].release_fence = release_fence;
         }
+    }
+
+    if (game_acquired) {
+        TrackFrameChainLocked(swap_interval);
+    } else {
+        TrackFrameChainLocked(std::nullopt);
     }
 
     // Advance by 1 frame (60 FPS compositing)
@@ -213,6 +233,38 @@ void HardwareComposer::ReleaseFramebuffersLocked(Display& display) {
     }
 }
 
+void HardwareComposer::TrackFrameChainLocked(std::optional<s32> game_swap_interval) {
+    using VideoCore::Perf::Counter;
+    static constexpr std::array<Counter, HISTORY_COUNTERS> COUNTERS{
+        Counter::VsyncsLost,          Counter::VsyncComposeWaitUs, Counter::CompositesLate,
+        Counter::PresentFreeWaitUs,   Counter::PresentRenderWaitUs, Counter::PresentCopyWaitUs,
+        Counter::PipelineStallUs,     Counter::GuestDequeueWaitUs, Counter::VsyncComposeWaitsCut,
+    };
+    std::array<u64, HISTORY_COUNTERS> now;
+    for (size_t i = 0; i < HISTORY_COUNTERS; ++i) {
+        now[i] = VideoCore::Perf::ReadCounter(COUNTERS[i]);
+    }
+    // The oldest entry: the counters HISTORY_VSYNCS vsyncs ago (zeros early on).
+    auto& slot = m_history[m_frame_number % HISTORY_VSYNCS];
+    if (game_swap_interval && m_game_swap_interval != 0 &&
+        *game_swap_interval != m_game_swap_interval) {
+        VideoCore::Perf::Add(Counter::GuestSwapIntervalChanges, 1);
+        const auto delta = [&](size_t i) { return now[i] - slot[i]; };
+        const auto ms = [&](size_t i) { return static_cast<double>(delta(i)) / 1000.0; };
+        LOG_INFO(Service_Nvnflinger,
+                 "frame chain: the game's swap interval went {} -> {} at vsync {}; the last {} "
+                 "vsyncs: {} lost, waited {:.1f} ms for the GPU thread ({} waits cut), {} late "
+                 "composites, present frame waits free {:.1f} / render {:.1f} / copy {:.1f} ms, "
+                 "pipeline stalls {:.1f} ms, game waited {:.1f} ms for a framebuffer",
+                 m_game_swap_interval, *game_swap_interval, m_frame_number, HISTORY_VSYNCS,
+                 delta(0), ms(1), delta(8), delta(2), ms(3), ms(4), ms(5), ms(6), ms(7));
+    }
+    if (game_swap_interval) {
+        m_game_swap_interval = *game_swap_interval;
+    }
+    slot = now;
+}
+
 void HardwareComposer::RemoveLayerLocked(Display& display, ConsumerId consumer_id) {
     // Check if we are tracking a slot with this consumer_id.
     const auto it = m_framebuffers.find(consumer_id);
@@ -238,7 +290,10 @@ bool HardwareComposer::TryAcquireFramebufferLocked(Layer& layer, Framebuffer& fr
     }
 
     // We succeeded, so set the new release frame info.
-    const s32 swap_interval = layer.is_overlay ? 1 : NormalizeSwapInterval(nullptr, framebuffer.item.swap_interval);
+    const s32 swap_interval = layer.is_overlay
+        ? 1
+        : GamePacingIntervalLocked(NormalizeSwapInterval(nullptr, framebuffer.item.swap_interval));
+    framebuffer.pacing_interval = swap_interval;
     framebuffer.release_frame_number = m_frame_number + swap_interval;
     framebuffer.last_acquire_frame = m_frame_number;
     framebuffer.is_acquired = true;
@@ -249,6 +304,24 @@ bool HardwareComposer::TryAcquireFramebufferLocked(Layer& layer, Framebuffer& fr
         static_cast<u32>(swap_interval));
 
     return true;
+}
+
+s32 HardwareComposer::GamePacingIntervalLocked(s32 requested) {
+    using VideoCore::FramePipeline::Mode;
+    static constexpr u64 HOLD_VSYNCS = 120;
+    const Mode mode = VideoCore::FramePipeline::SwapIntervalHold();
+    if (mode == Mode::Off) {
+        return requested;
+    }
+    if (requested == 2) {
+        m_last_interval_2_frame = m_frame_number;
+    }
+    if (requested != 3 || !m_last_interval_2_frame ||
+        m_frame_number - *m_last_interval_2_frame > HOLD_VSYNCS) {
+        return requested;
+    }
+    VideoCore::Perf::Add(VideoCore::Perf::Counter::GuestSwapIntervalsHeld, 1);
+    return mode == Mode::On ? 2 : requested;
 }
 
 HardwareComposer::CacheStatus HardwareComposer::CacheFramebufferLocked(Layer& layer,

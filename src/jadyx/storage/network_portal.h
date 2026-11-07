@@ -57,7 +57,7 @@ struct PortalStatus {
     unsigned short port{}; ///< Listening port, or the first one tried when the start failed.
     int os_error{};        ///< WSA code behind a failed bind, 0 when there was none.
     UploadSnapshot transfer;
-    UploadSnapshot content; ///< Update/DLC package; its tag is "<kind>:<application hex>".
+    UploadSnapshot content; ///< Update/DLC package or save archive; its tag is "<kind>:<application hex>".
     SystemUploadStatus system;
     PortalRemoval removal;
 };
@@ -84,10 +84,13 @@ struct PortalLibrary {
     std::function<std::optional<std::string>(std::uint64_t)> cover;          ///< JPEG bytes
     std::function<std::vector<PortalContent>(std::uint64_t)> contents;
     std::function<std::pair<std::uint64_t, std::uint64_t>()> progress;      ///< installed MiB, total MiB
+    /// Zips the game's save into the string; returns an error word ("no_save" when there is none).
+    std::function<std::string(std::uint64_t, std::string&)> save_export;
 };
 
 /// Installs an update/DLC upload; `tag` is the validated "<kind>:<application hex>".
 using ContentValidator = std::function<std::string(const std::filesystem::path&, const std::string& tag, std::stop_token)>;
+using GameValidator = std::function<std::string(const std::filesystem::path&, const std::string& name, std::stop_token)>;
 /// Carries out the pending removal; returns an error word, empty on success.
 using RemovalRunner = std::function<std::string(const PortalRemoval&)>;
 
@@ -115,7 +118,7 @@ public:
     // Configure the library view before Start; without it the library routes answer 503.
     void SetLibrary(PortalLibrary library);
     bool BlockForLocalOperation();
-    std::string FinalizeGame(const NspValidator& validate);
+    std::string FinalizeGame(const GameValidator& validate);
     /// Only the library coordinator calls this, after its metadata worker has joined.
     std::string FinalizeContent(const ContentValidator& validate);
     /// Runs the pending removal, if any. Only the library coordinator calls this, from its

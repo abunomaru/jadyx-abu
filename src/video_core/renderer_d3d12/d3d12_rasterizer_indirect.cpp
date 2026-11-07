@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 
+#include "common/bug_tracker.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "video_core/gpu.h"
@@ -19,6 +20,7 @@
 namespace D3D12 {
 
 void RasterizerD3D12::DrawIndirect() {
+    DrainCpuWrites();
     const bool full = VideoCommon::FullCapture::Active();
     if (full) {
         ++full_capture_operation;
@@ -50,7 +52,10 @@ void RasterizerD3D12::DrawIndirect() {
         DrawByteCount(params);
         return;
     }
-    if (BufferCacheRuntime::IsEmulatedTopology(maxwell3d->draw_manager.draw_state.topology)) {
+    // Patches tessellate through TessEmulation, which sizes its work from the draw's counts.
+    const auto indirect_topology = maxwell3d->draw_manager.draw_state.topology;
+    if (BufferCacheRuntime::IsEmulatedTopology(indirect_topology) ||
+        indirect_topology == Maxwell::PrimitiveTopology::Patches) {
         hunt.Outcome(Hunt::Outcome::Expanded);
         hunt.Geometry(static_cast<u32>(params.max_draw_counts), 0,
                       static_cast<u32>(maxwell3d->draw_manager.draw_state.topology),
@@ -73,13 +78,20 @@ void RasterizerD3D12::DrawIndirect() {
 
     scheduler.BeginWork();
     hunt.PipelineStart();
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    GraphicsPipeline* pipeline = pipeline_cache.CurrentGraphicsPipeline();
     hunt.PipelineEnd();
     if (!pipeline) {
         hunt.Outcome(Hunt::Outcome::NoPipeline);
         return;
     }
     hunt.Shaders(pipeline->Key().unique_hashes[1], pipeline->Key().unique_hashes[5]);
+    if (pipeline->GetVertexTextureHandle()) [[unlikely]] {
+        // The primitives of an indirect draw are unknown here, so neither are their textures.
+        BUG_TRACK_KEY(DrawSkipped, reinterpret_cast<std::uintptr_t>(pipeline),
+                      "indirect draw skipped: per-primitive texture handle (PS {:016x})",
+                      pipeline->Key().unique_hashes[5]);
+        return;
+    }
     const DrawMetrics::CacheLockTimer lock_timer;
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     lock_timer.Locked();
@@ -97,13 +109,35 @@ void RasterizerD3D12::DrawIndirect() {
     }
     SCOPE_EXIT { buffer_runtime.SetTraceBuffers(nullptr); };
     buffer_cache.SetDrawIndirect(&params);
+    // The draw counts live in GPU memory, so its indices cannot be rewritten here.
+    buffer_runtime.SetIndexRestart(std::nullopt);
     pipeline->Configure(params.is_indexed,
                         {*maxwell3d, *gpu_memory, buffer_cache, texture_cache, descriptor_queue,
                          sampler_heap, scheduler},
                         bindings);
+    if (bindings.unemulated_reduction_stages != 0 || bindings.unemulated_mirror_border)
+        [[unlikely]] {
+        if (bindings.unemulated_reduction_stages != 0) {
+            pipeline_cache.EmulateReduction(pipeline->Key(), bindings.unemulated_reduction_stages);
+        }
+        if (bindings.unemulated_mirror_border) {
+            pipeline_cache.EmulateMirrorBorder(pipeline->Key());
+        }
+        // This draw too: only the bindings seen just now tell that it needs the other pipeline.
+        if (GraphicsPipeline* const emulating = pipeline_cache.CurrentGraphicsPipeline();
+            emulating && emulating != pipeline) {
+            pipeline = emulating;
+            pipeline->Configure(false,
+                                {*maxwell3d, *gpu_memory, buffer_cache, texture_cache,
+                                 descriptor_queue, sampler_heap, scheduler},
+                                bindings);
+        }
+    }
     buffer_cache.SetDrawIndirect(nullptr);
-    if (bindings.unemulated_reduction_stages != 0) [[unlikely]] {
-        pipeline_cache.EmulateReduction(pipeline->Key(), bindings.unemulated_reduction_stages);
+    if (!pipeline->IsBuilt() && !WaitPendingPipeline(pipeline, UINT32_MAX, UINT32_MAX,
+                                                     params.is_indexed)) [[unlikely]] {
+        hunt.Outcome(Hunt::Outcome::NoPipeline);
+        return;
     }
     if (!pipeline->Handle()) {
         hunt.Outcome(Hunt::Outcome::PsoRejected);
@@ -121,7 +155,8 @@ void RasterizerD3D12::DrawIndirect() {
         return;
     }
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
-    framebuffer->PrepareAttachments(scheduler, bindings.depth_sampled);
+    framebuffer->PrepareAttachments(scheduler, bindings.depth_sampled,
+                                    pipeline->BoundColorTargets());
     // The GPU time includes the argument copies below: two per draw.
     hunt.Target(framebuffer);
     hunt.Geometry(static_cast<u32>(params.max_draw_counts), 0,
@@ -200,10 +235,13 @@ void RasterizerD3D12::DrawIndirect() {
     BindDrawState(*pipeline, bindings, *framebuffer, draw_params,
                   maxwell3d->draw_manager.draw_state.topology, compatible);
     {
+        query_runtime.PrepareDraw(maxwell3d->regs.zpass_pixel_count_enable);
         const ConditionalRendering::Scope predicate{conditional_rendering, cmd};
-        cmd->ExecuteIndirect(signature, draw_count, range.buffer, range.offset,
-                             params.include_count ? range.buffer : nullptr,
-                             params.include_count ? count_offset : 0);
+        DrawStencilFaces(*pipeline, maxwell3d->draw_manager.draw_state.topology, [&] {
+            cmd->ExecuteIndirect(signature, draw_count, range.buffer, range.offset,
+                                 params.include_count ? range.buffer : nullptr,
+                                 params.include_count ? count_offset : 0);
+        });
     }
     texture_runtime.FinishCompatibleDrawTargets(*framebuffer);
     hunt.Recorded();
@@ -226,8 +264,8 @@ void RasterizerD3D12::DrawIndirectOnCpu(const IndirectParams& params) {
     // The topologies D3D12 lacks are rebuilt from guest memory on the CPU, so these draws read
     // their arguments there too. ReadBlock flushes what the GPU wrote first, which can stall.
     if (!logged_cpu_indirect_draw) {
-        LOG_INFO(Render, "D3D12: indirect draws of emulated topologies read their arguments on "
-                         "the CPU");
+        LOG_INFO(Render, "D3D12: indirect draws of emulated topologies or patches read their "
+                         "arguments on the CPU");
         logged_cpu_indirect_draw = true;
     }
     const u32 guest_words = params.is_indexed ? 5 : 4;
@@ -269,8 +307,10 @@ void RasterizerD3D12::DrawByteCount(const IndirectParams& params) {
     // DrawAuto: byte_count / stride vertices from vertex 0, one instance. The byte count is a
     // StreamingByteCount report the guest points at (QueryByteCount writes it on the GPU).
     auto& draw_state = maxwell3d->draw_manager.draw_state;
-    if (BufferCacheRuntime::IsEmulatedTopology(draw_state.topology)) {
-        // Rebuilt on the CPU, so the count is read there; ReadBlock waits for the GPU's value.
+    if (BufferCacheRuntime::IsEmulatedTopology(draw_state.topology) ||
+        draw_state.topology == Maxwell::PrimitiveTopology::Patches) {
+        // Rebuilt on the CPU (or tessellated through TessEmulation), so the count is read there;
+        // ReadBlock waits for the GPU's value.
         u32 byte_count = 0;
         gpu_memory->ReadBlock(params.indirect_start_address, &byte_count, sizeof(byte_count));
         const auto saved_vertex_buffer = draw_state.vertex_buffer;
@@ -293,8 +333,15 @@ void RasterizerD3D12::DrawByteCount(const IndirectParams& params) {
     gpu_memory->FlushCaching();
     ApplyPendingStateInvalidation();
     scheduler.BeginWork();
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    GraphicsPipeline* pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (!pipeline) {
+        return;
+    }
+    if (pipeline->GetVertexTextureHandle()) [[unlikely]] {
+        // The primitives of an indirect draw are unknown here, so neither are their textures.
+        BUG_TRACK_KEY(DrawSkipped, reinterpret_cast<std::uintptr_t>(pipeline),
+                      "indirect draw skipped: per-primitive texture handle (PS {:016x})",
+                      pipeline->Key().unique_hashes[5]);
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
@@ -305,9 +352,28 @@ void RasterizerD3D12::DrawByteCount(const IndirectParams& params) {
                         {*maxwell3d, *gpu_memory, buffer_cache, texture_cache, descriptor_queue,
                          sampler_heap, scheduler},
                         bindings);
+    if (bindings.unemulated_reduction_stages != 0 || bindings.unemulated_mirror_border)
+        [[unlikely]] {
+        if (bindings.unemulated_reduction_stages != 0) {
+            pipeline_cache.EmulateReduction(pipeline->Key(), bindings.unemulated_reduction_stages);
+        }
+        if (bindings.unemulated_mirror_border) {
+            pipeline_cache.EmulateMirrorBorder(pipeline->Key());
+        }
+        // This draw too: only the bindings seen just now tell that it needs the other pipeline.
+        if (GraphicsPipeline* const emulating = pipeline_cache.CurrentGraphicsPipeline();
+            emulating && emulating != pipeline) {
+            pipeline = emulating;
+            pipeline->Configure(false,
+                                {*maxwell3d, *gpu_memory, buffer_cache, texture_cache,
+                                 descriptor_queue, sampler_heap, scheduler},
+                                bindings);
+        }
+    }
     buffer_cache.SetDrawIndirect(nullptr);
-    if (bindings.unemulated_reduction_stages != 0) [[unlikely]] {
-        pipeline_cache.EmulateReduction(pipeline->Key(), bindings.unemulated_reduction_stages);
+    if (!pipeline->IsBuilt() && !WaitPendingPipeline(pipeline, UINT32_MAX, UINT32_MAX, false))
+        [[unlikely]] {
+        return;
     }
     if (!pipeline->Handle() || UsesSkippedShader(pipeline->Key().unique_hashes)) {
         return;
@@ -319,7 +385,8 @@ void RasterizerD3D12::DrawByteCount(const IndirectParams& params) {
         return;
     }
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
-    framebuffer->PrepareAttachments(scheduler, bindings.depth_sampled);
+    framebuffer->PrepareAttachments(scheduler, bindings.depth_sampled,
+                                    pipeline->BoundColorTargets());
 
     std::array<D3D12_VIEWPORT, Maxwell::NumViewports> viewports{};
     const ViewportState viewport_state = ComputeViewports(viewports);
@@ -342,8 +409,10 @@ void RasterizerD3D12::DrawByteCount(const IndirectParams& params) {
         *framebuffer, pipeline->BoundColorTargets());
     BindDrawState(*pipeline, bindings, *framebuffer, draw_params, draw_state.topology, compatible);
     {
+        query_runtime.PrepareDraw(maxwell3d->regs.zpass_pixel_count_enable);
         const ConditionalRendering::Scope predicate{conditional_rendering, cmd};
-        cmd->ExecuteIndirect(signature, 1, record, 0, nullptr, 0);
+        DrawStencilFaces(*pipeline, draw_state.topology,
+                         [&] { cmd->ExecuteIndirect(signature, 1, record, 0, nullptr, 0); });
     }
     texture_runtime.FinishCompatibleDrawTargets(*framebuffer);
     // The command signature wrote the runtime data constants: the next draw sets them again.

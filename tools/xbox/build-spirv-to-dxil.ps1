@@ -32,9 +32,10 @@ if (-not (Test-Path (Join-Path $src "meson.build"))) {
         Invoke-WebRequest "https://archive.mesa3d.org/mesa-$MesaVersion.tar.xz" -OutFile $tarball
     }
     Write-Host "extracting $tarball ..."
-    # tar reports errors for the few symlinks in the tarball (CI files, not needed here): the check
-    # below is what decides whether extraction worked.
-    & tar.exe -xf $tarball -C $WorkDir 2>$null
+    # Python, not tar: Windows 10's tar hangs on .xz, and a GNU tar earlier on PATH (devkitPro's
+    # msys2) reads "C:" as a remote host. The few symlinks in the tarball (CI files, not needed here)
+    # are left out: Windows cannot create them without privileges.
+    & python -c "import sys, tarfile; t = tarfile.open(sys.argv[1]); t.extractall(sys.argv[2], members=[m for m in t if not m.issym() and not m.islnk()])" $tarball $WorkDir
     if (-not (Test-Path (Join-Path $src "meson.build"))) { throw "extracting Mesa failed" }
 }
 
@@ -62,6 +63,7 @@ Copy-Item (Join-Path $PSScriptRoot "mesa\eden_pipeline.c") $s2d -Force
 Copy-Item (Join-Path $PSScriptRoot "mesa\eden_integer_sampling.h") $s2d -Force
 Copy-Item (Join-Path $PSScriptRoot "mesa\eden_reduction_sampling.h") $s2d -Force
 Copy-Item (Join-Path $PSScriptRoot "..\..\externals\spirv-to-dxil\include\eden_spirv_to_dxil.h") $s2d -Force
+Copy-Item (Join-Path $PSScriptRoot "mesa\eden_hoist_resource_handles.h") (Join-Path $src "src\microsoft\compiler") -Force
 Patch-File "src\microsoft\spirv_to_dxil\spirv_to_dxil.def" `
     "    spirv_to_dxil_get_version`n" `
     "    spirv_to_dxil_get_version`n    eden_spirv_to_dxil_pipeline`n"
@@ -104,6 +106,22 @@ Patch-File "src\microsoft\compiler\nir_to_dxil.c" `
 Patch-File "src\microsoft\spirv_to_dxil\dxil_spirv_nir.c" `
     "nir_fadd_imm(builder, nir_fneg(builder, z_pos), 1.0f)," `
     "nir_fsub(builder, nir_channel(builder, pos, 3), z_pos),"
+# Atomics write memory: declared readnone (as upstream does), a driver compiler may drop every atomic
+# whose result goes unused, and the Series' does. DXC declares them nounwind only.
+Patch-File "src\microsoft\compiler\dxil_function.c" `
+    "{`"dx.op.atomicBinOp`", `"O`", `"i@iiiii`", DXIL_ATTR_KIND_READ_NONE}," `
+    "{`"dx.op.atomicBinOp`", `"O`", `"i@iiiii`", DXIL_ATTR_KIND_NO_UNWIND},"
+Patch-File "src\microsoft\compiler\dxil_function.c" `
+    "{`"dx.op.atomicCompareExchange`", `"O`", `"i@iiiii`", DXIL_ATTR_KIND_READ_NONE}," `
+    "{`"dx.op.atomicCompareExchange`", `"O`", `"i@iiiii`", DXIL_ATTR_KIND_NO_UNWIND},"
+# One handle per texture/sampler/image, created in the entry block instead of in every branch that
+# reads it: the Series' driver compiler faults on some shaders with the per-branch copies.
+Patch-File "src\microsoft\compiler\nir_to_dxil.c" `
+    "extern uint64_t eden_phase_ns[];`n" `
+    "extern uint64_t eden_phase_ns[];`n#include `"eden_hoist_resource_handles.h`"`n"
+Patch-File "src\microsoft\compiler\nir_to_dxil.c" `
+    "   NIR_PASS(_, s, dxil_nir_guess_image_formats);`n" `
+    "   NIR_PASS(_, s, dxil_nir_guess_image_formats);`n   if (opts->environment == DXIL_ENVIRONMENT_VULKAN)`n      NIR_PASS(_, s, eden_hoist_resource_handles);`n"
 Patch-File "src\microsoft\spirv_to_dxil\meson.build" `
     "      'spirv_to_dxil.h',`n" `
     "      'spirv_to_dxil.h',`n      'eden_pipeline.c',`n      'eden_spirv_to_dxil.h',`n"

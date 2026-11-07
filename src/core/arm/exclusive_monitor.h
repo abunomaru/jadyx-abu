@@ -22,7 +22,8 @@ struct ExclusiveMonitorCheckpoint {
         bool active{};
     };
     u32 core_count{};
-    std::array<Reservation, 4> reservations{};
+    /// Same capacity as Dynarmic::ExclusiveMonitor::Checkpoint (dynarmic_exclusive_monitor.cpp).
+    std::array<Reservation, 8> reservations{};
 };
 
 class ExclusiveMonitor {

@@ -9,6 +9,8 @@
 #include <fstream>
 #include <memory>
 #include <numeric>
+
+#include "core/hardware_properties.h"
 #include <optional>
 #include <span>
 #include <string_view>
@@ -225,7 +227,7 @@ struct Catalog {
     explicit Catalog(const Layout& layout_) : layout{&layout_} {}
 
     const Layout* layout;
-    std::array<std::vector<std::uint64_t>, 4> descriptors;
+    std::array<std::vector<std::uint64_t>, Hardware::NUM_CPU_CORES> descriptors;
     std::vector<std::uint64_t> pcs;
     std::vector<Record> priority;
     void Finalize() {

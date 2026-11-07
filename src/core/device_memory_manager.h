@@ -94,6 +94,11 @@ public:
         }
     }
 
+    /// Whether p points into the emulated physical memory, the only memory with device addresses.
+    bool IsPhysicalPointer(const u8* p) const {
+        return (GetRawPhysicalAddr(p) >> page_bits) < compressed_device_addr.size();
+    }
+
     template <typename Func>
     void ApplyOpOnPointer(const u8* p, Common::ScratchBuffer<u32>& buffer, Func&& operation) {
         PAddr address = GetRawPhysicalAddr<u8>(p);
@@ -129,6 +134,10 @@ public:
     void UnregisterProcess(Asid id);
 
     void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta);
+
+    /// jit_read_table: the GPU wrote [addr, addr + size) for the first time; the CPU pages
+    /// backing it leave the JIT load table.
+    void MarkGpuWritten(DAddr addr, size_t size);
 
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);

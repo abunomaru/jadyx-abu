@@ -13,6 +13,8 @@
 namespace Service::Audio {
 
 class IHardwareOpusDecoder;
+class IClientSession;
+class HardwareAudioCodecTags;
 
 using AudioCore::OpusDecoder::OpusMultiStreamParameters;
 using AudioCore::OpusDecoder::OpusMultiStreamParametersEx;
@@ -23,6 +25,7 @@ class IHardwareOpusDecoderManager final : public ServiceFramework<IHardwareOpusD
 public:
     explicit IHardwareOpusDecoderManager(Core::System& system_);
     ~IHardwareOpusDecoderManager() override;
+    Result GetClientSession(Out<SharedPointer<IClientSession>> out_client);
 
     // Pulse: the manager holds no guest state; it reopens each decoder.
     std::string_view PulseKind() const override {
@@ -32,6 +35,7 @@ public:
                                           Pulse::HandlerRestore& restore) override;
 
 private:
+    void GetClientSessionRequest(HLERequestContext& ctx);
     Result OpenHardwareOpusDecoder(Out<SharedPointer<IHardwareOpusDecoder>> out_decoder,
                                    OpusParameters params, u32 tmem_size,
                                    InCopyHandle<Kernel::KTransferMemory> tmem_handle);
@@ -58,6 +62,7 @@ private:
 
     Core::System& system;
     AudioCore::OpusDecoder::OpusDecoderManager impl;
+    std::shared_ptr<HardwareAudioCodecTags> codec_tags;
 };
 
 } // namespace Service::Audio

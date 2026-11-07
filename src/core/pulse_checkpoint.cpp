@@ -974,7 +974,7 @@ u64 ProcessCheckpoint::MaxEncodedSize() const {
     const auto section = [](u64 size) {
         return 24 + (size + Common::Pulse::BlockSize - 1) / Common::Pulse::BlockSize * 32 + size;
     };
-    u64 total = 136 + section(memory_size) + 24 + 8;
+    u64 total = ExclusiveStateSize + section(memory_size) + 24 + 8;
     for (const auto& entry : sections) total += section(entry.bytes.size());
     return total;
 }

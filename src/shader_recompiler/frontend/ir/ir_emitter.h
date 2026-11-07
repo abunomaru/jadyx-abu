@@ -118,16 +118,17 @@ public:
 
     [[nodiscard]] F32 RenderAreaWidth();
     [[nodiscard]] F32 RenderAreaHeight();
+    [[nodiscard]] F32 StageConstant(u32 index);
 
     [[nodiscard]] U32 LaneId();
 
-    [[nodiscard]] U32 LoadGlobalU8(const U64& address);
-    [[nodiscard]] U32 LoadGlobalS8(const U64& address);
-    [[nodiscard]] U32 LoadGlobalU16(const U64& address);
-    [[nodiscard]] U32 LoadGlobalS16(const U64& address);
-    [[nodiscard]] U32 LoadGlobal32(const U64& address);
-    [[nodiscard]] Value LoadGlobal64(const U64& address);
-    [[nodiscard]] Value LoadGlobal128(const U64& address);
+    [[nodiscard]] U32 LoadGlobalU8(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobalS8(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobalU16(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobalS16(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobal32(const U64& address, bool coherent = false);
+    [[nodiscard]] Value LoadGlobal64(const U64& address, bool coherent = false);
+    [[nodiscard]] Value LoadGlobal128(const U64& address, bool coherent = false);
 
     void WriteGlobalU8(const U64& address, const U32& value);
     void WriteGlobalS8(const U64& address, const U32& value);
@@ -150,6 +151,7 @@ public:
     [[nodiscard]] U1 GetSparseFromOp(const Value& op);
     [[nodiscard]] U1 GetInBoundsFromOp(const Value& op);
 
+    [[nodiscard]] Value TensorMulAdd(const Value& a, const Value& b, const Value& c, u32 depth);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3,
@@ -289,7 +291,7 @@ public:
     [[nodiscard]] U32U64 GlobalAtomicOr(const U64& pointer_offset, const U32U64& value);
     [[nodiscard]] U32U64 GlobalAtomicXor(const U64& pointer_offset, const U32U64& value);
     [[nodiscard]] U32U64 GlobalAtomicExchange(const U64& pointer_offset, const U32U64& value);
-    [[nodiscard]] U32 GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& compare,
+    [[nodiscard]] U32 GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& comparator,
                                                   const U32& value);
 
     [[nodiscard]] F32 GlobalAtomicF32Add(const U64& pointer_offset, const Value& value,

@@ -175,11 +175,12 @@ void EmitStorageAtomicExchange32(EmitContext& ctx, IR::Inst& inst, const IR::Val
                ctx.var_alloc.Consume(offset), value);
 }
 
+/// Stores value if the storage word equals comparator; returns the old word.
 void EmitStorageAtomicCompareExchange32(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
-                                        const IR::Value& offset, std::string_view compare,
+                                        const IR::Value& offset, std::string_view comparator,
                                         std::string_view value) {
     ctx.AddU32("{}=atomicCompSwap({}_ssbo{}[{}>>2],{},{});", inst, ctx.stage_name, binding.U32(),
-               ctx.var_alloc.Consume(offset), compare, value);
+               ctx.var_alloc.Consume(offset), comparator, value);
 }
 
 void EmitStorageAtomicIAdd64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,

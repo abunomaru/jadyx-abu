@@ -380,34 +380,21 @@ ShaderCompiler::~ShaderCompiler() {
 
 std::vector<u8> ShaderCompiler::Compile(std::span<const u32> spirv, dxil_spirv_shader_stage stage,
                                         bool flip_y) const {
-    if (!available) {
-        throw std::runtime_error("D3D12: the shader path is unavailable");
-    }
-    dxil_spirv_runtime_conf conf = MakeConf();
+    // The pipeline entry point widens 16-bit ops, which the console's driver rejects (E_INVALIDARG)
+    // and spirv_to_dxil's own entry point leaves in, e.g. from booleans NIR narrows to 16 bits.
+    const PipelineStage pipeline_stage{.spirv = spirv, .stage = stage};
+    PipelineOptions options{};
     // An unconditional flip only applies to the viewports set in its mask.
     if (flip_y) {
-        conf.yz_flip = {.mode = DXIL_SPIRV_Y_FLIP_UNCONDITIONAL, .y_mask = 1, .z_mask = 0};
+        options.yz_flip = DXIL_SPIRV_Y_FLIP_UNCONDITIONAL;
+        options.y_flip_mask = 1;
     }
-
-    // spirv_to_dxil dereferences both of these unconditionally.
-    const dxil_spirv_debug_options debug_options{};
-    const dxil_spirv_logger logger{.priv = nullptr, .log = LogTranslatorMessage};
-    dxil_spirv_object object{};
-    if (!translate(spirv.data(), spirv.size(), nullptr, 0, stage, "main", VALIDATOR_VERSION,
-                   &debug_options, &conf, &logger, &object)) {
-        throw std::runtime_error(
-            fmt::format("D3D12: spirv_to_dxil failed for stage {}", static_cast<int>(stage)));
-    }
-    std::vector<u8> dxil(static_cast<const u8*>(object.binary.buffer),
-                         static_cast<const u8*>(object.binary.buffer) + object.binary.size);
-    free_dxil(&object);
-
-    Sign(dxil);
-    return dxil;
+    return std::move(CompilePipeline({&pipeline_stage, 1}, options, 0, nullptr).front().dxil);
 }
 
 std::vector<ShaderCompiler::CompiledStage> ShaderCompiler::CompilePipeline(
-    std::span<const PipelineStage> stages, const PipelineOptions& options, u64 trace_pipeline) const {
+    std::span<const PipelineStage> stages, const PipelineOptions& options, u64 trace_pipeline,
+    std::optional<DxilDiskCache::Key>* disk_record) const {
     if (!available) {
         throw std::runtime_error("D3D12: the shader path is unavailable");
     }
@@ -448,6 +435,9 @@ std::vector<ShaderCompiler::CompiledStage> ShaderCompiler::CompilePipeline(
         disk_key = DiskCacheKey(stages, options, flags);
         if (const auto payload = disk_cache.Find(disk_key)) {
             if (auto cached = DecodeStages(*payload, stages.size(), options.stream_output)) {
+                if (disk_record) {
+                    *disk_record = disk_key;
+                }
                 return std::move(*cached);
             }
         }
@@ -514,8 +504,20 @@ std::vector<ShaderCompiler::CompiledStage> ShaderCompiler::CompilePipeline(
     }
     if (use_disk_cache) {
         disk_cache.Store(disk_key, EncodeStages(result, options.stream_output));
+        if (disk_record && disk_cache.Contains(disk_key)) {
+            *disk_record = disk_key;
+        }
     }
     return result;
+}
+
+std::optional<std::vector<ShaderCompiler::CompiledStage>> ShaderCompiler::LoadPipeline(
+    const DxilDiskCache::Key& key, size_t num_stages) {
+    const auto payload = GetDxilDiskCache().Find(key);
+    if (!payload) {
+        return std::nullopt;
+    }
+    return DecodeStages(*payload, num_stages, nullptr);
 }
 
 u64 ShaderCompiler::TranslatorGeneration() const {

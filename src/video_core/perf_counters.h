@@ -106,6 +106,7 @@ enum class Counter : size_t {
     CbvCreateNs,
     CbvCreates,
     CbvStreamed,
+    CbvReused,      ///< streamed uniforms rebound from the submission's earlier copy
     CbvPersistent,
     CbvNull,
     CbvRoot,        ///< bound as root CBVs instead of table descriptors
@@ -114,6 +115,11 @@ enum class Counter : size_t {
     ViewCopies,
     DescriptorTables,       ///< resource tables a draw or dispatch asked for
     DescriptorTableReuses,  ///< of them, served by an identical table of the same list
+    RenderTargetEarlyOuts,  ///< draws that kept the attachments prepared by an earlier one
+    StageViewReuses,        ///< shader stages that kept the views and samplers of the last draw
+    StageViewMisses,        ///< cacheable stages that resolved them again
+    TextureReplays,         ///< draws that bound the textures of the pipeline's last draw
+    TextureReplayMismatches, ///< texture_replay=check: replays that would have bound otherwise
     SubmitListNs,
     SubmitLists,
     GpuTickNs,
@@ -132,6 +138,8 @@ enum class Counter : size_t {
     DmaCopyCalls,
     DmaOtherNs,
     DmaOtherCalls,
+    DmaHeaderFlushes,        ///< pushbuffer reads that flushed GPU-written memory first
+    DmaHeaderFlushesSkipped, ///< safe pushbuffer reads with no GPU-written granule (no flush)
     MaxwellDirtyChanged,
     MaxwellDirtyUnchanged,
     ClearNs,
@@ -169,6 +177,35 @@ enum class Counter : size_t {
     GuestCoreIdleUs,       ///< emulated CPU cores with no guest thread to run, summed over cores
     GuestCoreWakesSpun,    ///< idle cores interrupted while spinning (no OS wake)
     GuestCoreWakesBlocked, ///< idle cores interrupted after blocking in the OS
+    // The GPU thread taking a present frame to composite into (PresentManager::AcquireFrame).
+    PresentFreeWaitUs,     ///< waiting for a free frame: every one queued or being copied
+    PresentRenderWaitUs,   ///< waiting for the GPU to finish the frame's previous rendering
+    PresentCopyWaitUs,     ///< waiting on the CPU for the frame's previous copy to the display
+    PresentWaitsLong,      ///< frames taken after waiting over 1 ms in all
+    PresentsReplaced,      ///< present_mailbox: queued frames reused before being shown
+    PresentsWouldReplace,  ///< present_mailbox=check: frames the mailbox would have reused
+    VsyncComposeWaitsCut,  ///< vsync_nowait: composite waits cut at 2 ms (check: would cut)
+    VsyncComposeWaitsFull, ///< vsync_nowait=1: full waits, a cut composite still in flight
+    GuestSwapIntervalChanges, ///< the game changed its swap interval (logged with the cause)
+    GuestSwapIntervalsHeld, ///< swap_interval_hold: frames of interval 3 paced at 2 (check: would)
+    // Guest CPU writes into rasterizer-cached memory (VideoCommon::CpuWriteQueue).
+    CpuWritesDeferred,        ///< cpu_write_defer=1: queued instead of taking the cache locks
+    CpuWritesWouldDefer,      ///< cpu_write_defer=check: writes that would have been queued
+    CpuWriteDeferMismatches,  ///< check: of those, OnCPUWrite found GPU data (must stay 0)
+    CpuWriteQueueFull,        ///< cpu_write_defer=1: queue full, OnCPUWrite instead
+    CpuWritesDrained,         ///< queued writes the GPU thread applied
+    CpuWritesLateGpu,         ///< of those, ranges that became GPU-modified while queued
+    // Guest loads of rasterizer-cached memory (jit_read_table, Common::PageTable).
+    JitReadPagesCleared,      ///< load entries cleared when the GPU first wrote their memory
+    JitReadsWouldInline,      ///< check: slow loads the load table would have done inline
+    JitReadMismatches,        ///< check: of those, memory the GPU may have written (must stay 0)
+    GpuFlushUnmarked,         ///< a CPU read flushed GPU data GpuWrittenPages missed (must stay 0)
+    // Why emulated cores left the JIT (Kernel::PhysicalCore::RunThread). One exit can count twice.
+    GuestRunExits,            ///< JIT runs that returned
+    GuestExitsSvc,            ///< of those, supervisor calls (per number in guest_svc_exits)
+    GuestExitsInterrupt,      ///< interrupts (BreakLoop: scheduling, timers, cross-core requests)
+    GuestExitsCacheInvalidation, ///< code cache invalidations
+    GuestExitsDataAbort,      ///< data aborts
     // Indirect draw macros (DrawArraysIndirect / DrawIndexedIndirect).
     IndirectMacroGpu,         ///< drawn from the GPU-side arguments (ExecuteIndirect)
     IndirectMacroCpu,         ///< drawn directly from arguments read on the CPU
@@ -181,6 +218,26 @@ enum class Counter : size_t {
     // Cache garbage collection under memory pressure (always counted, once per frame at most).
     CacheGcRuns,              ///< texture and buffer cache collections
     CacheGcUs,                ///< time they took, including buffer downloads before deletion
+    // Emulated tessellation, GPU time per step of the sampled draws (gpu_profile=1, timestamps).
+    TessDrawsSampled,
+    TessCaptureGpuNs,
+    TessControlGpuNs,
+    TessBarriersGpuNs,  ///< transitions of the tessellator's buffers back to unordered access
+    TessTessellateGpuNs,
+    TessReadbackGpuNs,  ///< barriers after the tessellator and the copy of the record's needs
+    TessDrawGpuNs,
+    // Draws D3D12 needs extra work for (always counted).
+    TessDraws,                ///< draws through the emulated tessellation (compute passes)
+    GeneratedGeometryDraws,   ///< draws through a generated geometry shader (lines, points,
+                              ///< fill rectangle, polygon points, last provoking vertex)
+    StencilFaceSplits,        ///< draws split per face for different stencil references
+    SnapshotLevelCopies,      ///< logic op snapshots that copied only stale levels
+    SnapshotReuses,           ///< logic op snapshots still current: no copy
+    LogicOpCopies,            ///< emulated logic op: destination copied before the draw
+    LogicOpCopyBytes,
+    DepthFeedbackCopies,      ///< depth images copied so a draw can sample its own target
+    QueryBlockingWaits,       ///< guest query reads that waited on the GPU fence
+    QueryBlockingWaitUs,
     Count,
 };
 
@@ -206,6 +263,10 @@ struct GuestWaitSiteSnapshot {
     u64 max_us{};
 };
 inline std::array<GuestWaitSiteCounters, NUM_GUEST_SYNCPOINTS> guest_wait_sites{};
+
+/// Supervisor calls that ended a JIT run, by SVC number.
+constexpr size_t NUM_GUEST_SVCS = 0x100;
+inline std::array<std::atomic<u64>, NUM_GUEST_SVCS> guest_svc_exits{};
 
 struct MacroProfileSnapshot {
     u32 method{};
@@ -288,6 +349,21 @@ inline void RecordGuestGpuWait(u32 syncpoint_id, u64 waited_us) {
     while (previous < waited_us &&
            !site.max_us.compare_exchange_weak(previous, waited_us, std::memory_order_relaxed)) {
     }
+}
+
+inline void RecordGuestSvcExit(u32 svc) {
+    Add(Counter::GuestExitsSvc, 1);
+    if (svc < guest_svc_exits.size()) {
+        guest_svc_exits[svc].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline std::array<u64, NUM_GUEST_SVCS> TakeGuestSvcExits() {
+    std::array<u64, NUM_GUEST_SVCS> result{};
+    for (size_t svc = 0; svc < result.size(); ++svc) {
+        result[svc] = guest_svc_exits[svc].exchange(0, std::memory_order_relaxed);
+    }
+    return result;
 }
 
 inline std::array<GuestWaitSiteSnapshot, NUM_GUEST_SYNCPOINTS> TakeGuestWaitSites() {

@@ -9,35 +9,89 @@
 #include "video_core/renderer_d3d12/d3d12_resource_allocator.h"
 #include "video_core/renderer_d3d12/d3d12_heap_growth_policy.h"
 #include "video_core/renderer_d3d12/d3d12_heap_packing.h"
+#include "video_core/renderer_d3d12/d3d12_resource_utils.h"
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <condition_variable>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
+
+#include "common/thread.h"
 
 namespace D3D12 {
 
 using namespace Common::Literals;
 
 namespace {
-enum class HeapClass : u8 { Texture, RenderTarget, SmallRenderTarget };
-constexpr size_t heap_classes = 3;
+std::atomic_bool small_texture_alignment{true};
+std::atomic_bool spare_heaps{true};
+std::atomic_bool cpu_texture_writes{false};
+std::atomic_bool cpu_texture_refused{false};
 
-HeapClass ClassOf(const D3D12_RESOURCE_DESC& desc, u64 size) {
-    constexpr D3D12_RESOURCE_FLAGS RT_DS = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    if ((desc.Flags & RT_DS) == 0) return HeapClass::Texture;
+enum class HeapClass : u8 {
+    Texture,
+    RenderTarget,
+    SmallRenderTarget,
+    TransientRenderTarget,
+    CpuTexture, ///< plain textures the CPU writes in place (SetCpuTextureWrites)
+};
+constexpr size_t heap_classes = 5;
+
+constexpr D3D12_RESOURCE_FLAGS RT_DS = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                       D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+HeapClass ClassOf(const D3D12_RESOURCE_DESC& desc, u64 size, bool transient, bool cpu_writable) {
+    if ((desc.Flags & RT_DS) == 0) return cpu_writable ? HeapClass::CpuTexture : HeapClass::Texture;
+    if (transient) return HeapClass::TransientRenderTarget;
     return size <= HeapGrowth::small_render_target ? HeapClass::SmallRenderTarget
                                                    : HeapClass::RenderTarget;
 }
 
 D3D12_HEAP_FLAGS FlagsOf(HeapClass heap_class) {
-    return heap_class == HeapClass::Texture ? D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
-                                            : D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+    return heap_class == HeapClass::Texture || heap_class == HeapClass::CpuTexture
+               ? D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+               : D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+}
+
+D3D12_HEAP_PROPERTIES PropertiesOf(HeapClass heap_class) {
+    if (heap_class == HeapClass::CpuTexture) {
+        return {.Type = D3D12_HEAP_TYPE_CUSTOM,
+                .CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                .MemoryPoolPreference = D3D12_MEMORY_POOL_L0};
+    }
+    return {.Type = D3D12_HEAP_TYPE_DEFAULT};
+}
+
+/// CreateHeap with the pages left as the process freed them (NotZeroedFlag): every placed RT/DS
+/// is discarded on first use and every other texture is uploaded or copied before it is sampled.
+HRESULT CreatePoolHeap(ID3D12Device* device, D3D12_HEAP_DESC heap_desc, ComPtr<ID3D12Heap>& heap) {
+    heap_desc.Flags |= NotZeroedFlag(device);
+    HRESULT hr = device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+    if (RefuseNotZeroed(heap_desc.Flags, hr)) {
+        heap_desc.Flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        hr = device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+    }
+    return hr;
+}
+
+/// The driver refused a CPU-writable heap or a texture in one: plain textures go back to
+/// DEFAULT heaps and staging.
+void RefuseCpuTextures(HRESULT hr) {
+    cpu_texture_writes.store(false, std::memory_order_relaxed);
+    if (!cpu_texture_refused.exchange(true, std::memory_order_relaxed)) {
+        LOG_WARNING(Render,
+                    "D3D12: a texture was refused in a CPU-writable heap ({:#010x}); plain "
+                    "textures go through staging from now on",
+                    static_cast<u32>(hr));
+    }
 }
 
 const char* NameOf(HeapClass heap_class) {
@@ -48,6 +102,10 @@ const char* NameOf(HeapClass heap_class) {
         return "RT/DS";
     case HeapClass::SmallRenderTarget:
         return "small RT/DS";
+    case HeapClass::TransientRenderTarget:
+        return "transient RT/DS";
+    case HeapClass::CpuTexture:
+        return "CPU-writable texture";
     }
     return "?";
 }
@@ -63,6 +121,10 @@ u64 PoolOf(HeapClass heap_class) {
         return 32_MiB;
     case HeapClass::SmallRenderTarget:
         return 8_MiB;
+    case HeapClass::TransientRenderTarget:
+        return 16_MiB;
+    case HeapClass::CpuTexture:
+        return 32_MiB;
     }
     return 64_MiB;
 }
@@ -70,14 +132,17 @@ u64 PoolOf(HeapClass heap_class) {
 // Padding of a heap grown under pressure. A large render target gets an exact heap: at world
 // entry 16 MiB padded RT heaps each kept one survivor, leaving ~300 MiB free inside them that
 // no trim could release. Small render targets arrive in bursts of hundreds and keep their full
-// pool: 2 MiB padding still made hundreds of heaps.
+// pool: 2 MiB padding still made hundreds of heaps. Transient ones are dropped within frames,
+// so a padded heap of them empties instead of holding survivors.
 u64 PressurePadOf(HeapClass heap_class) {
     switch (heap_class) {
     case HeapClass::Texture:
+    case HeapClass::CpuTexture:
         return 16_MiB;
     case HeapClass::RenderTarget:
         return 0;
     case HeapClass::SmallRenderTarget:
+    case HeapClass::TransientRenderTarget:
         return 8_MiB;
     }
     return 16_MiB;
@@ -90,9 +155,11 @@ struct TextureResourceAllocator::State {
         HeapClass heap_class{};
         u64 size{};
         u64 alignment{};
+        u64 used{};
         std::map<u64, u64> free_ranges; // offset -> bytes
         Common::MemoryCharge charge;
         u64 empty_tick{}; // first trim pass that saw it empty; 0 while in use
+        bool spare{};     // made ahead on the spare thread and not placed into yet
     };
 
     mutable std::mutex mutex;
@@ -101,6 +168,10 @@ struct TextureResourceAllocator::State {
     u64 live_bytes{};
     u64 peak_bytes{};
     u64 placed_resources{};
+    u64 transient_placed{};
+    /// Textures placed at 4 KiB, and the bytes they saved against 64 KiB slots.
+    u64 small_placed{};
+    u64 small_saved_bytes{};
     u64 committed_fallbacks{};
     u64 trimmed_heaps{};
     u64 trimmed_bytes{};
@@ -109,6 +180,8 @@ struct TextureResourceAllocator::State {
     u64 compact_heaps{};
     u64 avoided_capacity{};
     u64 pressure_waits{};
+    u64 spares_made{};
+    u64 spare_hits{};
     // Accessed only by the recording thread, never by retirement callbacks.
     u64 pressure_wait_tick{};
     // Diagnostic census of placed resources by shape (format, width, height, depth, mips, flags).
@@ -129,6 +202,7 @@ struct TextureResourceAllocator::State {
             return;
         }
         const u64 released_size = size;
+        blocks[block_index].used -= released_size;
         auto& ranges = blocks[block_index].free_ranges;
         auto next = ranges.lower_bound(offset);
         if (next != ranges.begin()) {
@@ -149,6 +223,75 @@ struct TextureResourceAllocator::State {
         live_bytes -= released_size;
         if (pending) pending_bytes -= released_size;
     }
+
+    /// Caller holds the mutex.
+    [[nodiscard]] bool HasEmptyHeap(HeapClass heap_class) const {
+        return std::ranges::any_of(blocks, [heap_class](const Block& block) {
+            return block.heap && block.heap_class == heap_class && block.used == 0;
+        });
+    }
+
+    /// Caller holds the mutex. Tombstones preserve outstanding Allocation indices: reuse only
+    /// slots with no heap, which Trim proves hold no live or pending allocations.
+    size_t Insert(Block&& block) {
+        const auto vacant = std::ranges::find_if(blocks, [](const Block& b) { return !b.heap; });
+        if (vacant == blocks.end()) {
+            blocks.emplace_back(std::move(block));
+            return blocks.size() - 1;
+        }
+        *vacant = std::move(block);
+        return static_cast<size_t>(vacant - blocks.begin());
+    }
+};
+
+struct TextureResourceAllocator::SpareWorker {
+    std::mutex mutex;
+    std::condition_variable_any wake;
+    std::array<bool, heap_classes> wanted{};
+    std::jthread thread; ///< last: stopped before the members it uses
+
+    void Request(HeapClass heap_class) {
+        {
+            std::scoped_lock lock{mutex};
+            wanted[static_cast<size_t>(heap_class)] = true;
+        }
+        wake.notify_one();
+    }
+
+    // CreateHeap of a pool stalled the recording thread while the system zeroed the pages. The
+    // spare is made here instead and joins the pool as an empty heap: the next growth finds it
+    // like any other free range, KeepWarm trims keep it, and the first pressured trim releases it.
+    static void Make(const Device& device, State& state, HeapClass heap_class) {
+        const u64 pool = PoolOf(heap_class);
+        {
+            std::scoped_lock lock{state.mutex};
+            if (state.HasEmptyHeap(heap_class)) return;
+        }
+        const auto memory = device.QueryCacheMemoryPressure();
+        if (!memory.Known() ||
+            !HeapGrowth::WantSpare(false, pool, {memory.app_used, memory.app_limit},
+                                   {memory.gpu_used, memory.gpu_budget})) {
+            return;
+        }
+        State::Block block{
+            .heap_class = heap_class, .size = pool,
+            .alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, .spare = true};
+        const D3D12_HEAP_DESC heap_desc{
+            .SizeInBytes = pool,
+            .Properties = PropertiesOf(heap_class),
+            .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+            .Flags = FlagsOf(heap_class),
+        };
+        if (FAILED(CreatePoolHeap(device.Get(), heap_desc, block.heap))) return;
+        block.free_ranges.emplace(0, pool);
+        block.charge = Common::MemoryCharge(Common::MemoryAccount::TextureHeaps, pool);
+        std::scoped_lock lock{state.mutex};
+        // Growth made one meanwhile, or a release emptied one: this spare is not needed.
+        if (state.HasEmptyHeap(heap_class)) return;
+        state.Insert(std::move(block));
+        state.heap_bytes += pool;
+        ++state.spares_made;
+    }
 };
 
 struct TextureResourceAllocator::Allocation {
@@ -166,27 +309,124 @@ struct TextureResourceAllocator::Allocation {
     }
 };
 
-TextureResourceAllocator::TextureResourceAllocator(const Device& device_, Scheduler& scheduler_)
-    : device{device_}, scheduler{scheduler_}, state{std::make_shared<State>()} {}
+void SetSmallTextureAlignment(bool enabled) {
+    small_texture_alignment.store(enabled, std::memory_order_relaxed);
+}
 
-TextureResourceAllocator::~TextureResourceAllocator() = default;
+void SetSpareHeaps(bool enabled) {
+    spare_heaps.store(enabled, std::memory_order_relaxed);
+}
+
+void SetCpuTextureWrites(bool enabled) {
+    cpu_texture_writes.store(enabled && !cpu_texture_refused.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+}
+
+bool CpuTextureWrites() noexcept {
+    return cpu_texture_writes.load(std::memory_order_relaxed);
+}
+
+TextureResourceAllocator::TextureResourceAllocator(const Device& device_, Scheduler& scheduler_)
+    : device{device_}, scheduler{scheduler_}, state{std::make_shared<State>()},
+      spare_worker{std::make_unique<SpareWorker>()} {
+    D3D12_FEATURE_DATA_ARCHITECTURE1 arch{};
+    cache_coherent_uma = SUCCEEDED(device.Get()->CheckFeatureSupport(
+                             D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch))) &&
+                         arch.CacheCoherentUMA;
+    spare_worker->thread = std::jthread{[this](std::stop_token stop) {
+        Common::SetCurrentThreadName("D3D12SpareHeaps");
+        auto& worker = *spare_worker;
+        while (true) {
+            std::array<bool, heap_classes> wanted{};
+            {
+                std::unique_lock lock{worker.mutex};
+                if (!worker.wake.wait(lock, stop, [&] {
+                        return std::ranges::find(worker.wanted, true) != worker.wanted.end();
+                    })) {
+                    return;
+                }
+                wanted = std::exchange(worker.wanted, {});
+            }
+            for (size_t type = 0; type < heap_classes; ++type) {
+                if (wanted[type]) SpareWorker::Make(device, *state, static_cast<HeapClass>(type));
+            }
+        }
+    }};
+}
+
+TextureResourceAllocator::~TextureResourceAllocator() {
+    spare_worker.reset();
+}
 
 TextureResourceAllocator::Resource TextureResourceAllocator::Create(
-    const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state,
-    const D3D12_CLEAR_VALUE* clear_value) {
-    const D3D12_RESOURCE_ALLOCATION_INFO info = device.Get()->GetResourceAllocationInfo(0, 1, &desc);
+    const D3D12_RESOURCE_DESC& requested, D3D12_RESOURCE_STATES initial_state,
+    const D3D12_CLEAR_VALUE* clear_value, HeapPacking::TexelBlock texel_block, bool cpu_writable) {
+    return CreateImpl(requested, initial_state, clear_value, texel_block, cpu_writable, false, {});
+}
+
+TextureResourceAllocator::Resource TextureResourceAllocator::CreateInUsedHeaps(
+    const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state, bool cpu_writable,
+    const std::vector<bool>& avoid) {
+    return CreateImpl(desc, initial_state, nullptr, {}, cpu_writable, true, avoid);
+}
+
+TextureResourceAllocator::Resource TextureResourceAllocator::CreateImpl(
+    const D3D12_RESOURCE_DESC& requested, D3D12_RESOURCE_STATES initial_state,
+    const D3D12_CLEAR_VALUE* clear_value, HeapPacking::TexelBlock texel_block, bool cpu_writable,
+    bool in_used_heaps, const std::vector<bool>& avoid) {
+    // Small sampled textures sit at 4 KiB instead of 64 KiB: icons, glyphs and LUTs each wasted
+    // most of a 64 KiB slot. The device may still refuse (a larger alignment or an invalid size),
+    // and the texture goes back to the default alignment.
+    D3D12_RESOURCE_DESC desc = requested;
+    D3D12_RESOURCE_ALLOCATION_INFO info{UINT64_MAX, 0};
+    if (desc.Alignment == 0 && small_texture_alignment.load(std::memory_order_relaxed) &&
+        HeapPacking::SmallPlacementCandidate(desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                                             (desc.Flags & RT_DS) != 0, desc.SampleDesc.Count,
+                                             desc.Width, desc.Height, texel_block)) {
+        desc.Alignment = HeapPacking::small_alignment;
+        info = device.Get()->GetResourceAllocationInfo(0, 1, &desc);
+        if (info.SizeInBytes == UINT64_MAX || info.Alignment != HeapPacking::small_alignment) {
+            desc.Alignment = 0;
+            info = {UINT64_MAX, 0};
+        }
+    }
+    if (info.SizeInBytes == UINT64_MAX) {
+        info = device.Get()->GetResourceAllocationInfo(0, 1, &desc);
+    }
     if (info.SizeInBytes == UINT64_MAX || info.Alignment == 0) {
         return {};
     }
-    const HeapClass heap_class = ClassOf(desc, info.SizeInBytes);
+    const State::CensusKey shape{static_cast<u32>(desc.Format), desc.Width, desc.Height,
+                                 desc.DepthOrArraySize, desc.MipLevels,
+                                 static_cast<u32>(desc.Flags)};
+    bool transient = false;
+    // An image old enough to be moved is not transient, whatever its shape does now.
+    if ((desc.Flags & RT_DS) && !in_used_heaps) {
+        std::scoped_lock lock{state->mutex};
+        const auto known = state->census.find(shape);
+        transient = known != state->census.end() &&
+                    HeapGrowth::TransientShape(known->second.created, known->second.live);
+    }
+    const bool in_cpu_heap = cpu_writable && cache_coherent_uma && CpuTextureWrites() &&
+                             (desc.Flags & RT_DS) == 0;
+    const HeapClass heap_class = ClassOf(desc, info.SizeInBytes, transient, in_cpu_heap);
     const u64 heap_alignment =
         std::max<u64>(info.Alignment, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
     size_t selected = SIZE_MAX;
     u64 selected_offset{};
     u64 best_waste = UINT64_MAX;
     u64 best_block_free = UINT64_MAX;
+    // The spare thread may grow the block vector: read the heap only under the pool lock. The
+    // reserved range keeps trim from releasing it.
+    ID3D12Heap* selected_heap{};
     const auto reserve_space = [&] {
-        auto& ranges = state->blocks[selected].free_ranges;
+        auto& block = state->blocks[selected];
+        selected_heap = block.heap.Get();
+        if (block.spare) {
+            block.spare = false;
+            ++state->spare_hits;
+        }
+        auto& ranges = block.free_ranges;
         auto containing = ranges.upper_bound(selected_offset);
         if (containing != ranges.begin()) --containing;
         const u64 range_offset = containing->first;
@@ -199,7 +439,8 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
         if (end < range_offset + range_size) {
             ranges.emplace(end, range_offset + range_size - end);
         }
-        state->blocks[selected].empty_tick = 0;
+        block.empty_tick = 0;
+        block.used += info.SizeInBytes;
         state->live_bytes += info.SizeInBytes;
         state->peak_bytes = std::max(state->peak_bytes, state->live_bytes);
     };
@@ -218,7 +459,8 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
             for (size_t index = 0; index < state->blocks.size(); ++index) {
                 auto& block = state->blocks[index];
                 if (!block.heap || block.heap_class != wanted_class ||
-                    block.alignment < heap_alignment) {
+                    block.alignment < heap_alignment || (index < avoid.size() && avoid[index]) ||
+                    (in_used_heaps && block.used == 0)) {
                     continue;
                 }
                 u64 block_free = 0;
@@ -245,6 +487,7 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
         if (selected != SIZE_MAX) reserve_space();
     };
     find_space();
+    if (in_used_heaps && selected == SIZE_MAX) return {};
 
     bool compact = false;
     u64 wanted{};
@@ -309,6 +552,8 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
         }
     }
 
+    bool want_spare = false;
+    HRESULT cpu_heap_refused = S_OK;
     {
         std::scoped_lock lock{state->mutex};
 
@@ -318,13 +563,13 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
             if (!wanted) return {};
             const D3D12_HEAP_DESC heap_desc{
                 .SizeInBytes = wanted,
-                .Properties = {.Type = D3D12_HEAP_TYPE_DEFAULT},
+                .Properties = PropertiesOf(heap_class),
                 .Alignment = heap_alignment,
                 .Flags = FlagsOf(heap_class),
             };
             State::Block block{.heap_class = heap_class, .size = wanted,
                                .alignment = heap_alignment};
-            const HRESULT heap_hr = device.Get()->CreateHeap(&heap_desc, IID_PPV_ARGS(&block.heap));
+            const HRESULT heap_hr = CreatePoolHeap(device.Get(), heap_desc, block.heap);
             if (SUCCEEDED(heap_hr)) {
                 block.free_ranges.emplace(0, wanted);
                 block.charge = Common::MemoryCharge(Common::MemoryAccount::TextureHeaps, wanted);
@@ -335,34 +580,44 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
                         HeapGrowth::Capacity(info.SizeInBytes, info.Alignment, false,
                                              PoolOf(heap_class)) - wanted;
                 }
-                // Tombstones preserve outstanding Allocation indices. Reuse only slots with
-                // no heap: Trim proves there are no live or pending allocations in that slot.
-                const auto vacant = std::find_if(state->blocks.begin(), state->blocks.end(),
-                                                [](const auto& b) { return !b.heap; });
-                if (vacant == state->blocks.end()) {
-                    state->blocks.emplace_back(std::move(block));
-                    selected = state->blocks.size() - 1;
-                } else {
-                    selected = static_cast<size_t>(vacant - state->blocks.begin());
-                    *vacant = std::move(block);
-                }
+                selected = state->Insert(std::move(block));
                 selected_offset = 0;
+                // Pooled growth: the class is filling, so the next heap is made off the frame.
+                want_spare = !compact &&
+                             heap_alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+                             spare_heaps.load(std::memory_order_relaxed);
                 reserve_space();
                 LOG_INFO(Render, "D3D12: texture heap pool added {} MiB {} block ({} MiB total), "
                          "required {} bytes, pressure-sized {}",
                          wanted / 1_MiB, NameOf(heap_class), state->heap_bytes / 1_MiB,
                          info.SizeInBytes, compact);
+            } else if (heap_class == HeapClass::CpuTexture && heap_hr != E_OUTOFMEMORY) {
+                cpu_heap_refused = heap_hr;
             } else {
                 LOG_WARNING(Render, "D3D12: CreateHeap for texture pool failed 0x{:08x}; using committed resources",
                             static_cast<u32>(heap_hr));
             }
         }
     }
+    if (FAILED(cpu_heap_refused)) {
+        RefuseCpuTextures(cpu_heap_refused);
+        return CreateImpl(requested, initial_state, clear_value, texel_block, false,
+                          in_used_heaps, avoid);
+    }
+
+    if (want_spare) spare_worker->Request(heap_class);
+
+    // A sudden jump in commit otherwise has no owner in the log.
+    if (info.SizeInBytes >= 128ULL * 1024 * 1024) {
+        LOG_WARNING(Render, "D3D12: large texture: {} MiB, {}x{}x{} format {}, {} mips",
+                    info.SizeInBytes / (1024 * 1024), desc.Width, desc.Height,
+                    desc.DepthOrArraySize, static_cast<u32>(desc.Format), desc.MipLevels);
+    }
 
     Resource result;
     if (selected != SIZE_MAX) {
         const HRESULT placed_hr = device.Get()->CreatePlacedResource(
-            state->blocks[selected].heap.Get(), selected_offset, &desc, initial_state, clear_value,
+            selected_heap, selected_offset, &desc, initial_state, clear_value,
             IID_PPV_ARGS(&result.resource));
         if (SUCCEEDED(placed_hr)) {
             result.allocation = std::make_shared<Allocation>();
@@ -371,22 +626,37 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
             result.allocation->offset = selected_offset;
             result.allocation->size = info.SizeInBytes;
             result.placed = true;
+            result.cpu_writable = heap_class == HeapClass::CpuTexture;
             std::scoped_lock lock{state->mutex};
             ++state->placed_resources;
-            auto& entry = state->census[{static_cast<u32>(desc.Format), desc.Width, desc.Height,
-                                         desc.DepthOrArraySize, desc.MipLevels,
-                                         static_cast<u32>(desc.Flags)}];
-            ++entry.created;
+            state->transient_placed += heap_class == HeapClass::TransientRenderTarget;
+            if (desc.Alignment == HeapPacking::small_alignment) {
+                ++state->small_placed;
+                state->small_saved_bytes +=
+                    Common::AlignUp(info.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) -
+                    info.SizeInBytes;
+            }
+            auto& entry = state->census[shape];
+            // A move is not a new texture: counting it would make the shape look transient.
+            entry.created += !in_used_heaps;
             ++entry.live;
             entry.live_bytes += info.SizeInBytes;
             result.allocation->census = &entry;
             return result;
         }
         state->Free(selected, selected_offset, info.SizeInBytes);
+        if (in_used_heaps) return {};
+        if (heap_class == HeapClass::CpuTexture && placed_hr != E_OUTOFMEMORY) {
+            RefuseCpuTextures(placed_hr);
+            return CreateImpl(requested, initial_state, clear_value, texel_block, false,
+                          in_used_heaps, avoid);
+        }
         LOG_WARNING(Render, "D3D12: CreatePlacedResource failed 0x{:08x}; using committed resource",
                     static_cast<u32>(placed_hr));
     }
 
+    // A committed resource takes a whole allocation of its own: the 4 KiB placement buys nothing.
+    desc.Alignment = 0;
     const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
     const auto create_committed = [&] {
         return device.Get()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
@@ -463,6 +733,21 @@ void TextureResourceAllocator::TrimEmptyHeaps(TrimMode mode) {
     }
 }
 
+std::vector<bool> TextureResourceAllocator::SparseHeaps(u32 max_used_percent) const {
+    std::scoped_lock lock{state->mutex};
+    std::vector<bool> sparse(state->blocks.size());
+    for (size_t index = 0; index < state->blocks.size(); ++index) {
+        const auto& block = state->blocks[index];
+        sparse[index] = block.heap && block.used != 0 &&
+                        block.used * 100 <= block.size * max_used_percent;
+    }
+    return sparse;
+}
+
+size_t TextureResourceAllocator::HeapOf(const Allocation& allocation) {
+    return allocation.block_index;
+}
+
 std::string TextureResourceAllocator::Report() const {
     std::scoped_lock lock{state->mutex};
     // Diagnostic: per class heaps, empty heaps, free bytes and largest free range.
@@ -478,18 +763,22 @@ std::string TextureResourceAllocator::Report() const {
         }
     }
     LOG_INFO(Render, "D3D12: heap frag tex n {} free {} empty {} max {} | rt n {} free {} empty {} "
-             "max {} | small rt n {} free {} empty {} max {} MiB, pending {} MiB",
+             "max {} | small rt n {} free {} empty {} max {} | transient rt n {} free {} empty {} "
+             "max {} MiB, pending {} MiB",
              count[0], free[0] / 1_MiB, empty[0] / 1_MiB, largest[0] / 1_MiB, count[1],
              free[1] / 1_MiB, empty[1] / 1_MiB, largest[1] / 1_MiB, count[2], free[2] / 1_MiB,
-             empty[2] / 1_MiB, largest[2] / 1_MiB, state->pending_bytes / 1_MiB);
-    return fmt::format("texture heaps {} MiB, live {} MiB, peak {} MiB, placed {}, fallback {}, trimmed {} ({} MiB), "
+             empty[2] / 1_MiB, largest[2] / 1_MiB, count[3], free[3] / 1_MiB, empty[3] / 1_MiB,
+             largest[3] / 1_MiB, state->pending_bytes / 1_MiB);
+    return fmt::format("texture heaps {} MiB, live {} MiB, peak {} MiB, placed {} (transient {}, 4 KiB {} saving "
+                       "{} MiB), fallback {}, trimmed {} ({} MiB), "
                        "growth recoveries {}, pressure waits {}, pressure heaps {}, "
-                       "avoided capacity {} MiB",
+                       "avoided capacity {} MiB, spare heaps {} made {} used",
                        state->heap_bytes / 1_MiB, state->live_bytes / 1_MiB,
-                       state->peak_bytes / 1_MiB, state->placed_resources,
+                       state->peak_bytes / 1_MiB, state->placed_resources, state->transient_placed,
+                       state->small_placed, state->small_saved_bytes / 1_MiB,
                        state->committed_fallbacks, state->trimmed_heaps, state->trimmed_bytes / 1_MiB,
                        state->growth_recoveries, state->pressure_waits, state->compact_heaps,
-                       state->avoided_capacity / 1_MiB);
+                       state->avoided_capacity / 1_MiB, state->spares_made, state->spare_hits);
 }
 
 std::string TextureResourceAllocator::Census(size_t top) const {

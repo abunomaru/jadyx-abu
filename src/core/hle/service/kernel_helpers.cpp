@@ -139,7 +139,7 @@ void ServiceContext::CloseEvent(Kernel::KEvent* event) {
 std::string ServiceContext::GetEventName(const Kernel::KEvent* event) {
     std::scoped_lock lk{event_names_mutex};
     const auto it = event_names.find(event);
-    return it == event_names.end() ? std::string{} : it->second;
+    return it == event_names.end() ? std::string{} : it->second.name;
 }
 
 } // namespace Service::KernelHelpers

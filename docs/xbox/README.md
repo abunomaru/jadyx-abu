@@ -36,11 +36,13 @@ en documentación histórica ya no son carpetas de entrega vigentes.
 - [Operaciones Fermi2D](xbox_fermi2d.md): diagnóstico 0.3.4.9 para identificar operación, ROP, superficies y ruta antes de corregir efectos.
 
 - [Rendimiento](xbox_performance.md): perfiles, optimizaciones y prioridades pendientes.
+- [Protocolo de rendimiento y estabilidad](xbox_perf_protocol.md): reglas, gate por título y checklist antes de fusionar.
+- [Cadena de cuadros y núcleo guest](xbox_frame_chain.md): present mailbox, vsync sin esperas, presupuesto de PSO, escrituras sin locks y tabla de lectura del JIT; todo de serie, claves `=0|1|check` para diagnóstico, resultados y qué mirar en el log.
 - [GPU de la Series](xbox_series_gpu.md): ocupacion, atomicos, division de grupos compute y como medir.
 - [Preparación y reutilización de PSO](xbox_pipeline_preparation.md): identidad host, trabajo único, residencia por fence y gates Game A.
 - [Preparación CPU de draws](xbox_draw_preparation.md): baseline Game D, metadata, samplers y subasignación de uniform buffers.
 - [Memoria de texturas](xbox_texture_memory.md): packing, readbacks, staging y comparación con Vulkan.
-- [Texturas servidas abajo](xbox_texture_downscale.md): `texture_scale` (candidato), política pura, límites y gates.
+- [Texturas servidas abajo](xbox_texture_downscale.md): `texture_scale`, retirado al sincronizar con Jadyx `main` (registro histórico).
 - [Alcance NX2](xbox_nx2_scope.md): qué costaría traer Switch 2 (Eglantine) al renderer D3D12.
 - [Jadyx + Eglantine](xbox_jadyx_eglantine.md): un solo appx Switch 1 + Switch 2; nadie ha portado Eglantine a Xbox (5 nov 2026); divergencia medida y fases.
 - [Comparación de ports](xbox_port_comparison.md): Jadyx, eden-xbox, NXbox, eglantine-xbox y EglantinePS5.

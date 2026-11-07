@@ -36,6 +36,19 @@ public:
         }
         pacer.Wait(buffer.frames);
     }
+    bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples) override {
+        return buffer.frames == TargetSampleCount && buffer.frames_played == 0 &&
+               !buffer.consumed && samples.size() == TargetSampleCount * 2;
+    }
+    bool IsReady() const override {
+        return true;
+    }
+    void Start(bool = false) override {
+        paused = false;
+    }
+    void Stop() override {
+        SignalPause();
+    }
     std::vector<s16> ReleaseBuffer(u64) override {
         return {};
     }

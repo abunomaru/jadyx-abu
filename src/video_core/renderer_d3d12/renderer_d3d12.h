@@ -105,6 +105,9 @@ public:
     [[nodiscard]] std::pair<u32, u32> ScreenSize() const {
         return {swapchain.Width(), swapchain.Height()};
     }
+    /// Presents at another size from now on. False keeps the current one. GPU thread only, while
+    /// the guest is paused.
+    [[nodiscard]] bool ResizeOutput(u32 width, u32 height);
     /// The last guest frame composited again without the HUD or the menu and read back, never
     /// presented. Empty when it is not a GPU image. GPU thread only, while the guest is paused.
     [[nodiscard]] MenuImage CaptureFrame();
@@ -171,7 +174,7 @@ private:
     /// Records the CPU-path copy of the upload image into frame.
     void RecordCopy(const StagingBufferRef& upload, PresentFrame& frame);
     /// Submits the recorded frame and hands it to the present manager.
-    void Present(FrameLease&& frame);
+    void Present(FrameLease&& frame, const PresentInfo& info = {});
     void CaptureGuestPresent(FrameLease& frame);
     /// Records a copy of frame into readback memory (before Present).
     StagingBufferRef RecordFrameReadback(PresentFrame& frame);
@@ -229,6 +232,8 @@ private:
     std::optional<MenuImage> game_menu;
     /// While CaptureFrame composites: the guest's image only, nothing drawn over it.
     bool bare_composite{};
+    /// The last composite went through FSR: frame generation stays off while FSR upscales.
+    bool last_composite_fsr{};
     std::vector<Tegra::FramebufferConfig> last_framebuffers;
     /// How many layers the last composited frame had, to log a change only once.
     size_t logged_layer_count{};

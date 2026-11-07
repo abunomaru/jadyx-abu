@@ -5,6 +5,7 @@
 
 #include <array>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "common/memory_ledger.h"
@@ -25,6 +26,9 @@ class GuestDescriptorQueue;
 
 /// Opt-in regular SSE2 stores for short uploads, for subsequently created runtimes.
 void SetUniformUploadCopy(bool enabled);
+/// Opt-in rebinding of a streamed uniform buffer whose bytes did not change within a submission,
+/// for subsequently created runtimes.
+void SetUniformReuse(bool enabled);
 
 class Buffer : public VideoCommon::BufferBase {
 public:
@@ -121,12 +125,18 @@ public:
     u64 CurrentTick();
     bool IsFree(u64 tick);
     void Wait(u64 tick);
+    /// Waits for a tick the work that wrote an NX2 command list page submits (BufferCache's list
+    /// reads). Wait already waits for another thread's submission instead of flushing its list.
+    void WaitSubmittedTick(u64 tick) { Wait(tick); }
     void Finish();
     u64 GetDeviceLocalMemory() const;
     u64 GetDeviceMemoryUsage() const;
     bool CanReportMemoryUsage() const { return true; }
     u32 GetUniformBufferAlignment() const { return D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT; }
     u32 GetStorageBufferAlignment() const { return 16; }
+    /// How far one storage buffer view may reach: kept at 512 MiB, well under the 2 GiB past
+    /// which AMD's driver has been seen to misread a single buffer.
+    u64 GetMaxStorageBufferRange() const { return u64{512} << 20; }
 
     StagingBufferRef UploadStagingBuffer(size_t size);
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
@@ -149,6 +159,13 @@ public:
     /// Index and vertex buffers are collected here and set by ApplyGeometry() right before the
     /// draw, so a flush between binding and drawing (descriptor ring or staging exhaustion)
     /// cannot leave the new command list without them.
+    /// The restart index of the next indexed draws, empty when restart is off.
+    void SetIndexRestart(std::optional<u32> value) noexcept { index_restart = value; }
+    /// The draw's inline indices, which live in no guest memory; empty for any other draw.
+    void SetInlineIndices(std::span<const u8> indices) noexcept {
+        inline_indices = indices;
+    }
+
     void BindIndexBuffer(PrimitiveTopology topology, IndexFormat format, u32 first,
                          u32 num_indices, Buffer& buffer, u32 offset, u32 size);
     /// Non-indexed quads are rewritten by EmulateTopology, like fans and loops.
@@ -173,6 +190,9 @@ public:
         return transform_feedback;
     }
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size);
+    /// Streams the guest bytes of a uniform buffer slot, or rebinds the copy streamed for the slot
+    /// earlier in this submission when they are the same. False: the caller streams them.
+    bool BindGuestUniformBuffer(size_t stage, u32 index, DAddr device_addr, u32 size);
     bool UseWriteCombinedUniformCopy(u32 size) const noexcept {
         return uniform_upload_copy && !trace_buffers && size <= 512;
     }
@@ -202,11 +222,17 @@ public:
     /// A new command list starts without an index buffer.
     void InvalidateGeometry() noexcept { applied_index.reset(); }
 
+    /// The index buffer ApplyGeometry set on the command list, if any.
+    [[nodiscard]] const std::optional<D3D12_INDEX_BUFFER_VIEW>& AppliedIndex() const noexcept {
+        return applied_index;
+    }
+
     [[nodiscard]] static bool IsEmulatedTopology(PrimitiveTopology topology) noexcept;
 
 private:
     /// Uploads indices to staging memory and binds them as a 32-bit or 16-bit index buffer.
     void BindRewrittenIndices(IndexRewriteCache::Entry& entry);
+    [[nodiscard]] bool NeedsRestartRewrite(IndexFormat format) const noexcept;
     ComPtr<ID3D12Resource> CreateDefaultBuffer(u64 size);
     void Copy(Buffer* dst, ID3D12Resource* dst_raw, Buffer* src, ID3D12Resource* src_raw,
               std::span<const VideoCommon::BufferCopy> copies);
@@ -225,13 +251,30 @@ private:
     std::array<D3D12_VERTEX_BUFFER_VIEW, VideoCommon::NUM_VERTEX_BUFFERS> pending_vertex{};
     UniformStream uniform_stream;
     bool uniform_upload_copy{};
+    /// What each uniform slot streamed last: its guest bytes (kept in cached memory, as the stream
+    /// is write-combined) and where they went. Valid for the tick they were streamed in.
+    struct StreamedUniform {
+        DAddr device_addr{};
+        u64 tick{};
+        D3D12_GPU_VIRTUAL_ADDRESS address{};
+        u32 size{};
+        u32 reach{};
+        std::vector<u8> bytes;
+    };
+    std::array<std::array<StreamedUniform, VideoCommon::NUM_GRAPHICS_UNIFORM_BUFFERS>,
+               VideoCommon::NUM_STAGES>
+        streamed_uniforms;
+    D3D12_GPU_VIRTUAL_ADDRESS last_uniform_address{};
+    bool uniform_reuse{};
     u32 pending_vertex_mask{};
     std::optional<u32> rewritten_count;
+    std::optional<u32> index_restart;
     std::array<TransformFeedbackBinding, 4> transform_feedback{};
     std::vector<u32> rewrite_scratch;
     IndexRewriteCache rewrite_cache;
     u64 next_buffer_id{1};
     std::vector<u8> guest_indices;
+    std::span<const u8> inline_indices;
     bool logged_rewrite{};
     bool logged_inline_rewrite{};
 };

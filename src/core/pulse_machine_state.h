@@ -68,7 +68,9 @@ inline Kernel::Svc::ThreadContext DecodeContext(std::span<const u8> input) {
     return context;
 }
 
-inline constexpr size_t ExclusiveStateSize = 136;
+// Core count and reserved word, then address, value and active flag per reservation slot.
+inline constexpr size_t ExclusiveStateSize =
+    8 + std::tuple_size_v<decltype(ExclusiveMonitorCheckpoint::reservations)> * 32;
 using EncodedExclusiveState = std::array<u8, ExclusiveStateSize>;
 
 inline void ValidateExclusiveState(const ExclusiveMonitorCheckpoint& state) {

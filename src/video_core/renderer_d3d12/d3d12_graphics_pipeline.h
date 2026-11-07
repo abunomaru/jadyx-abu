@@ -6,10 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -25,6 +29,7 @@
 #include "video_core/renderer_d3d12/d3d12_buffer_cache.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
+#include "video_core/renderer_d3d12/d3d12_dxil_disk_cache.h"
 #include "video_core/renderer_d3d12/d3d12_pso_cache.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_transition_order.h"
 #include "video_core/renderer_d3d12/d3d12_root_signature.h"
@@ -61,9 +66,45 @@ struct GraphicsPipelineCacheKey {
     u8 stencil_read_mask;        ///< D3D12 has one pair for both faces: the front one
     u8 stencil_write_mask;
     u8 strip_cut; ///< D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, from the index format
-    /// 1: the float samples apply the sampler table's MIN/MAX reduction (PipelineCache sets it for
-    /// the shaders seen with a filtered MIN/MAX sampler the device cannot create).
-    u8 emulate_reduction;
+    /// Bit 0 (SHADER_REDUCTION): the float samples apply the sampler table's MIN/MAX reduction
+    /// (PipelineCache sets it for the shaders seen with a filtered MIN/MAX sampler the device
+    /// cannot create). Bits 1-2 (SHADER_A2C_SHIFT): the fragment shader computes
+    /// alpha-to-coverage with this footprint (Shader::RuntimeInfo::alpha_to_coverage_footprint)
+    /// and the PSO does not. Bit 3 (SHADER_DEPTH_BIAS): the fragment shader adds the depth bias
+    /// (Shader::RuntimeInfo::depth_bias_in_shader) and the PSO has none.
+    /// Bits 4-7 (SAMPLE_MASK_SHIFT): samples 0-3 the guest's sample mask turns off at the first
+    /// position of its 2x2 footprint, the rest in state.sample_mask_rest. Zero keeps every sample,
+    /// so the keys of pipelines already on disk stay valid.
+    u8 shader_flags;
+    static constexpr u8 SHADER_REDUCTION = 1;
+    static constexpr u32 SHADER_A2C_SHIFT = 1;
+    static constexpr u8 SHADER_DEPTH_BIAS = 8;
+    static constexpr u32 SAMPLE_MASK_SHIFT = 4;
+
+    [[nodiscard]] u8 ShaderAlphaToCoverage() const noexcept {
+        return static_cast<u8>((shader_flags >> SHADER_A2C_SHIFT) & 3);
+    }
+
+    /// A mask that changes with the position needs the fragment shader: D3D12's has one value.
+    [[nodiscard]] bool SampleMaskInShader() const noexcept {
+        return state.sample_mask_rest != 0 && unique_hashes[5] != 0;
+    }
+
+    [[nodiscard]] UINT SampleMask() const noexcept {
+        return SampleMaskInShader() ? UINT_MAX : ~static_cast<UINT>(shader_flags >> SAMPLE_MASK_SHIFT);
+    }
+
+    /// Shader::RuntimeInfo::sample_mask_footprint.
+    [[nodiscard]] u16 SampleMaskFootprint() const noexcept {
+        if (!SampleMaskInShader()) {
+            return 0;
+        }
+        const u32 first = shader_flags >> SAMPLE_MASK_SHIFT;
+        const u32 rest = state.sample_mask_rest;
+        return static_cast<u16>(first | (first ^ (rest & 0xF)) << 4 |
+                                (first ^ ((rest >> 4) & 0xF)) << 8 |
+                                (first ^ ((rest >> 8) & 0xF)) << 12);
+    }
 
     size_t Hash() const noexcept;
 
@@ -132,6 +173,12 @@ struct PipelineBindings {
     /// Stages (bit per Configure stage, VS first) that sampled a float texture with a sampler whose
     /// MIN/MAX reduction is emulated while the pipeline does not emulate it. Draws filter normally.
     u8 unemulated_reduction_stages{};
+    /// In: the handle of the textures whose shader takes it per primitive (varying_handle).
+    u32 vertex_texture_handle{};
+    /// Per axis (u, v), the fragment stage's texture descriptors that MirrorBorderPass mirrors.
+    std::array<u32, 2> mirror_border_masks{};
+    /// Some are, while the pipeline was built without the pass.
+    bool unemulated_mirror_border{};
 };
 
 /// Textures whose samples EDEN_SPIRV_TO_DXIL_EMULATE_REDUCTION reduces: float, not cube.
@@ -158,6 +205,18 @@ public:
     /// Copies the rows to the staging stream; returns their address, or 0 if there are none.
     D3D12_GPU_VIRTUAL_ADDRESS Upload(BufferCache& buffer_cache) const;
 
+    [[nodiscard]] bool Empty() const noexcept {
+        return rows.empty();
+    }
+    [[nodiscard]] bool SameRows(const IntegerSamplerTable& other) const noexcept {
+        return num_bindings == other.num_bindings && rows.size() == other.rows.size() &&
+               std::equal(rows.begin(), rows.end(), other.rows.begin(),
+                          [](const auto& a, const auto& b) {
+                              return a.first == b.first &&
+                                     std::memcmp(&a.second, &b.second, sizeof(a.second)) == 0;
+                          });
+    }
+
 private:
     boost::container::small_vector<std::pair<u32, eden_integer_sampler_state>, 8> rows;
     u32 num_bindings{};
@@ -169,12 +228,56 @@ private:
 /// The PSO, the driver's compiled pipeline and by far its largest part, is resident only while it
 /// is drawn (PipelineResidencyPolicy): a dormant pipeline keeps its DXIL, and Wake builds the PSO
 /// again from it.
+/// Draws reuse the views and samplers a stage resolved in the pipeline's last draw while it reads
+/// the same handles from unchanged descriptor table entries (boot.cfg "stage_view_cache=1").
+void SetStageViewCache(bool enabled);
+
+/// Draws that bind the same views and samplers as the pipeline's last draw, under the same
+/// binding stamp and depth target, take its texture descriptors, prepare flags, reduction bits
+/// and integer sampler rows instead of resolving each texture again (boot.cfg
+/// "texture_replay=1"; "=check" binds in full and logs every replay that would have differed).
+enum class TextureReplayMode : u8 { Off, On, Check };
+void SetTextureReplay(TextureReplayMode mode);
+
+/// How a pipeline's color equations share D3D12's single blend constant. Mixing constant color
+/// and constant alpha leaves it to the destination factors; the fragment shader applies the source
+/// factors that read the other one.
+struct BlendConstantPlan {
+    bool hardware_alpha{}; ///< The constant holds the guest's alpha in all four channels.
+    std::array<Shader::BlendConstantFactor, 8> shader_factors{};
+
+    [[nodiscard]] bool InShader() const noexcept {
+        return std::ranges::any_of(shader_factors, [](Shader::BlendConstantFactor factor) {
+            return factor != Shader::BlendConstantFactor::None;
+        });
+    }
+};
+
+[[nodiscard]] BlendConstantPlan PlanBlendConstants(const Vulkan::FixedPipelineState& state);
+
+/// What the draws of a pipeline that emulates tessellation (Shader::TessellationEmulation) size
+/// and dispatch its passes with. Zero output_vertices: the pipeline does not emulate it.
+struct TessEmulationPlan {
+    u32 input_vertices{};      ///< Patch control points.
+    u32 output_vertices{};     ///< Control shader invocations per patch.
+    u32 input_vertex_bytes{};  ///< Stride of a captured vertex.
+    u32 record_words{};        ///< Words of a patch record (TessellationEmulation::RecordWords).
+    u32 patches_per_group{};   ///< Patches per control shader group.
+    u32 domain{};              ///< d3d12_tessellate.comp: isolines 0, triangles 1, quads 2.
+    u32 partitioning{};        ///< d3d12_tessellate.comp: odd 0, even 1, integer 2.
+    bool ccw{};                ///< Triangles wind counterclockwise.
+
+    [[nodiscard]] bool Active() const noexcept {
+        return output_vertices != 0;
+    }
+};
+
 class GraphicsPipeline {
 public:
     enum class State : u8 {
         Building, ///< DXIL or PSO being built on a worker.
         Ready,    ///< PSO built, or the pipeline failed (Handle() null): drawable or skipped.
-        Dormant,  ///< DXIL kept, no PSO: Wake builds it.
+        Dormant,  ///< No PSO, DXIL kept or on disk: Wake builds it.
     };
 
     static constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
@@ -184,6 +287,13 @@ public:
     struct LinkedDxil {
         DxilStages stages;
         std::vector<D3D12_SO_DECLARATION_ENTRY> stream_output;
+        /// The disk cache record the stages can be read back from, if any.
+        std::optional<DxilDiskCache::Key> disk_key;
+        /// Emulated tessellation (TessEmulationPlan): the vertex shader alone, storing to the
+        /// capture, and the control shader as compute. stages then holds the
+        /// evaluation shader as the vertex stage, and no hull or domain stage.
+        std::vector<u8> tess_capture;
+        std::vector<u8> tess_control;
     };
     using SharedDxilStages = std::shared_ptr<const LinkedDxil>;
     /// (trace id, flatten the vertex stage's branches) -> linked DXIL.
@@ -196,7 +306,8 @@ public:
                      const GraphicsPipelineCacheKey& key, CompileDxil compile_dxil,
                      const std::array<const Shader::Info*, NUM_STAGES>& infos,
                      const PipelineLayout& layout, bool build_pso = true,
-                     GraphicsPsoCache* pso_cache = nullptr, u32 lower_noperspective_mask = 0);
+                     GraphicsPsoCache* pso_cache = nullptr, u32 lower_noperspective_mask = 0,
+                     const TessEmulationPlan& tess_plan = {});
     ~GraphicsPipeline();
 
     GraphicsPipeline(const GraphicsPipeline&) = delete;
@@ -222,10 +333,27 @@ public:
         return build_state.load(std::memory_order::acquire) == State::Dormant;
     }
 
+    /// GPU thread: the frame before which a pipeline whose PSO ran out of memory is not woken
+    /// again; its draws are skipped until then.
+    [[nodiscard]] u64 RetryFrame() const noexcept {
+        return retry_frame;
+    }
+    void SetRetryFrame(u64 frame) noexcept {
+        retry_frame = frame;
+    }
+    /// GPU thread, while dormant: whether the last build ran out of memory, cleared on read.
+    [[nodiscard]] bool TakeOutOfMemory() noexcept {
+        return std::exchange(out_of_memory, false);
+    }
+
     /// Blocks until the PSO is built. A build still in its worker's queue is claimed and run on
     /// the calling thread instead: the GPU thread runs at a higher priority than the workers and
-    /// would otherwise wait for the queue ahead of it too. A dormant pipeline must be woken first.
+    /// would otherwise wait for the queue ahead of it too. A dormant pipeline must be woken first;
+    /// one whose PSO ran out of memory is dormant again when this returns.
     void WaitBuilt();
+    /// Waits for the worker up to this long and never takes the build over: a driver build cannot
+    /// be cut short once it runs here. True when it is no longer building.
+    [[nodiscard]] bool WaitBuiltFor(u64 microseconds);
 
     /// GPU thread: a dormant pipeline queues the build of its PSO from the kept DXIL. False if it
     /// was not dormant.
@@ -249,9 +377,19 @@ public:
         return prewarmed;
     }
 
-    /// GPU thread: releases the PSO of a ready pipeline once the GPU is done with it, keeping the
-    /// DXIL to build it again. Pipelines that failed have nothing to release. True if released.
+    /// GPU thread: releases the PSO of a ready pipeline once the GPU is done with it, and its DXIL
+    /// when Wake can read it back from disk. Pipelines that failed have nothing to release. True
+    /// if released.
     bool Evict(Scheduler& scheduler);
+
+    /// Dormant pipelines' DXIL dropped and read back from disk so far, and read-backs that failed.
+    struct DxilReleaseStats {
+        u64 released;
+        u64 released_bytes;
+        u64 reloaded;
+        u64 failed;
+    };
+    [[nodiscard]] static DxilReleaseStats GetDxilReleaseStats() noexcept;
 
     /// GPU thread: the frame this pipeline was last drawn in.
     void Touch(u64 frame) noexcept {
@@ -278,6 +416,18 @@ public:
 
     [[nodiscard]] const PipelineLayout& Layout() const noexcept {
         return layout;
+    }
+
+    [[nodiscard]] const TessEmulationPlan& TessPlan() const noexcept {
+        return tess_plan;
+    }
+    /// With TessPlan().Active(): the capture PSO (vertex shader and stream output) and the control
+    /// compute PSO, both built with Handle(), both null when it is.
+    [[nodiscard]] ID3D12PipelineState* TessCaptureHandle() const noexcept {
+        return tess_capture_state.Get();
+    }
+    [[nodiscard]] ID3D12PipelineState* TessControlHandle() const noexcept {
+        return tess_control_state.Get();
     }
     /// Words per lane of the local memory pool the fragment stage uses, or 0 without it.
     [[nodiscard]] u32 LocalMemoryScratchWords() const noexcept {
@@ -315,14 +465,41 @@ public:
         return depth_bounds;
     }
 
-    /// The color equations read only the blend constant's alpha (constant-alpha factors), so
-    /// the draw sets the D3D12 blend factor to the guest's alpha in all four channels.
+    /// The D3D12 blend factor serves constant-alpha factors, so the draw sets it to the guest's
+    /// alpha in all four channels.
     [[nodiscard]] bool BlendConstantAlpha() const noexcept {
-        return blend_constant_alpha;
+        return blend_constants.hardware_alpha;
     }
+
+    /// The fragment shader reads the blend constant, so the draw sets it in the root constants.
+    [[nodiscard]] bool ShaderBlendConstants() const noexcept {
+        return blend_constants.InShader();
+    }
+
+    /// This pipeline culling one face instead of as the guest asked, built the first time a draw
+    /// needs it (draws whose faces use different stencil state). The one culling front faces
+    /// draws the back ones, with the back-face stencil masks given (D3D12 has one pair for both
+    /// faces and the key holds the front one). Null if it cannot be built.
+    [[nodiscard]] ID3D12PipelineState* CulledHandle(D3D12_CULL_MODE mode, u8 back_read_mask = 0,
+                                                    u8 back_write_mask = 0);
 
     [[nodiscard]] u32 LoweredNoPerspectiveMask() const noexcept {
         return lower_noperspective_mask;
+    }
+
+    /// The vertex attribute a fragment shader's texture handle comes from, passed through flat by
+    /// the vertex shader: each run of primitives with one handle is a draw of its own.
+    struct VertexTextureHandle {
+        u32 attribute{};
+        u32 component{};
+    };
+
+    void SetVertexTextureHandle(const std::optional<VertexTextureHandle>& source) noexcept {
+        vertex_texture_handle = source;
+    }
+
+    [[nodiscard]] const std::optional<VertexTextureHandle>& GetVertexTextureHandle() const noexcept {
+        return vertex_texture_handle;
     }
 
     /// How the fragment shader keeps the helper lanes of its derivatives, for draw traces.
@@ -334,6 +511,15 @@ public:
 
     void SetFragmentHelpers(const FragmentHelpers& helpers) noexcept {
         fragment_helpers = helpers;
+    }
+
+    /// Whether the pipeline draws through a geometry shader generated for state D3D12 lacks.
+    void SetGeneratesGeometry(bool value) noexcept {
+        generates_geometry = value;
+    }
+
+    [[nodiscard]] bool GeneratesGeometry() const noexcept {
+        return generates_geometry;
     }
 
     [[nodiscard]] const FragmentHelpers& GetFragmentHelpers() const noexcept {
@@ -360,6 +546,12 @@ private:
     /// flatten_on_fault: on a driver fault, leave the failure to the caller (flatten_retry) instead
     /// of reporting it, since it can retranslate the shaders.
     void Build(bool flatten_on_fault = false);
+    /// Creates the capture and control pipelines of an emulated tessellation; false if refused.
+    bool BuildTessEmulation(std::span<const D3D12_INPUT_ELEMENT_DESC> elements);
+    /// Drops dxil when its disk cache record can stand in for it (no stream output).
+    void ReleaseDxil();
+    /// Reads back the DXIL ReleaseDxil dropped. False if it could not.
+    bool ReloadDxil();
     D3D12_GRAPHICS_PIPELINE_STATE_DESC Describe(std::vector<D3D12_INPUT_ELEMENT_DESC>& elements) const;
 
     void Publish(State next);
@@ -382,7 +574,10 @@ private:
     const u64 key_hash;
     const PipelineLayout& layout;
     const u32 lower_noperspective_mask;
+    const TessEmulationPlan tess_plan;
     FragmentHelpers fragment_helpers{};
+    std::optional<VertexTextureHandle> vertex_texture_handle;
+    bool generates_geometry{};
     SharedDxilStages dxil; ///< Immutable linked bytecode shared across fixed-state PSOs.
     std::array<bool, NUM_STAGES> has_stage{};
     std::array<std::shared_ptr<const StageBindings>, NUM_STAGES> stage_infos;
@@ -393,10 +588,11 @@ private:
     bool has_images{};
     u32 local_memory_scratch_words{};
     bool flatten_retry{};    ///< Build(true) hit a driver fault: retry with flattened branches.
+    bool out_of_memory{};    ///< The last Build() ran out of memory: published dormant.
     bool flattened_vertex{}; ///< dxil holds the flattened vertex stage.
     u8 bound_color_targets{}; ///< Computed once from the immutable PSO write masks.
     bool depth_bounds{};
-    bool blend_constant_alpha{};
+    BlendConstantPlan blend_constants{};
     /// Guest transform feedback buffer strides, for the stream output declaration.
     std::array<UINT, Maxwell::NumTransformFeedbackBuffers> stream_output_strides{};
 
@@ -405,6 +601,11 @@ private:
     std::vector<u32> transition_order;
 
     ComPtr<ID3D12PipelineState> pipeline_state;
+    ComPtr<ID3D12PipelineState> cull_back_state;
+    /// Back faces only, one per pair of back-face stencil masks (read | write << 8).
+    std::vector<std::pair<u16, ComPtr<ID3D12PipelineState>>> cull_front_states;
+    ComPtr<ID3D12PipelineState> tess_capture_state;
+    ComPtr<ID3D12PipelineState> tess_control_state;
     GraphicsPsoCache* const pso_cache;
     SharedGraphicsPso shared_pso;
 
@@ -417,7 +618,19 @@ private:
     u64 last_used_frame{}; ///< GPU thread only.
     bool drawn{};          ///< GPU thread only.
     bool evicted{};        ///< GPU thread only.
+    u64 retry_frame{};     ///< GPU thread only.
+    /// Where the DXIL dropped by ReleaseDxil is read back from, and which stages it holds.
+    std::optional<DxilDiskCache::Key> released_dxil;
+    u8 released_stage_mask{};
     bool prewarmed{};      ///< GPU thread only.
+    /// What each stage resolved its views and samplers to in the last draw (stage_view_cache=1),
+    /// allocated by the first draw that uses it. GPU thread only.
+    struct StageViewState;
+    std::unique_ptr<StageViewState> stage_views;
+    /// What the last draw bound per texture (texture_replay), allocated by the first draw that
+    /// uses it. GPU thread only.
+    struct TextureReplayState;
+    std::unique_ptr<TextureReplayState> texture_replay;
     /// The object itself. Its DXIL and stage bindings are shared with other pipelines.
     Common::MemoryCharge charge{Common::MemoryAccount::Pipelines, sizeof(GraphicsPipeline)};
 };

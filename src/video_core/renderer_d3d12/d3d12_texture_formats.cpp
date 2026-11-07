@@ -3,12 +3,14 @@
 
 #include "video_core/renderer_d3d12/d3d12_texture_cache_internal.h"
 
+#include <algorithm>
 #include <optional>
 
 #include "common/settings.h"
 #include "video_core/renderer_d3d12/d3d12_blit_image.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
+#include "video_core/texture_cache/util.h"
 
 // DXGI formats of guest pixel formats and the Maxwell -> D3D12 sampler and view enums.
 
@@ -121,6 +123,31 @@ FormatInfo AstcFormat(PixelFormat format, Settings::AstcRecompression recompress
     return info;
 }
 
+FormatInfo AstcFormatFor(const VideoCommon::ImageInfo& info) {
+    if (VideoCommon::AstcAlphaMaskFor(info) == VideoCommon::AstcMask::None) {
+        return AstcFormat(info.format, VideoCommon::AstcRecompressionFor(info));
+    }
+    // Alpha masks keep only their alpha, in BC4's red; views put it back (AstcMaskSwizzle).
+    // Alpha has no sRGB curve, so neither does the view.
+    FormatInfo format{};
+    format.converted = true;
+    format.resource = DXGI_FORMAT_BC4_TYPELESS;
+    format.view = DXGI_FORMAT_BC4_UNORM;
+    format.srv = format.view;
+    format.copy_format = PixelFormat::BC4_UNORM;
+    return format;
+}
+
+void AstcMaskSwizzle(VideoCommon::AstcMask mask,
+                     std::array<Tegra::Texture::SwizzleSource, 4>& swizzle) {
+    using enum Tegra::Texture::SwizzleSource;
+    const Tegra::Texture::SwizzleSource color =
+        mask == VideoCommon::AstcMask::White ? OneFloat : Zero;
+    std::ranges::transform(swizzle, swizzle.begin(), [color](Tegra::Texture::SwizzleSource s) {
+        return s == R || s == G || s == B ? color : s == A ? R : s;
+    });
+}
+
 /// No ETC2/EAC in D3D12: the CPU decodes them on upload (VideoCommon::ConvertImage). Color to
 /// RGBA8; EAC to 16-bit channels, which keep all 11 bits where 8-bit ones would band.
 FormatInfo Etc2Format(PixelFormat format) {
@@ -159,6 +186,17 @@ FormatInfo NativeFormat(PixelFormat format) {
     }
     if (VideoCore::Surface::IsPixelFormatETC2(format)) {
         return Etc2Format(format);
+    }
+    // No DXGI layout has these bits: the CPU widens them on upload (VideoCommon::ConvertImage).
+    if (format == PixelFormat::A5B5G5R1_UNORM) {
+        return FormatInfo{.resource = DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                          .view = DXGI_FORMAT_R8G8B8A8_UNORM, .srv = DXGI_FORMAT_R8G8B8A8_UNORM,
+                          .converted = true, .copy_format = PixelFormat::A8B8G8R8_UNORM};
+    }
+    if (format == PixelFormat::G4R4_UNORM) {
+        return FormatInfo{.resource = DXGI_FORMAT_R8G8_TYPELESS, .view = DXGI_FORMAT_R8G8_UNORM,
+                          .srv = DXGI_FORMAT_R8G8_UNORM, .converted = true,
+                          .copy_format = PixelFormat::R8G8_UNORM};
     }
     // Formats without a DXGI mapping yet: keep an image so the cache works, never transfer data
     // into it (its bytes would not match the resource layout).

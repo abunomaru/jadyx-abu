@@ -7,6 +7,7 @@
 #include <utility>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include "common/common_types.h"
 #include "common/fiber.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/random.h"
 #include "core/core.h"
@@ -40,6 +42,7 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_types.h"
+#include "core/hle/kernel/thread_startup_policy.h"
 #include "core/hle/result.h"
 #include "core/memory.h"
 
@@ -364,6 +367,11 @@ namespace Kernel {
             KScopedSchedulerLock sl(kernel);
             m_checkpoint_wait_queue->AbandonCheckpointWait(kernel, this);
         }
+        for (KThread* thread : m_pending_started_threads) {
+            thread->Close(kernel);
+        }
+        m_pending_started_threads.clear();
+
         // If the thread has an owner process, unregister it.
         if (m_parent != nullptr) {
             m_parent->UnregisterThread(kernel, this);
@@ -1365,6 +1373,55 @@ namespace Kernel {
         }
 
         return this->GetState();
+    }
+
+    void KThread::RecordStartupThread(KernelCore& kernel, KThread* thread) {
+        ASSERT(this == GetCurrentThreadPointer(kernel));
+        ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel));
+        thread->Open(kernel);
+        m_pending_started_threads.push_back(thread);
+    }
+
+    void KThread::WaitForStartupThreads(KernelCore& kernel) {
+        ASSERT(this == GetCurrentThreadPointer(kernel));
+        if (m_pending_started_threads.empty()) {
+            return;
+        }
+        SCOPE_EXIT {
+            for (KThread* thread : m_pending_started_threads) {
+                thread->Close(kernel);
+            }
+            m_pending_started_threads.clear();
+        };
+
+        // MTF passes stack-backed arguments to lower-priority workers. Near-instant HLE
+        // replies can preempt them before they consume those arguments. Give only this
+        // startup cohort guest sleep slices, with one shared host-time budget.
+        const auto start = std::chrono::steady_clock::now();
+        size_t sleeps = 0;
+        bool interrupted = false;
+        for (KThread* thread : m_pending_started_threads) {
+            while (!interrupted) {
+                bool wait;
+                {
+                    KScopedSchedulerLock sl{kernel};
+                    wait = ShouldWaitForStartup(
+                        thread->GetState() == ThreadState::Runnable,
+                        thread->GetWaitingLockInfo() != nullptr,
+                        IsTerminationRequested() || thread->IsTerminationRequested(),
+                        std::chrono::steady_clock::now() - start);
+                }
+                if (!wait) {
+                    break;
+                }
+                ++sleeps;
+                interrupted = R_FAILED(Sleep(
+                    kernel, kernel.HardwareTimer().GetTick() + StartupSleepNanoseconds));
+            }
+        }
+        LOG_INFO(Kernel, "MTF startup worker grace: workers={}, sleeps={}, budget_expired={}",
+                 m_pending_started_threads.size(), sleeps,
+                 std::chrono::steady_clock::now() - start >= StartupGraceLimit);
     }
 
     Result KThread::Sleep(KernelCore& kernel, s64 timeout) {

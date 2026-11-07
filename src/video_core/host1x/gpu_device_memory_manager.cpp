@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/device_memory_manager.inc"
+#include "video_core/gpu_written_pages.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -16,6 +17,16 @@ struct MaxwellDeviceMethods {
     static inline void MarkRegionReadTrap(Core::Memory::Memory* interface, VAddr address,
                                           size_t size) {
         interface->RasterizerArmReadTraps(address, size);
+    }
+
+    /// jit_read_table: whether the GPU may have written device memory.
+    static inline bool IsGpuWritten(DAddr address, size_t size) {
+        return VideoCommon::GpuWrittenPages::AnyMarked(address, size);
+    }
+
+    static inline void MarkRegionGpuWritten(Core::Memory::Memory* interface, VAddr address,
+                                            size_t size) {
+        interface->RasterizerMarkRegionGpuWritten(address, size);
     }
 };
 

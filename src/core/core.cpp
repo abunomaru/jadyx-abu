@@ -12,6 +12,7 @@
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -23,7 +24,9 @@
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/debugger/debugger.h"
+#include "core/debugger/nx2_debug_tools.h"
 #include "core/device_memory.h"
+#include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/nup_container.h"
@@ -75,6 +78,9 @@
 namespace Core {
 
 std::atomic<u64> g_nx2_present_count{};
+static_assert(std::atomic<u64>::is_always_lock_free);
+std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
+std::atomic<u32> g_nx2_present_time_services{};
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
@@ -139,6 +145,21 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
                metadata.IsSwitch2();
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
+    if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
+        const FileSys::XCI xci{file, program_id, program_index};
+        if (xci.GetStatus() != Loader::ResultStatus::Success) {
+            return false;
+        }
+        const auto partition = xci.GetSecurePartitionNSP();
+        const auto program = partition != nullptr
+                                 ? partition->GetNCA(xci.GetProgramTitleID(),
+                                                     FileSys::ContentRecordType::Program)
+                                 : nullptr;
+        const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
+               metadata.IsSwitch2();
+    }
     if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
         const FileSys::NSP nsp{file, program_id, program_index};
         if (nsp.GetStatus() != Loader::ResultStatus::Success) {
@@ -173,7 +194,6 @@ struct System::Impl {
         device_memory.emplace();
 
         is_multicore = Settings::values.use_multi_core.GetValue();
-        extended_memory_layout = Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_4Gb;
         memory_layout = Settings::values.memory_layout_mode.GetValue();
 
         core_timing.SetMulticore(is_multicore);
@@ -201,8 +221,6 @@ struct System::Impl {
         const bool must_reinitialize =
             !device_memory.has_value() ||
             is_multicore != Settings::values.use_multi_core.GetValue() ||
-            extended_memory_layout != (Settings::values.memory_layout_mode.GetValue() !=
-                                       Settings::MemoryLayout::Memory_4Gb) ||
             // The DRAM backing is sized for the layout: a Switch 2 program moves a 6/8/10 GiB
             // configuration to 12 GiB (Load), which "extended or not" alone did not notice.
             memory_layout != Settings::values.memory_layout_mode.GetValue();
@@ -214,8 +232,7 @@ struct System::Impl {
         LOG_DEBUG(Kernel, "Re-initializing");
 
         is_multicore = Settings::values.use_multi_core.GetValue();
-        extended_memory_layout =
-            Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_4Gb;
+        memory_layout = Settings::values.memory_layout_mode.GetValue();
 
         Initialize(system);
     }
@@ -385,6 +402,14 @@ struct System::Impl {
                                               : Common::WallClock::CNTFRQ;
         Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
         LOG_INFO(Core, "Guest counter frequency: {} Hz", cntfrq);
+        // The guest clocks derive from the host TSC calibration (or the OS clock). A wrong rate
+        // there skews every guest timer by a constant factor (#105), so record what was measured:
+        // tsc vs the CPUID base/max frequency is a sanity check at a glance.
+#ifdef ARCHITECTURE_x86_64
+        LOG_INFO(Core, "Host clock: tsc {} Hz, cpu base {} MHz, max {} MHz, invariant {}",
+                 Common::g_cpu_caps.tsc_frequency, Common::g_cpu_caps.base_frequency,
+                 Common::g_cpu_caps.max_frequency, Common::g_cpu_caps.invariant_tsc);
+#endif
 
         InitializeKernel(system);
 
@@ -478,10 +503,13 @@ struct System::Impl {
             game_info.version = title_version;
             room_member->SendGameInfo(game_info);
         }
+        debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
+        Nx2Sampler::StartFromEnvironment();
         return SystemResultStatus::Success;
     }
 
     void ShutdownMainProcess() {
+        debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
 
@@ -619,10 +647,11 @@ struct System::Impl {
     /// The layout the DRAM backing (device_memory) was sized for.
     Settings::MemoryLayout memory_layout{Settings::MemoryLayout::Memory_4Gb};
     bool is_multicore : 1 = false;
-    bool extended_memory_layout : 1 = false;
     bool exit_locked : 1 = false;
     bool exit_requested : 1 = false;
     bool nvdec_active : 1 = false;
+    /// EDEN_NX2_DEBUG_SERVER; the last member, so it stops before anything it reads goes away.
+    std::unique_ptr<Nx2Debug::Service> debug_service;
 
     void EnsureGeneralChannelInitialized(System& system) {
         if (!general_channel_event) {

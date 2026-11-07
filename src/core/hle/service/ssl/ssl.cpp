@@ -629,7 +629,7 @@ public:
         } else if (kind == "ssl:ISslContext") {
             SslVersion version{};
             version.raw = in.U32();
-            service = std::make_shared<ISslContext>(system, version);
+            service = std::make_shared<ISslContext>(system, version, false);
         } else {
             return nullptr;
         }

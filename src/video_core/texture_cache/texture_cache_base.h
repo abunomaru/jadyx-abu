@@ -48,6 +48,7 @@
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
+#include "video_core/textures/unswizzle_worker.h"
 
 namespace Tegra {
 namespace Control {
@@ -61,6 +62,25 @@ using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::PixelFormat;
 using namespace Common::Literals;
+
+/// Draws whose render target registers are clean skip preparing the bound attachments again while
+/// no image changed in a way that preparing them would act on (default; boot.cfg "rt_early_out=0"
+/// prepares them on every draw).
+void SetRenderTargetEarlyOut(bool enabled) noexcept;
+[[nodiscard]] bool RenderTargetEarlyOut() noexcept;
+
+/// What graphics image views and samplers resolved from the descriptor tables depend on beyond
+/// the table entries themselves. Equal stamps mean an entry that still holds the same descriptor
+/// resolves to the same, already prepared, view and sampler.
+struct GraphicsBindingStamp {
+    u64 epoch{};    ///< image changes that preparing a view acts on (uploads, aliases, deletions)
+    u64 frame{};    ///< frame tick, for the LRU touch of the images
+    u64 bindings{}; ///< table addresses and limits
+    u64 tables{};   ///< graphics table entries read with a new descriptor
+    const void* channel{};
+
+    bool operator==(const GraphicsBindingStamp&) const = default;
+};
 
 /// Depth targets at a mip level of an existing mipmapped image render into that level (default)
 /// instead of a separate aliased image. Boot.cfg "mip_rt=0" turns it off to reproduce the alias
@@ -170,7 +190,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
-    bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+    bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -280,6 +300,8 @@ public:
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
+    [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
+
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
 
@@ -295,6 +317,20 @@ public:
     /// Refresh the state for graphics/compute image view and sampler descriptors
     void SynchronizeDescriptors(bool compute);
 
+    /// See GraphicsBindingStamp. Call after SynchronizeDescriptors(false).
+    [[nodiscard]] GraphicsBindingStamp CurrentGraphicsBindingStamp() const noexcept {
+        return {binding_epoch, frame_tick, texture_bindings_serial, graphics_table_generation,
+                channel_state};
+    }
+
+    /// True when graphics TIC (TSC) entry index was read before and still holds that descriptor.
+    [[nodiscard]] bool GraphicsImageEntryMatches(u32 index) const noexcept {
+        return channel_state->graphics_image_table.Matches(*gpu_memory, index);
+    }
+    [[nodiscard]] bool GraphicsSamplerEntryMatches(u32 index) const noexcept {
+        return channel_state->graphics_sampler_table.Matches(*gpu_memory, index);
+    }
+
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
     bool RescaleRenderTargets();
@@ -303,9 +339,19 @@ public:
     /// @param is_clear True when the render targets are being used for clears
     void UpdateRenderTargets(bool is_clear);
 
+private:
+    /// Records whether the attachments UpdateRenderTargets just prepared may skip it next time.
+    void RecordPreparedRenderTargets();
+
+public:
+
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
+
+    [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
+        return render_targets;
+    }
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
@@ -335,12 +381,12 @@ public:
                    const Tegra::Engines::Fermi2D::Config& copy);
 
     /// Stand-in for a DLSS evaluation: temporal upscale of src into dst (see the runtime's
-    /// TemporalUpscale). False when the images cannot take it; the caller then blits.
+    /// TemporalUpscale). False when unsupported; the caller retains its native dispatch.
     bool TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& dst,
                          const Tegra::Engines::Fermi2D::Surface& src,
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+                         std::array<f32, 2> motion_scale, bool use_history);
 
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
@@ -612,11 +658,19 @@ private:
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
 
+    /// Returns true if the current clear's render area and scissor cover a width x height image
+    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 
     bool ImageCanRescale(ImageBase& image);
     void InvalidateScale(Image& image);
+    /// Drops every view of the image and the framebuffers using them; they are made again on
+    /// next use, from the image's current resource.
+    void ReleaseImageViews(Image& image);
+    /// Moves images the GC kept in sparse heaps into fuller ones, within the runtime's budget.
+    void CompactSparseHeaps();
     bool ScaleUp(Image& image);
     bool ScaleDown(Image& image);
     u64 GetScaledImageSizeBytes(const ImageBase& image);
@@ -643,9 +697,18 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+    u64 graphics_table_generation = 0;
+    u64 binding_epoch = 0;
+    /// The attachments prepared by the last UpdateRenderTargets, under RenderTargetEarlyOut: preparing
+    /// them again is a no-op while binding_epoch and frame_tick stay the same.
+    bool rt_prepared_valid = false;
+    u64 rt_prepared_epoch = 0;
+    u64 rt_prepared_frame = 0;
+    const void* rt_prepared_engine = nullptr;
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
+    bool feedback_depth_dirty = true;
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 
@@ -662,6 +725,9 @@ private:
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
+    /// skip the upload of a new target the clear overwrites whole.
+    bool clearing_render_targets = false;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
@@ -732,6 +798,7 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
@@ -739,6 +806,14 @@ private:
     u64 reclaimed_overlaps = 0;
     std::array<u64, 6> diag_join{};
     std::array<u64, 4> diag_gc{};
+    /// Readbacks per frame the sparse heap pass may start for render targets it evicts.
+    static constexpr size_t SPARSE_GC_DOWNLOADS = 2;
+    u64 diag_sparse_evicted = 0;
+    /// An image the GC evicted that the guest asks for again soon after is a reload: its
+    /// upload is paid twice. Counts and bytes measure what a smarter eviction order could save.
+    static constexpr u64 GC_RELOAD_WINDOW = 600;
+    std::unordered_map<GPUVAddr, u64> gc_evicted_at; ///< address -> frame it was evicted
+    std::array<u64, 2> diag_reload{};
 
     struct ChurnAddress {
         u32 creates = 0;

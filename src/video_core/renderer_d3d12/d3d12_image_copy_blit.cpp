@@ -4,6 +4,7 @@
 #include "video_core/renderer_d3d12/d3d12_texture_cache_internal.h"
 
 #include <algorithm>
+#include <iterator>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -14,6 +15,7 @@
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
 #include "video_core/diagnostics/full_capture.h"
 #include "video_core/surface.h"
+#include "video_core/texture_cache/samples_helper.h"
 
 // Image to image copies and blits.
 
@@ -43,6 +45,18 @@ bool CoversSubresources(const Image& dst, const Image& src, const ImageCopy& cop
            covers(dst, copy.dst_subresource.base_level, copy.dst_offset);
 }
 
+/// Whether the shader path can draw src into dst: floats into floats, or integers into integers of
+/// the same signedness (the integer shaders move the bits; nothing converts between the two).
+bool IntegerBlitCompatible(VideoCore::Surface::PixelFormat src, VideoCore::Surface::PixelFormat dst) {
+    using VideoCore::Surface::IsPixelFormatInteger;
+    using VideoCore::Surface::IsPixelFormatSignedInteger;
+    if (IsPixelFormatInteger(src) != IsPixelFormatInteger(dst)) {
+        return false;
+    }
+    return !IsPixelFormatInteger(src) ||
+           IsPixelFormatSignedInteger(src) == IsPixelFormatSignedInteger(dst);
+}
+
 /// Diagnostic capture: an image copy the runtime drops.
 void CaptureCopySkip(const Image& dst, const Image& src, std::string_view reason) {
     if (!VideoCommon::FullCapture::Active()) return;
@@ -54,6 +68,21 @@ void CaptureCopySkip(const Image& dst, const Image& src, std::string_view reason
 } // namespace
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src, std::span<const ImageCopy> copies) {
+    if (src.LevelBias() != 0 || dst.LevelBias() != 0) {
+        // Levels left out of a resource (SetAstcDropTopLevel) have nothing to copy.
+        const auto kept_level = [&](const ImageCopy& copy) {
+            return copy.src_subresource.base_level >= static_cast<s32>(src.LevelBias()) &&
+                   copy.dst_subresource.base_level >= static_cast<s32>(dst.LevelBias());
+        };
+        if (!std::ranges::all_of(copies, kept_level)) {
+            boost::container::small_vector<ImageCopy, 16> kept;
+            std::ranges::copy_if(copies, std::back_inserter(kept), kept_level);
+            if (!kept.empty()) {
+                CopyImage(dst, src, kept);
+            }
+            return;
+        }
+    }
     if (std::ranges::any_of(copies, [](const ImageCopy& copy) { return copy.extent_in_blocks; })) {
         // Normalize only alias copies. Guessing units from alignment would corrupt ordinary
         // partial texel copies and silently under-copy aligned alias extents.
@@ -85,8 +114,14 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src, std::span<const Imag
         return;
     }
     if (&dst == &src) {
-        // Whole-resource state tracking cannot hold COPY_SOURCE and COPY_DEST at once.
-        WarnOnce(logged_self_copy, "copies within one image are not supported yet; skipped");
+        // Whole-resource state tracking cannot hold COPY_SOURCE and COPY_DEST at once, and the
+        // regions may overlap: copy from what the image holds now.
+        if (Image* const snapshot = src.TakeSnapshot()) {
+            CopyImage(dst, *snapshot, copies);
+            return;
+        }
+        WarnOnce(logged_self_copy, "a copy within one image found no memory for its snapshot; "
+                                   "skipped");
         CaptureCopySkip(dst, src, "self copy");
         return;
     }
@@ -136,14 +171,6 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src, std::span<const Imag
         // format families, which CopyTextureRegion rejects (the debug layer invalidates the list;
         // without it the result is undefined). The bytes go through a buffer instead.
         CopyThroughBuffer(dst, src, copies);
-        return;
-    }
-    // A served-down image has no host bytes for its largest levels (texture_downscale.h): a copy
-    // that could touch one is skipped rather than redirected into another level.
-    if (dst.DroppedLevels() != 0 || src.DroppedLevels() != 0) {
-        TextureDetail::WarnOnce(TextureDetail::logged_downscaled_copy,
-                                "copy between images skipped: {} -> {} level(s) served down",
-                                src.DroppedLevels(), dst.DroppedLevels());
         return;
     }
     if (src.Handle()->GetDesc().Dimension != dst.Handle()->GetDesc().Dimension) {
@@ -244,7 +271,9 @@ bool TextureCacheRuntime::CopyDecodedBlocks(Image& dst, Image& src,
     if (!((bytes == 16 && (target_format == DXGI_FORMAT_R32G32B32A32_UINT ||
                            target_format == DXGI_FORMAT_R32G32B32A32_SINT)) ||
           (bytes == 8 && (target_format == DXGI_FORMAT_R32G32_UINT ||
-                          target_format == DXGI_FORMAT_R32G32_SINT)))) {
+                          target_format == DXGI_FORMAT_R32G32_SINT ||
+                          target_format == DXGI_FORMAT_R16G16B16A16_UINT ||
+                          target_format == DXGI_FORMAT_R16G16B16A16_SINT)))) {
         return reject("unsupported integer format pair");
     }
     const auto source_desc = blocks->Handle()->GetDesc();
@@ -686,8 +715,177 @@ bool TextureCacheRuntime::CopyBlocksIntoDecoded(Image& dst, Image& src,
     return true;
 }
 
-void TextureCacheRuntime::CopyImageMSAA(Image&, Image&, std::span<const ImageCopy>) {
-    LOG_WARNING(Render, "D3D12: MSAA texture copies are deferred to phase 5");
+void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src, std::span<const ImageCopy> copies) {
+    using BlitCopy = BlitImageHelper::MsaaCopy;
+    using VideoCore::Surface::IsPixelFormatInteger;
+    using VideoCore::Surface::IsPixelFormatSignedInteger;
+    const u32 src_samples = static_cast<u32>(src.info.num_samples);
+    const u32 dst_samples = static_cast<u32>(dst.info.num_samples);
+    // The texture cache calls this only when the counts differ; one side is single-sampled.
+    const bool to_flat = src_samples > 1 && dst_samples == 1;
+    if (!to_flat && !(src_samples == 1 && dst_samples > 1)) {
+        WarnOnce(logged_msaa_copy, "copy between {} and {} samples skipped", src_samples,
+                 dst_samples);
+        CaptureCopySkip(dst, src, "msaa_counts");
+        return;
+    }
+    if (!blit_helper || !blit_helper->CanBlitMultisampled()) {
+        WarnOnce(logged_no_blit_helper, "multisampled copies need the shader path; skipped");
+        CaptureCopySkip(dst, src, "msaa_no_helper");
+        return;
+    }
+    const SurfaceType src_type = VideoCore::Surface::GetFormatType(src.info.format);
+    const SurfaceType dst_type = VideoCore::Surface::GetFormatType(dst.info.format);
+    const bool color = src_type == SurfaceType::ColorTexture;
+    if (color != (dst_type == SurfaceType::ColorTexture) ||
+        (color && !IntegerBlitCompatible(src.info.format, dst.info.format))) {
+        WarnOnce(logged_msaa_copy, "multisampled copy between {} and {} skipped", src.info.format,
+                 dst.info.format);
+        CaptureCopySkip(dst, src, "msaa_formats");
+        return;
+    }
+    const D3D12_RESOURCE_DESC dst_desc = dst.Handle()->GetDesc();
+    const D3D12_RESOURCE_FLAGS needed =
+        color ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if ((dst_desc.Flags & needed) == 0) {
+        WarnOnce(logged_msaa_copy, "multisampled copy into {}, not renderable, skipped",
+                 dst.info.format);
+        CaptureCopySkip(dst, src, "msaa_target");
+        return;
+    }
+    const FormatInfo src_format = Format(src.info.format);
+    const FormatInfo dst_format = Format(dst.info.format);
+    // Stencil only when both sides have it: the stencil plane's SRV formats, as StencilHandle.
+    DXGI_FORMAT stencil_format = DXGI_FORMAT_UNKNOWN;
+    if (!color && dst_type == SurfaceType::DepthStencil && src_type == SurfaceType::DepthStencil) {
+        switch (src.Handle()->GetDesc().Format) {
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            stencil_format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+            break;
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            stencil_format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            break;
+        default:
+            break;
+        }
+    }
+    BlitCopy type = BlitCopy::Float;
+    if (!color) {
+        type = stencil_format != DXGI_FORMAT_UNKNOWN ? BlitCopy::DepthStencil : BlitCopy::Depth;
+    } else if (IsPixelFormatInteger(src.info.format)) {
+        type = IsPixelFormatSignedInteger(src.info.format) ? BlitCopy::Sint : BlitCopy::Uint;
+    }
+    const DXGI_FORMAT src_view = color ? src.ViewFormat() : src_format.srv;
+    const DXGI_FORMAT dst_view = color ? dst.ViewFormat() : dst_format.dsv;
+    const auto [log_x, log_y] = VideoCommon::SamplesLog2(static_cast<int>(to_flat ? src_samples
+                                                                                   : dst_samples));
+    const s32 scale_x = 1 << log_x;
+    const s32 scale_y = 1 << log_y;
+    ID3D12Device* const device_handle = device.Get();
+
+    src.Transition(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    dst.Transition(color ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    for (const ImageCopy& copy : copies) {
+        const u32 src_level = static_cast<u32>(copy.src_subresource.base_level);
+        const u32 dst_level = static_cast<u32>(copy.dst_subresource.base_level);
+        if (src_level < src.LevelBias() || dst_level < dst.LevelBias()) {
+            continue; // Not on the host (a dropped top level).
+        }
+        const u32 src_mip = src_level - src.LevelBias();
+        const u32 dst_mip = dst_level - dst.LevelBias();
+        // The target's level, in its own pixels: the copy never writes past it.
+        const s32 dst_width = static_cast<s32>(std::max<u64>(1, dst_desc.Width >> dst_mip));
+        const s32 dst_height = static_cast<s32>(std::max(1U, dst_desc.Height >> dst_mip));
+        const D3D12_RECT rect{
+            .left = copy.dst_offset.x,
+            .top = copy.dst_offset.y,
+            .right = std::min(dst_width, copy.dst_offset.x + static_cast<s32>(copy.extent.width)),
+            .bottom =
+                std::min(dst_height, copy.dst_offset.y + static_cast<s32>(copy.extent.height)),
+        };
+        if (rect.right <= rect.left || rect.bottom <= rect.top) {
+            continue;
+        }
+        const s32 layers =
+            std::min(copy.src_subresource.num_layers, copy.dst_subresource.num_layers);
+        for (s32 layer = 0; layer < layers; ++layer) {
+            const u32 src_layer = static_cast<u32>(copy.src_subresource.base_layer + layer);
+            const u32 dst_layer = static_cast<u32>(copy.dst_subresource.base_layer + layer);
+            // The source's one layer (and level), as the shaders read it.
+            const auto make_srv = [&](DXGI_FORMAT format, UINT mapping, UINT plane) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC desc{.Format = format,
+                                                     .Shader4ComponentMapping = mapping};
+                if (to_flat) {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    desc.Texture2DMSArray = {src_layer, 1};
+                } else {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    desc.Texture2DArray = {.MostDetailedMip = src_mip,
+                                           .MipLevels = 1,
+                                           .FirstArraySlice = src_layer,
+                                           .ArraySize = 1,
+                                           .PlaneSlice = plane,
+                                           .ResourceMinLODClamp = 0.0f};
+                }
+                const D3D12_CPU_DESCRIPTOR_HANDLE handle = view_descriptors.Allocate();
+                device_handle->CreateShaderResourceView(src.Handle(), &desc, handle);
+                return handle;
+            };
+            const D3D12_CPU_DESCRIPTOR_HANDLE srv =
+                make_srv(src_view, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0);
+            D3D12_CPU_DESCRIPTOR_HANDLE stencil_srv{};
+            if (type == BlitCopy::DepthStencil) {
+                // The stencil formats hold the value in G; the shaders read red.
+                stencil_srv = make_srv(stencil_format,
+                                       D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(1, 1, 1, 1), 1);
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE target_view{};
+            if (color) {
+                target_view = rtv_descriptors.Allocate();
+                D3D12_RENDER_TARGET_VIEW_DESC desc{.Format = dst_view};
+                if (to_flat) {
+                    desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    desc.Texture2DArray = {dst_mip, dst_layer, 1, 0};
+                } else {
+                    desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                    desc.Texture2DMSArray = {dst_layer, 1};
+                }
+                device_handle->CreateRenderTargetView(dst.Handle(), &desc, target_view);
+            } else {
+                target_view = dsv_descriptors.Allocate();
+                D3D12_DEPTH_STENCIL_VIEW_DESC desc{.Format = dst_view,
+                                                   .Flags = D3D12_DSV_FLAG_NONE};
+                if (to_flat) {
+                    desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+                    desc.Texture2DArray = {dst_mip, dst_layer, 1};
+                } else {
+                    desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+                    desc.Texture2DMSArray = {dst_layer, 1};
+                }
+                device_handle->CreateDepthStencilView(dst.Handle(), &desc, target_view);
+            }
+            const bool copied = blit_helper->CopyMultisample(
+                {target_view, dst_view, dst_samples}, to_flat, type, srv, stencil_srv, rect,
+                copy.src_offset.x, copy.src_offset.y, scale_x, scale_y);
+            if (!copied) {
+                WarnOnce(logged_msaa_copy, "multisampled copy of {} ({} -> {} samples) failed",
+                         src.info.format, src_samples, dst_samples);
+                CaptureCopySkip(dst, src, "msaa_pipeline");
+            }
+            // Recorded already: CPU descriptors are copied into the ring when uploaded.
+            view_descriptors.Free(srv);
+            if (stencil_srv.ptr) {
+                view_descriptors.Free(stencil_srv);
+            }
+            if (color) {
+                rtv_descriptors.Free(target_view);
+            } else {
+                dsv_descriptors.Free(target_view);
+            }
+        }
+    }
 }
 bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) const noexcept {
     using VideoCore::Surface::PixelFormat;
@@ -784,8 +982,7 @@ bool TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src
         return false;
     }
     if (dst_image->info.num_samples > 1 || src_image->info.num_samples > 1) {
-        WarnOnce(logged_msaa_blit, "MSAA blits and resolves need phase 5; skipped");
-        return false;
+        return BlitMultisample(dst, src, dst_region, src_region, filter);
     }
     const SurfaceType src_type = VideoCore::Surface::GetFormatType(src.format);
     const SurfaceType dst_type = VideoCore::Surface::GetFormatType(dst.format);
@@ -852,11 +1049,11 @@ bool TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src
     }
     const VideoCommon::Extent2D src_size{src.size.width, src.size.height};
     if (src_color) {
-        if (VideoCore::Surface::IsPixelFormatInteger(src.format) ||
-            VideoCore::Surface::IsPixelFormatInteger(dst.format)) {
-            // The blit shader samples and writes floats.
-            WarnOnce(logged_integer_blit, "scaled blits of integer formats ({} -> {}) skipped",
-                     src.format, dst.format);
+        const bool integer = VideoCore::Surface::IsPixelFormatInteger(src.format);
+        if (!IntegerBlitCompatible(src.format, dst.format)) {
+            // Integers are not converted through floats, nor between signednesses.
+            WarnOnce(logged_integer_blit, "scaled blit between {} and {} skipped", src.format,
+                     dst.format);
             return false;
         }
         if (!dst.RenderTarget().ptr) {
@@ -867,6 +1064,15 @@ bool TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src
         src_image->Transition(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         src.PrepareRead(Shader::TextureType::Color2D);
         dst.PrepareRender();
+        if (integer) {
+            // Point sampled, bit exact. The shader fetches from the SRV's own size: the level's.
+            return blit_helper->BlitInteger(
+                {dst.RenderTarget(), Format(dst.format).view, 1},
+                src.Handle(Shader::TextureType::Color2D),
+                VideoCore::Surface::IsPixelFormatSignedInteger(src.format), 1, dst_region,
+                src_region,
+                {static_cast<u32>(src_place.width), static_cast<u32>(src_place.height)});
+        }
         const bool linear = filter == Tegra::Engines::Fermi2D::Filter::Bilinear;
         return blit_helper->BlitColor({dst.RenderTarget(), Format(dst.format).view, 1},
                                       src.Handle(Shader::TextureType::Color2D),
@@ -885,9 +1091,10 @@ bool TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src
     // As Vulkan's blits, stencil moves only when both sides have it.
     const D3D12_CPU_DESCRIPTOR_HANDLE src_stencil =
         dst_type == SurfaceType::DepthStencil ? src.StencilHandle() : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    const bool linear_depth = filter == Tegra::Engines::Fermi2D::Filter::Bilinear;
     if (!src_stencil.ptr) {
         return blit_helper->BlitDepth(target, src.Handle(Shader::TextureType::Color2D), dst_region,
-                                      src_region, src_size);
+                                      src_region, src_size, 1, linear_depth);
     }
     if (!logged_stencil_blit) {
         logged_stencil_blit = true;
@@ -895,7 +1102,8 @@ bool TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src
                  src.format, dst.format);
     }
     if (!blit_helper->BlitDepthStencil(target, src.Handle(Shader::TextureType::Color2D),
-                                       src_stencil, dst_region, src_region, src_size)) {
+                                       src_stencil, dst_region, src_region, src_size, 1,
+                                       linear_depth)) {
         return false;
     }
     if (stencil_blit_verify.load(std::memory_order_relaxed) > 0 &&
@@ -904,6 +1112,102 @@ bool TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src
                           dst_region, src_region);
     }
     return true;
+}
+bool TextureCacheRuntime::BlitMultisample(ImageView& dst, ImageView& src,
+                                          const Region2D& dst_region, const Region2D& src_region,
+                                          Tegra::Engines::Fermi2D::Filter filter) {
+    using VideoCore::Surface::IsPixelFormatInteger;
+    using VideoCore::Surface::IsPixelFormatSignedInteger;
+    Image* const dst_image = dst.SourceImage();
+    Image* const src_image = src.SourceImage();
+    const u32 dst_samples = static_cast<u32>(dst_image->info.num_samples);
+    const u32 src_samples = static_cast<u32>(src_image->info.num_samples);
+    const bool src_multisampled = src_samples > 1;
+    const CopyPlace src_place = ViewCopyPlace(*src_image, src);
+    const CopyPlace dst_place = ViewCopyPlace(*dst_image, dst);
+    const SurfaceType src_type = VideoCore::Surface::GetFormatType(src.format);
+    const SurfaceType dst_type = VideoCore::Surface::GetFormatType(dst.format);
+    const bool src_color = src_type == SurfaceType::ColorTexture;
+    if (src_color != (dst_type == SurfaceType::ColorTexture)) {
+        WarnOnce(logged_mixed_blit, "blit between color and depth ({} -> {}) skipped", src.format,
+                 dst.format);
+        return false;
+    }
+    const bool integer = src_color && IsPixelFormatInteger(src.format);
+    const bool whole = src_region.start.x == 0 && src_region.start.y == 0 &&
+                       src_region.end.x == src_place.width &&
+                       src_region.end.y == src_place.height && dst_region.start.x == 0 &&
+                       dst_region.start.y == 0 && dst_region.end.x == dst_place.width &&
+                       dst_region.end.y == dst_place.height && src_place.width == dst_place.width &&
+                       src_place.height == dst_place.height;
+    if (dst_samples == 1 && whole && src.format == dst.format && src_color && !integer) {
+        // A whole level averaged as the guest's 2D engine does, without a draw.
+        src_image->Transition(D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        dst_image->Transition(D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        scheduler.CommandList()->ResolveSubresource(dst_image->Handle(), dst_place.subresource,
+                                                    src_image->Handle(), src_place.subresource,
+                                                    dst_image->ViewFormat());
+        return true;
+    }
+    if (!blit_helper || !blit_helper->CanBlitMultisampled()) {
+        WarnOnce(logged_no_blit_helper, "multisampled blits need the shader path; skipped");
+        return false;
+    }
+    // The level, not src.size: a guest view may be larger than the image it landed on, and the
+    // shaders fetch from the SRV's own size. A scaled multisampled source is read per pixel.
+    const VideoCommon::Extent2D src_size{static_cast<u32>(src_place.width),
+                                         static_cast<u32>(src_place.height)};
+    const D3D12_CPU_DESCRIPTOR_HANDLE src_srv =
+        src_multisampled ? src.MultisampleHandle() : src.Handle(Shader::TextureType::Color2D);
+    const bool linear = filter == Tegra::Engines::Fermi2D::Filter::Bilinear;
+    if (!src_color) {
+        if (!dst.DepthStencil().ptr) {
+            WarnOnce(logged_blit_target, "blit target format {} cannot be rendered to; skipped",
+                     dst.format);
+            return false;
+        }
+        const BlitImageHelper::Target target{dst.DepthStencil(), Format(dst.format).dsv,
+                                             dst_samples};
+        src_image->Transition(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        dst_image->Transition(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        const D3D12_CPU_DESCRIPTOR_HANDLE src_stencil = dst_type == SurfaceType::DepthStencil
+                                                            ? src.StencilHandle()
+                                                            : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        if (src_stencil.ptr) {
+            return blit_helper->BlitDepthStencil(target, src_srv, src_stencil, dst_region,
+                                                 src_region, src_size, src_samples, linear);
+        }
+        return blit_helper->BlitDepth(target, src_srv, dst_region, src_region, src_size,
+                                      src_samples, linear);
+    }
+    if (!IntegerBlitCompatible(src.format, dst.format)) {
+        WarnOnce(logged_msaa_blit, "multisampled blit between {} and {} skipped", src.format,
+                 dst.format);
+        return false;
+    }
+    if (!dst.RenderTarget().ptr) {
+        WarnOnce(logged_blit_target, "blit target format {} cannot be rendered to; skipped",
+                 dst.format);
+        return false;
+    }
+    src_image->Transition(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    src.PrepareRead(Shader::TextureType::Color2D);
+    dst.PrepareRender();
+    const BlitImageHelper::Target target{dst.RenderTarget(), Format(dst.format).view, dst_samples};
+    if (integer) {
+        return blit_helper->BlitInteger(target, src_srv, IsPixelFormatSignedInteger(src.format),
+                                        src_samples, dst_region, src_region, src_size);
+    }
+    if (src_multisampled) {
+        return blit_helper->BlitColorMultisampled(target, src_srv, src_samples,
+                                                  src_samples == dst_samples, dst_region,
+                                                  src_region, src_size);
+    }
+    // One sample into many: the triangle covers them all.
+    return blit_helper->BlitColor(target, src_srv,
+                                  linear ? blit_helper->LinearSampler()
+                                         : blit_helper->NearestSampler(),
+                                  dst_region, src_region, src_size);
 }
 void TextureCacheRuntime::BlitWithinImage(ImageView& dst, ImageView& src,
                                           const Region2D& dst_region, const Region2D& src_region,
@@ -935,10 +1239,9 @@ void TextureCacheRuntime::BlitWithinImage(ImageView& dst, ImageView& src,
             WarnOnce(logged_no_blit_helper, "scaled blits need the shader path; skipped");
             return;
         }
-        if (VideoCore::Surface::IsPixelFormatInteger(src.format) ||
-            VideoCore::Surface::IsPixelFormatInteger(dst.format)) {
-            WarnOnce(logged_integer_blit, "scaled blits of integer formats ({} -> {}) skipped",
-                     src.format, dst.format);
+        if (!IntegerBlitCompatible(src.format, dst.format)) {
+            WarnOnce(logged_integer_blit, "scaled blit between {} and {} skipped", src.format,
+                     dst.format);
             return;
         }
         if (!dst.RenderTarget().ptr) {
@@ -1009,10 +1312,18 @@ void TextureCacheRuntime::BlitWithinImage(ImageView& dst, ImageView& src,
         .end = {src_region.end.x - left, src_region.end.y - top},
     };
     dst.PrepareRender();
-    const bool linear = filter == Tegra::Engines::Fermi2D::Filter::Bilinear;
-    blit_helper->BlitColor({dst.RenderTarget(), Format(dst.format).view, 1}, srv,
-                           linear ? blit_helper->LinearSampler() : blit_helper->NearestSampler(),
-                           dst_region, scratch_region, {self_blit_width, self_blit_height});
+    const BlitImageHelper::Target target{dst.RenderTarget(), Format(dst.format).view, 1};
+    if (VideoCore::Surface::IsPixelFormatInteger(src.format)) {
+        blit_helper->BlitInteger(target, srv,
+                                 VideoCore::Surface::IsPixelFormatSignedInteger(src.format), 1,
+                                 dst_region, scratch_region, {self_blit_width, self_blit_height});
+    } else {
+        const bool linear = filter == Tegra::Engines::Fermi2D::Filter::Bilinear;
+        blit_helper->BlitColor(target, srv,
+                               linear ? blit_helper->LinearSampler()
+                                      : blit_helper->NearestSampler(),
+                               dst_region, scratch_region, {self_blit_width, self_blit_height});
+    }
     // The helper copies the descriptor into the shader-visible ring while recording.
     view_descriptors.Free(srv);
 }

@@ -8,11 +8,11 @@
 #include <string>
 #include <vector>
 #include "jadyx/input/controller_style.h"
+#include "jadyx/settings/graphics_page.h"
 #include "jadyx/ui/ui_actions.h"
 #include "jadyx/ui/ui_icon.h"
 #include "jadyx/i18n/localization.h"
 #include "jadyx/ui/ui_text.h"
-#include "jadyx/settings/upscaling.h"
 
 namespace Jadyx {
 // In-game menu: View + Menu held for a second (Escape on a keyboard) pauses the game and opens it.
@@ -98,8 +98,6 @@ struct GameMenuSettings {
     /// Pulse sessions are on: leaving for home keeps the game where it is, unless the player
     /// turns that off on the row (pulse_sessions.h).
     bool pulse_sessions{};
-    /// Shown live: the paused frame is presented again with each change.
-    Upscaling upscaling{Upscaling::Bilinear};
     /// Opt-in diagnostic package: capture from a controller without a keyboard.
     bool material_capture{};
     /// Opt-in diagnostic package ("hunt=1"): bottleneck capture of the next frames.
@@ -109,17 +107,21 @@ struct GameMenuSettings {
     /// This game's own offline mode; nullopt follows Settings > System (`offline_default`).
     std::optional<bool> offline_mode;
     bool offline_default{};
+    /// Settings > Graphics and this game's own, for the Graphics page.
+    GraphicsSettings graphics_global{};
+    GameGraphics graphics{};
 };
 
 /// Library: back to home, keeping a Pulse session when they are on. LibraryWithoutSession: the
 /// player chose to leave without one.
 enum class GameMenuResult : std::uint8_t {
-    None, Resume, Library, SettingsChanged, FullScreen, Cheats, PerformanceStatsChanged, UpscalingChanged,
+    None, Resume, Library, SettingsChanged, FullScreen, Cheats, PerformanceStatsChanged,
     LibraryWithoutSession,
     CaptureGraphics,
     CapturePerformance,
     Screenshot,
     OfflineModeChanged,
+    GraphicsChanged,
 };
 
 /// One row as drawn: a label, a line under it, and the value of a setting (changed with
@@ -139,24 +141,29 @@ struct GameMenuRow {
 class GameMenu {
 public:
     enum Item : std::size_t {
-        Continue, Cheats, Mods, Style, FaceButtons, Deadzone, FullScreen, ImageUpscaling, PerformanceStats, Library,
+        Continue, Cheats, Mods, Style, FaceButtons, Deadzone, FullScreen, PerformanceStats, Library,
         CaptureGraphics, CapturePerformance, Screenshot, ControllerPage, DisplayPage, OfflineMode,
+        GraphicsMenu, GfxUpscaling, GfxFrameGen, GfxShaders, GfxGpuFence, GfxGuestClock, GfxTextureMemory, GfxGpuAccuracy,
+        GfxConsoleMode,
     };
-    enum class Page : std::uint8_t { Quick, Controller, Display };
+    enum class Page : std::uint8_t { Quick, Controller, Display, Graphics };
 
-    /// `cheats`: the game has a title id, so the menu offers its cheats and its own offline mode.
+    /// `cheats`: the game has a title id, so the menu offers its cheats, its own offline mode and
+    /// its graphics that can change while it runs. The rest wait for a boot: the library has them.
     explicit GameMenu(GameMenuSettings settings_, bool cheats = false) : settings{settings_} {
         quick = {Continue};
         if (settings.screenshot) quick.push_back(Screenshot);
         if (cheats) quick.push_back(Cheats);
         quick.insert(quick.end(), {ControllerPage, DisplayPage});
+        if (cheats) quick.push_back(GraphicsMenu);
         if (cheats) quick.push_back(OfflineMode);
         if (settings.material_capture) quick.push_back(CaptureGraphics);
         if (settings.performance_capture) quick.push_back(CapturePerformance);
         quick.push_back(Library);
         controller = {Style, FaceButtons, Deadzone};
-        display = {ImageUpscaling, PerformanceStats};
+        display = {PerformanceStats};
         if (settings.can_fullscreen) display.push_back(FullScreen);
+        UpdateGraphicsItems();
     }
 
     /// How many cheats are on, shown on the Cheats row.
@@ -185,7 +192,8 @@ public:
             if (page == Page::Quick) return GameMenuResult::Resume;
             // Back on the page's own row.
             selected = static_cast<std::size_t>(
-                std::find(quick.begin(), quick.end(), page == Page::Controller ? ControllerPage : DisplayPage) -
+                std::find(quick.begin(), quick.end(),
+                          page == Page::Controller ? ControllerPage : page == Page::Display ? DisplayPage : GraphicsMenu) -
                 quick.begin());
             page = Page::Quick;
             return GameMenuResult::None;
@@ -219,8 +227,10 @@ public:
     /// The page's title and icon, as its header shows them.
     [[nodiscard]] std::wstring PageTitle() const {
         using I18n::Text;
-        return Tr(page == Page::Controller ? Text::MenuController : page == Page::Display ? Text::MenuDisplay
-                                                                                          : Text::MenuQuick);
+        return Tr(page == Page::Controller ? Text::MenuController
+                  : page == Page::Display  ? Text::MenuDisplay
+                  : page == Page::Graphics ? Text::Graphics
+                                           : Text::MenuQuick);
     }
     /// Row of the cursor, as drawn.
     [[nodiscard]] std::size_t Selected() const { return selected; }
@@ -231,7 +241,26 @@ private:
     static std::wstring Tr(I18n::Text id) { return std::wstring{I18n::Tr(id)}; }
 
     [[nodiscard]] const std::vector<Item>& Items() const {
-        return page == Page::Controller ? controller : page == Page::Display ? display : quick;
+        return page == Page::Controller ? controller : page == Page::Display ? display : page == Page::Graphics ? graphics : quick;
+    }
+
+    /// The Handheld style forces the console's mode (uwp_input.cpp): there is nothing to choose.
+    void UpdateGraphicsItems() {
+        graphics = {GfxUpscaling, GfxFrameGen, GfxShaders, GfxGpuFence, GfxGuestClock, GfxTextureMemory, GfxGpuAccuracy};
+        if (settings.style != ConsoleControllerStyle::Handheld) graphics.push_back(GfxConsoleMode);
+    }
+
+    static GraphicsRow RowOf(Item item) {
+        switch (item) {
+        case GfxFrameGen: return GraphicsRow::FrameGen;
+        case GfxShaders: return GraphicsRow::Shaders;
+        case GfxGpuFence: return GraphicsRow::GpuFence;
+        case GfxGuestClock: return GraphicsRow::GuestClock;
+        case GfxTextureMemory: return GraphicsRow::TextureMemory;
+        case GfxGpuAccuracy: return GraphicsRow::GpuAccuracy;
+        case GfxConsoleMode: return GraphicsRow::ConsoleMode;
+        default: return GraphicsRow::Upscaling;
+        }
     }
 
     GameMenuRow Row(Item item) const {
@@ -263,10 +292,32 @@ private:
                         Tr(settings.swap_face_buttons ? Text::ByPosition : Text::ByLetter) + L" · " + DeadzoneText(),
                     UiIcon::Controller};
         case DisplayPage: {
-            std::wstring detail = Tr(UpscalingText(settings.upscaling));
-            if (settings.show_performance_stats) detail += L" · " + Tr(Text::MenuStatsShort);
+            std::wstring detail;
+            if (settings.show_performance_stats) detail = Tr(Text::MenuStatsShort);
             return {Tr(Text::MenuDisplay), {}, Page, detail, UiIcon::Display};
         }
+        case GraphicsMenu: {
+            const GraphicsSettings resolved = ResolveGraphics(settings.graphics_global, settings.graphics);
+            return {Tr(Text::Graphics), {}, Page,
+                    resolved.frame_gen ? Tr(Text::FrameGen) : GraphicsRowValue(resolved, GraphicsRow::Upscaling),
+                    UiIcon::Settings};
+        }
+        case GfxUpscaling:
+        case GfxFrameGen:
+        case GfxShaders:
+        case GfxGpuFence: {
+            // Whose value it is goes under the label: with the value it would not fit the row.
+            const GraphicsRow row = RowOf(item);
+            return {Tr(GraphicsRowTitle(row)),
+                    GraphicsRowValue(ResolveGraphics(settings.graphics_global, settings.graphics), row), Choice,
+                    Tr(HasGameOverride(settings.graphics, row) ? Text::MenuGraphicsOwn : Text::MenuGraphicsFollowsSettings)};
+        }
+        case GfxGuestClock:
+        case GfxTextureMemory:
+        case GfxGpuAccuracy:
+        case GfxConsoleMode:
+            return {Tr(GraphicsRowTitle(RowOf(item))),
+                    GameGraphicsRowValue(settings.graphics_global, settings.graphics, RowOf(item)), Choice};
         case Style:
             return {Tr(Text::ControllerSeenAs), Tr(ControllerStyleText(settings.style)), Choice};
         case FaceButtons:
@@ -274,8 +325,6 @@ private:
                     Choice};
         case Deadzone:
             return {Tr(Text::DeadZone), DeadzoneText(), Choice};
-        case ImageUpscaling:
-            return {Tr(Text::Upscaling), Tr(UpscalingText(settings.upscaling)), Choice};
         case PerformanceStats:
             return {Tr(Text::PerformanceStats), Tr(settings.show_performance_stats ? Text::Yes : Text::No), Choice};
         case FullScreen:
@@ -317,11 +366,28 @@ private:
             return GameMenuResult::None;
         case ControllerPage:
         case DisplayPage:
+        case GraphicsMenu:
             // A and Right open the page, as a row with ">" does elsewhere.
             if (back) return GameMenuResult::None;
-            page = SelectedItem() == ControllerPage ? Page::Controller : Page::Display;
+            page = SelectedItem() == ControllerPage ? Page::Controller
+                   : SelectedItem() == DisplayPage  ? Page::Display
+                                                    : Page::Graphics;
             selected = 0;
             return GameMenuResult::None;
+        case GfxUpscaling:
+        case GfxFrameGen:
+        case GfxShaders:
+        case GfxGpuFence:
+        case GfxGuestClock:
+        case GfxTextureMemory:
+        case GfxGpuAccuracy:
+        case GfxConsoleMode: {
+            auto row = static_cast<std::size_t>(RowOf(SelectedItem()));
+            const bool changed = HandleGameGraphicsInput(
+                settings.graphics, row,
+                back ? GraphicsInput::Left : confirm ? GraphicsInput::Confirm : GraphicsInput::Right);
+            return changed ? GameMenuResult::GraphicsChanged : GameMenuResult::None;
+        }
         case Library:
             if (!confirm) {
                 if (settings.pulse_sessions) keep_session = !keep_session;
@@ -331,6 +397,7 @@ private:
                                                             : GameMenuResult::LibraryWithoutSession;
         case Style:
             settings.style = StepConsoleControllerStyle(settings.style, back);
+            UpdateGraphicsItems();
             return GameMenuResult::SettingsChanged;
         case FaceButtons:
             settings.swap_face_buttons = !settings.swap_face_buttons;
@@ -343,9 +410,6 @@ private:
             settings.deadzone = steps[i];
             return GameMenuResult::SettingsChanged;
         }
-        case ImageUpscaling:
-            settings.upscaling = StepUpscaling(settings.upscaling, back);
-            return GameMenuResult::UpscalingChanged;
         case PerformanceStats:
             settings.show_performance_stats = !settings.show_performance_stats;
             return GameMenuResult::PerformanceStatsChanged;
@@ -365,7 +429,7 @@ private:
     }
 
     GameMenuSettings settings;
-    std::vector<Item> quick, controller, display;
+    std::vector<Item> quick, controller, display, graphics;
     Page page{Page::Quick};
     std::size_t selected{};
     std::size_t cheats_on{};

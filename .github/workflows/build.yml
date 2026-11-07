@@ -151,7 +151,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: build-uwp/_deps/openssl-build
-          key: openssl-uwp-sccache-${{ steps.tools.outputs.image }}-${{ hashFiles('cpmfile.json', 'CMakePresets.json', 'CMakeLists.txt', 'CMakeModules/**') }}
+          key: openssl-uwp-sccache-${{ github.event.repository.name }}-${{ steps.tools.outputs.image }}-${{ hashFiles('cpmfile.json', 'CMakePresets.json', 'CMakeLists.txt', 'CMakeModules/**') }}
 
       # Its post step read the stats after "Compiler cache stats" had stopped the server, so its
       # annotation always said 0 hits. That step writes the real ones to the run summary instead.
@@ -254,20 +254,37 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           # Every package carries the project's certificate, so the console updates in place.
-          if (-not $env:JADYX_PFX_BASE64 -or -not $env:JADYX_PFX_PASSWORD) {
-              throw "The JADYX_PFX_BASE64 / JADYX_PFX_PASSWORD secrets are not set"
+          # Without the secrets (a fork, a personal repo) the package is signed with a
+          # self-signed certificate minted on the runner: it installs in Dev Mode with its .cer,
+          # but each run has a new signer, so the previous install must be removed first.
+          $pfx = $null
+          if ($env:JADYX_PFX_BASE64 -and $env:JADYX_PFX_PASSWORD) {
+              $pfx = Join-Path $env:RUNNER_TEMP "jadyx.pfx"
+              # A secret piped in from PowerShell can carry a BOM or line breaks; keep only base64.
+              $base64 = $env:JADYX_PFX_BASE64 -replace '[^A-Za-z0-9+/=]', ''
+              [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($base64))
+              $params = @{
+                  Release     = $true
+                  PfxPath     = $pfx
+                  SpirvToDxil = Join-Path $env:RUNNER_TEMP "mesa\spirv_to_dxil.dll"
+              }
+              if ($env:PACKAGE_VERSION) { $params.Version = $env:PACKAGE_VERSION }
+          } else {
+              if ($env:PACKAGE_VERSION) {
+                  throw "A release needs the JADYX_PFX_BASE64 / JADYX_PFX_PASSWORD secrets"
+              }
+              Write-Warning "No signing secrets: signing with a self-signed development certificate"
+              # The fork's own app (Bonsai, identity Jadyx.NX), so it installs next to the official Jadyx.
+              $params = @{
+                  Library            = $true
+                  Nx                 = $true
+                  MintDevCertificate = $true
+                  # Test builds of the Switch 2 port: D3D12 breadcrumbs, so a GPU hang names its command.
+                  BootCfg            = @('dred=1')
+                  SpirvToDxil        = Join-Path $env:RUNNER_TEMP "mesa\spirv_to_dxil.dll"
+              }
           }
-          $pfx = Join-Path $env:RUNNER_TEMP "jadyx.pfx"
-          # A secret piped in from PowerShell can carry a BOM or line breaks; keep only base64.
-          $base64 = $env:JADYX_PFX_BASE64 -replace '[^A-Za-z0-9+/=]', ''
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($base64))
-          $params = @{
-              Release     = $true
-              PfxPath     = $pfx
-              SpirvToDxil = Join-Path $env:RUNNER_TEMP "mesa\spirv_to_dxil.dll"
-          }
-          if ($env:PACKAGE_VERSION) { $params.Version = $env:PACKAGE_VERSION }
-          try { & tools\xbox\package-appx.ps1 @params } finally { Remove-Item $pfx -Force }
+          try { & tools\xbox\package-appx.ps1 @params } finally { if ($pfx) { Remove-Item $pfx -Force } }
 
           [xml]$mf = Get-Content build-uwp\package\layout\AppxManifest.xml -Raw
           $version = $mf.Package.Identity.Version

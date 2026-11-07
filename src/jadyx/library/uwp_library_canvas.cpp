@@ -135,6 +135,10 @@ public:
         swap_prompt_faces = false;
         if (const auto active = SelectController(panel.devices, options.controller_id))
             swap_prompt_faces = SwapControllerFaceButtons(panel.devices[*active], options.swap_face_buttons);
+        if (view.app_mode) {
+            DrawAppMode(view.app_memory_mib);
+            return;
+        }
         using LibraryLayout::LibraryTab;
         const bool library = !view.loading && view.selected < scan.entries.size();
         const LibraryEntry* game = library ? &scan.entries[view.selected] : nullptr;
@@ -228,6 +232,24 @@ public:
                     hero.Running(now) || backdrop_fade.Running(now) || tab_slide.Running(now) ||
                     filter_slide.Running(now) || management_collapse.Running(now) ||
                     list_scroll.Running(now) || grid_scroll.Running(now);
+    }
+    /// Only this, over the whole screen, while Jadyx runs as an App: games do not fit its memory.
+    void DrawAppMode(std::uint64_t memory_mib) {
+        hits.clear();
+        ambient = false;
+        target->BeginDraw();
+        target->Clear(D2D1::ColorF(Palette::Canvas));
+        Card(140, 150, 1000, 420, 24);
+        Type(Tr(T::AppModeTitle), TypeRole::HeadlineLarge, 190, 200, 900, Palette::Warning, 1, TextAlign::Leading, 2);
+        Type(I18n::Format(T::AppModeBody, {std::to_wstring(memory_mib)}), TypeRole::BodyLarge, 190, 300, 900,
+             Palette::Text, 1, TextAlign::Leading, 6);
+        ControlPrompt(Navigation::Back, Tr(T::Exit), 190, 500);
+        if (const HRESULT drawn = target->EndDraw(); FAILED(drawn)) {
+            if (drawn == D2DERR_RECREATE_TARGET) winrt::throw_hresult(drawn);
+            last_draw_error = drawn;
+        }
+        winrt::check_hresult(swapchain->Present(1, 0));
+        animating = false;
     }
     /// The library's corner card for a new version: Y opens the update page, X hides it a day.
     void DrawUpdateNotice(const Updates::Release& release) {
@@ -466,11 +488,24 @@ private:
             AddHit(places[i].x, y, places[i].width, height, hit, i);
         }
     }
+    /// "BONSAI" for the Switch 1 + Switch 2 fork (package Jadyx.NX, package-appx.ps1 -Nx), which
+    /// installs next to Jadyx; "JADYX" otherwise.
+    static std::wstring_view Wordmark() {
+        static const std::wstring mark = [] {
+            try {
+                if (winrt::Windows::ApplicationModel::Package::Current().Id().Name() == L"Jadyx.NX") {
+                    return std::wstring{L"B O N S A I"};
+                }
+            } catch (...) {}
+            return std::wstring{L"J A D Y X"};
+        }();
+        return mark;
+    }
     /// The wordmark; the tabs in the middle; the controller, the time and the user at the right.
     void DrawHeader(const LibraryView& view, Tween::Clock::time_point now) {
         using namespace LibraryLayout;
-        Type(L"J A D Y X", TypeRole::HeadlineSmall, Margin, HeaderTop + 6, 200, Palette::Text);
-        const float mark = Margin + MeasureType(L"J A D Y X", TypeRole::HeadlineSmall) + 14;
+        Type(Wordmark(), TypeRole::HeadlineSmall, Margin, HeaderTop + 6, 200, Palette::Text);
+        const float mark = Margin + MeasureType(Wordmark(), TypeRole::HeadlineSmall) + 14;
         Type(view.panel.xbox ? L"SERIES X|S" : L"PC", TypeRole::Caps, mark, HeaderTop + 13, 160, Palette::TextSecondary);
         // The tabs, with the bumpers that switch them at their ends.
         const std::vector<std::wstring_view> tabs{Tr(T::TabHome), Tr(T::TabLibrary), Tr(T::TabSettings)};
@@ -865,7 +900,7 @@ private:
         // the header) go without saying.
         if (view.tab == LibraryTab::Settings) {
             const auto& configuration = view.configuration;
-            const bool change = view.system.open || view.controller_panel;
+            const bool change = view.system.open || view.graphics.open || view.controller_panel;
             x += ControlPrompt(Navigation::Play, Tr(change ? T::Change : T::Open), x, y);
             ControlPrompt(Navigation::Back, Tr(configuration.busy ? T::Cancel : T::Back), x, y);
             // The version is on the page's kicker; its notices take the corner.
@@ -874,7 +909,7 @@ private:
             if (configuration.busy) {
                 notice = I18n::Format(T::Importing, {std::to_wstring(configuration.completed),
                                                      std::to_wstring(configuration.total)});
-            } else if (view.system.open && !view.system.notice.empty()) {
+            } else if ((view.system.open || view.graphics.open) && !view.system.notice.empty()) {
                 notice = view.system.notice;
             } else if (view.controller_panel && !view.panel.notice.empty()) {
                 notice = view.panel.notice;
@@ -1119,6 +1154,7 @@ private:
     /// The category the Settings tab shows: the open one, or the focused one in the list.
     static std::size_t SettingsCategory(const LibraryView& view) {
         if (view.system.open) return HomeSystem;
+        if (view.graphics.open) return HomeGraphics;
         if (view.configuration.files) return HomeFiles;
         if (view.controller_panel) return HomeControllers;
         return std::min<std::size_t>(view.configuration.selected, HomeRowCount - 1);
@@ -1147,6 +1183,16 @@ private:
                 }
                 rows.push_back(std::move(item));
             }
+        } else if (category == HomeGraphics) {
+            for (std::size_t i = 0; i < GraphicsRowCount; ++i) {
+                const auto row = static_cast<GraphicsRow>(i);
+                const auto& settings = view.graphics.settings;
+                SettingsRow item{Kind::Choice, std::wstring{Tr(GraphicsRowTitle(row))},
+                                 std::wstring{Tr(GraphicsRowHint(row))}, GraphicsRowValue(settings, row)};
+                if (row == GraphicsRow::FrameGen) { item.kind = Kind::Toggle; item.on = settings.frame_gen; }
+                if (row == GraphicsRow::AsyncRecord) { item.kind = Kind::Toggle; item.on = settings.async_record; }
+                rows.push_back(std::move(item));
+            }
         } else if (category == HomeControllers) {
             // As the controller panel: [device (PC)], type, A/B/X/Y, dead zone, [keyboard (PC)].
             const auto& options = view.options;
@@ -1168,7 +1214,7 @@ private:
                 face.on_segment = options.swap_face_buttons ? 1 : 0;
                 rows.push_back(std::move(face));
             }
-            // The dead zone's three steps (uwp_library.cpp, Zone).
+            // The dead zone's three steps (library_session_pages.cpp, Zone).
             SettingsRow zone{Kind::Segments, std::wstring{Tr(T::DeadZone)}};
             zone.segments = {L"8%", L"12%", L"18%"};
             zone.on_segment = options.deadzone < 0.10f ? 0 : options.deadzone < 0.15f ? 1 : 2;
@@ -1389,7 +1435,7 @@ private:
         const auto& configuration = view.configuration;
         const auto& status = configuration.status;
         const std::size_t category = SettingsCategory(view);
-        const bool in_pane = view.system.open || configuration.files || view.controller_panel;
+        const bool in_pane = view.system.open || view.graphics.open || configuration.files || view.controller_panel;
         // The page's kicker: what it is and which build is installed.
         const auto kicker = Upper(Tr(T::SettingsTitle));
         const float kicker_width = MeasureType(kicker, TypeRole::Caps);
@@ -1398,8 +1444,10 @@ private:
         Type(L"Jadyx " + version_text, TypeRole::Label, Margin + kicker_width + 28, 92, 300, Palette::TextHint);
         // The categories.
         static constexpr std::array<ConfigurationIcon, HomeRowCount> icons{
-            ConfigurationIcon::Settings, ConfigurationIcon::Controller, ConfigurationIcon::Folder};
-        static constexpr std::array<T, HomeRowCount> titles{T::System, T::ControllersAndKeyboard, T::FileManager};
+            ConfigurationIcon::Settings, ConfigurationIcon::Display, ConfigurationIcon::Controller,
+            ConfigurationIcon::Folder};
+        static constexpr std::array<T, HomeRowCount> titles{T::System, T::Graphics, T::ControllersAndKeyboard,
+                                                            T::FileManager};
         for (std::size_t i = 0; i < HomeRowCount; ++i) {
             const float x = SettingsListX, y = SettingsListTop + i * SettingsListStride;
             const float w = SettingsListWidth, h = SettingsListHeight;
@@ -1414,6 +1462,11 @@ private:
             if (i == HomeSystem) {
                 summary = SystemRowValue(view.system, SystemPage::UserName) + L" · " +
                           SystemRowValue(view.system, SystemPage::InterfaceLanguage);
+            } else if (i == HomeGraphics) {
+                const auto& settings = view.graphics.settings;
+                summary = (settings.frame_gen ? std::wstring{Tr(T::FrameGen)}
+                                              : GraphicsRowValue(settings, GraphicsRow::Upscaling)) +
+                          L" · " + GraphicsRowValue(settings, GraphicsRow::Shaders);
             } else if (i == HomeControllers) {
                 const auto label = ControllerLabel(view.panel.devices, view.options.controller_id);
                 summary = view.options.controller_id.empty() ? I18n::Format(T::AutomaticValue, {label}) : label;
@@ -1460,8 +1513,10 @@ private:
                  view.loading ? std::wstring{L"…"} : std::to_wstring(view.scan.entries.size()));
         }
         // The category's page.
-        static constexpr std::array<T, HomeRowCount> pages{T::SystemTitle, T::ControllersAndKeyboard, T::FileManager};
-        static constexpr std::array<T, HomeRowCount> about{T::SystemSubtitle, T::ControllerSubtitle, T::FilesSubtitle};
+        static constexpr std::array<T, HomeRowCount> pages{T::SystemTitle, T::Graphics, T::ControllersAndKeyboard,
+                                                           T::FileManager};
+        static constexpr std::array<T, HomeRowCount> about{T::SystemSubtitle, T::GraphicsSubtitle, T::ControllerSubtitle,
+                                                           T::FilesSubtitle};
         const float px = SettingsPaneX, pw = SettingsPaneWidth;
         Type(Tr(pages[category]), TypeRole::HeadlineLarge, px, 122, pw, Palette::Text);
         Type(Tr(about[category]), TypeRole::Body, px, 176, pw, Palette::TextSecondary);
@@ -1469,6 +1524,7 @@ private:
         if (rows.empty()) return;
         const std::size_t selected = !in_pane ? SIZE_MAX :
             category == HomeSystem ? view.system.selected :
+            category == HomeGraphics ? view.graphics.selected :
             category == HomeFiles ? configuration.selected : view.controller_row;
         const std::size_t visible = std::min(rows.size(), SettingsVisibleRows);
         const std::size_t first = selected != SIZE_MAX && selected >= visible ? selected - visible + 1 : 0;
@@ -1789,13 +1845,34 @@ private:
                     I18n::Format(game.pulse_current ? T::PulseSavedOn : T::PulseSavedOther, {game.pulse_saved});
                 const auto discard = I18n::Format(T::PulseDiscardConfirm, {PromptKey(Navigation::Play).letters});
                 in_place(option, pulse, game.pulse_saved.empty() ? std::wstring_view{} : std::wstring_view{discard});
+            } else if (option == GameOption::Graphics && view.graphics && view.global_graphics) {
+                // The rows of Settings > Graphics, each one the game's own or what it follows, then
+                // the ones only a game has. They do not all fit: the window follows the focus.
+                const bool advanced = IsAdvancedRow(static_cast<GraphicsRow>(view.graphics_row));
+                Type(Tr(advanced ? T::GameGraphicsAdvancedHint : T::GameGraphicsHint), TypeRole::Body, 56, 222, 1168,
+                     Palette::TextSecondary);
+                const bool focused = view.page.focus == GameOptionsFocus::Content;
+                static constexpr std::size_t Visible = 6;
+                const std::size_t first = view.graphics_row >= Visible ? view.graphics_row - Visible + 1 : 0;
+                for (std::size_t i = first; i < first + Visible; ++i) {
+                    const auto row = static_cast<GraphicsRow>(i);
+                    const SettingsRow item{row == GraphicsRow::ResetAdvanced ? SettingsRow::Kind::Open : SettingsRow::Kind::Choice,
+                                           std::wstring{Tr(GraphicsRowTitle(row))}, std::wstring{Tr(GraphicsRowHint(row))},
+                                           GameGraphicsRowValue(*view.global_graphics, *view.graphics, row)};
+                    const float y = 262 + static_cast<float>(i - first) * SettingsRowStride;
+                    DrawSettingsRow(item, 56, y, 1168, SettingsRowHeight, focused && i == view.graphics_row, 1.0f);
+                }
+                ScrollIndicator(1232, 262, Visible * SettingsRowStride - (SettingsRowStride - SettingsRowHeight), first,
+                                Visible, GameGraphicsRowCount);
             } else if (option == GameOption::Remove) {
                 const bool external = IsStoragePath(game.launch_path);
                 in_place(option, Tr(external ? T::GameRemoveExternal :
                                     view.other_copies ? T::GameRemoveCopyWarning : T::GameRemoveWarning),
                          external ? std::wstring_view{} : Tr(T::GameRemove));
             } else {
-                Type(view.notice.empty() ? Tr(T::CheckingGame) : view.notice, TypeRole::BodyLarge, 56, 230, 1168, Palette::TextHint,
+                // No pane to show: the game's title is on its way, or this game cannot have one.
+                const T waiting = game.title_loaded && !view.page.activate ? T::GameOptionUnavailable : T::CheatsUnavailable;
+                Type(view.notice.empty() ? Tr(waiting) : view.notice, TypeRole::BodyLarge, 56, 230, 1168, Palette::TextHint,
                      1, TextAlign::Leading, 3);
             }
         }

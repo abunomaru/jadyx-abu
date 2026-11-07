@@ -5,11 +5,14 @@
 #include <array>
 #include <cstring>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "common/div_ceil.h"
 #include "video_core/host_shaders/d3d12_astc_decoder_comp_spv.h"
 #include "video_core/host_shaders/d3d12_bc3_encoder_comp_spv.h"
+#include "video_core/host_shaders/d3d12_bcn_decoder_comp_spv.h"
+#include "video_core/host_shaders/d3d12_block_linear_unswizzle_comp_spv.h"
 #include "video_core/host_shaders/d3d12_depth_stencil_merge_comp_spv.h"
 #include "video_core/host_shaders/d3d12_depth_stencil_split_comp_spv.h"
 #include "video_core/host_shaders/d3d12_depth_unorm24_comp_spv.h"
@@ -19,8 +22,8 @@
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
 #include "video_core/renderer_d3d12/d3d12_shader_compiler.h"
 
-// The compute helpers of BlitImageHelper: depth-stencil plane packing and the GPU ASTC decoder
-// and BC3 encoder.
+// The compute helpers of BlitImageHelper: depth-stencil plane packing, the GPU ASTC and BCn
+// decoders and BC3 encoder, and the block-linear unswizzle of texture uploads.
 
 namespace D3D12 {
 
@@ -61,7 +64,7 @@ constexpr u32 ASTC_GROUP_SIZE = 8;
 constexpr u32 BC3_CONSTANTS_PARAM = 0;
 constexpr u32 BC3_SOURCE_PARAM = 1;
 constexpr u32 BC3_DESTINATION_PARAM = 2;
-constexpr u32 BC3_CONSTANT_WORDS = 5;
+constexpr u32 BC3_CONSTANT_WORDS = 6;
 constexpr u32 BC3_GROUP_SIZE = 8;
 
 } // Anonymous namespace
@@ -107,6 +110,42 @@ void BlitImageHelper::CreatePackPipelines(const ShaderCompiler& compiler) {
     create(D3D12_DEPTH_STENCIL_SPLIT_COMP_SPV, split_pipeline);
     create(D3D12_DEPTH_STENCIL_MERGE_COMP_SPV, merge_pipeline);
     create(D3D12_DEPTH_UNORM24_COMP_SPV, unorm24_pipeline);
+}
+
+void BlitImageHelper::CreateUnswizzlePipeline(const ShaderCompiler& compiler) {
+    const std::vector<u8> dxil =
+        compiler.Compile(D3D12_BLOCK_LINEAR_UNSWIZZLE_COMP_SPV, DXIL_SPIRV_SHADER_COMPUTE);
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{
+        .pRootSignature = pack_root_signature.Get(),
+        .CS = {dxil.data(), dxil.size()},
+    };
+    ThrowIfFailed(device.Get()->CreateComputePipelineState(&pipeline_desc,
+                                                           IID_PPV_ARGS(&unswizzle_pipeline)),
+                  "CreateComputePipelineState (block-linear unswizzle)");
+}
+
+void BlitImageHelper::UnswizzleBlockLinear(const BlockLinearUnswizzle& unswizzle) {
+    if (!unswizzle_available || unswizzle.row_words == 0 || unswizzle.rows == 0) {
+        return;
+    }
+    CommandStream* const cmd = scheduler.CommandList();
+    cmd->SetComputeRootSignature(pack_root_signature.Get());
+    scheduler.SetPipelineState(unswizzle_pipeline.Get());
+    const std::array<u32, PACK_CONSTANT_WORDS> constants{
+        unswizzle.source_offset, unswizzle.source_bytes, unswizzle.block_size,
+        unswizzle.x_shift,       unswizzle.block_height, unswizzle.block_height_mask,
+        unswizzle.row_words,     unswizzle.rows,         unswizzle.first_row,
+        unswizzle.row_pitch_words, 0,                    0,
+    };
+    cmd->SetComputeRoot32BitConstants(PACK_CONSTANTS_PARAM, PACK_CONSTANT_WORDS, constants.data(),
+                                      0);
+    cmd->SetComputeRootShaderResourceView(PACK_SOURCE_PARAM, unswizzle.source);
+    cmd->SetComputeRootUnorderedAccessView(PACK_DESTINATION_PARAM, unswizzle.destination);
+    // One invocation per output word.
+    const std::array<u32, 3> groups{Common::DivCeil(unswizzle.row_words, PACK_GROUP_SIZE),
+                                    Common::DivCeil(unswizzle.rows, PACK_GROUP_SIZE), 1U};
+    SetComputeRuntimeData(cmd, 3, groups);
+    cmd->Dispatch(groups[0], groups[1], groups[2]);
 }
 
 void BlitImageHelper::CreateAstcPipeline(const ShaderCompiler& compiler) {
@@ -198,6 +237,57 @@ void BlitImageHelper::DecodeAstc(const AstcDecode& decode) {
     cmd->Dispatch(groups[0], groups[1], groups[2]);
 }
 
+void BlitImageHelper::CreateBcnPipeline(const ShaderCompiler& compiler) {
+    // Same bindings and constant count as the ASTC decoder.
+    if (!astc_root_signature) {
+        throw std::runtime_error("no ASTC decoder root signature");
+    }
+    const std::array<ShaderCompiler::PipelineStage, 1> stages{{
+        {D3D12_BCN_DECODER_COMP_SPV, DXIL_SPIRV_SHADER_COMPUTE},
+    }};
+    auto compiled = compiler.CompilePipeline(stages, {});
+    const std::vector<u8>& dxil = compiled[0].dxil;
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{
+        .pRootSignature = astc_root_signature.Get(),
+        .CS = {dxil.data(), dxil.size()},
+    };
+    ThrowIfFailed(device.Get()->CreateComputePipelineState(&pipeline_desc,
+                                                           IID_PPV_ARGS(&bcn_pipeline)),
+                  "CreateComputePipelineState (BCn decoder)");
+}
+
+void BlitImageHelper::DecodeBcn(const BcnDecode& decode) {
+    if (!bcn_available || decode.blocks_x == 0 || decode.blocks_y == 0 || decode.layers == 0) {
+        return;
+    }
+    // Descriptors first: a full ring flushes the command list.
+    const std::array descriptors{decode.source, decode.destination};
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = descriptor_ring.Upload(descriptors);
+    const D3D12_GPU_DESCRIPTOR_HANDLE destination{
+        table.ptr + descriptor_ring.Stride(),
+    };
+    CommandStream* const cmd = scheduler.CommandList();
+    ID3D12DescriptorHeap* const heaps[] = {descriptor_ring.Heap(), sampler_heap.Heap()};
+    cmd->SetDescriptorHeaps(2, heaps);
+    cmd->SetComputeRootSignature(astc_root_signature.Get());
+    scheduler.SetPipelineState(bcn_pipeline.Get());
+    const std::array<u32, ASTC_CONSTANT_WORDS> constants{
+        decode.mode,     decode.layer_stride,     decode.block_size,
+        decode.x_shift,  decode.gob_block_height, decode.gob_block_height_mask,
+        decode.input_words, decode.blocks_x,      decode.blocks_y,
+    };
+    cmd->SetComputeRoot32BitConstants(ASTC_CONSTANTS_PARAM, ASTC_CONSTANT_WORDS, constants.data(),
+                                      0);
+    cmd->SetComputeRootDescriptorTable(ASTC_SOURCE_PARAM, table);
+    cmd->SetComputeRootDescriptorTable(ASTC_DESTINATION_PARAM, destination);
+    // One invocation per 4x4 block.
+    const std::array<u32, 3> groups{Common::DivCeil(decode.blocks_x, ASTC_GROUP_SIZE),
+                                    Common::DivCeil(decode.blocks_y, ASTC_GROUP_SIZE),
+                                    decode.layers};
+    SetComputeRuntimeData(cmd, 3, groups);
+    cmd->Dispatch(groups[0], groups[1], groups[2]);
+}
+
 void BlitImageHelper::CreateBc3Pipeline(const ShaderCompiler& compiler) {
     const D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
     std::array<D3D12_ROOT_PARAMETER, 4> params{};
@@ -259,7 +349,7 @@ void BlitImageHelper::EncodeBc(const BcEncode& encode) {
     scheduler.SetPipelineState(bc3_pipeline.Get());
     const std::array<u32, BC3_CONSTANT_WORDS> constants{
         encode.width, encode.height, encode.band_height, encode.output_row_words,
-        encode.bc1 ? 2U : 4U};
+        encode.bc1 || encode.bc4_alpha ? 2U : 4U, encode.bc4_alpha ? 1U : 0U};
     cmd->SetComputeRoot32BitConstants(BC3_CONSTANTS_PARAM, BC3_CONSTANT_WORDS, constants.data(), 0);
     cmd->SetComputeRootDescriptorTable(BC3_SOURCE_PARAM, table);
     cmd->SetComputeRootUnorderedAccessView(BC3_DESTINATION_PARAM, encode.destination);

@@ -22,9 +22,11 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/rasterizer_download_area.h"
 #include "video_core/rasterizer_interface.h"
 
 #include "video_core/frame_trace.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/perf_counters.h"
 
 namespace VideoCommon {
@@ -84,6 +86,7 @@ public:
     }
 
     void SignalFence(std::function<void()>&& func) {
+        Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         SignalFence(std::move(func), false);
     }
 
@@ -109,6 +112,10 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
+            // The fence's commands can be held back by a deferred flush that only this thread
+            // submits. The fencing thread waits for that submission before releasing the fence,
+            // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
+            SubmitDeferredWork();
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
@@ -144,6 +151,8 @@ protected:
     virtual bool IsFenceSignaled(TFence& fence) const = 0;
     /// Waits until a fence has been signalled by the host GPU.
     virtual void WaitFence(TFence& fence) = 0;
+    /// Submits work whose submission the backend deferred (called before blocking on a fence).
+    virtual void SubmitDeferredWork() {}
 
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::GPU& gpu;
@@ -154,6 +163,9 @@ protected:
 
 private:
     void SignalFence(std::function<void()>&& func, bool is_syncpoint) {
+        // CPU reads cached as checked before this fence check again: the guest may now read what
+        // the work before it wrote.
+        VideoCore::AdvanceDownloadAreaEpoch();
         bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         const FlushSources flush_sources = PendingFlushSources();
         const bool should_flush = flush_sources.Any();
@@ -181,6 +193,11 @@ private:
                     : Counter::SyncpointsEarly;
             delay_fence = reason != Counter::SyncpointsEarly;
             VideoCore::Perf::Add(reason, 1);
+        }
+        // A counter's result reaches guest memory when the fence releases, so what tells the guest
+        // to read it waits for that under any fence setting.
+        if (flush_sources.query) {
+            delay_fence = true;
         }
         if (delay_fence) {
             uncommitted_operations.emplace_back(std::move(func));

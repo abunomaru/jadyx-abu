@@ -3,12 +3,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <optional>
 #include <span>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -17,6 +19,8 @@
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"
 #include "video_core/renderer_d3d12/d3d12_draw_sampler_cache.h"
+#include "video_core/renderer_d3d12/d3d12_maxwell_to_d3d12.h"
+#include "video_core/renderer_d3d12/d3d12_render_corrections.h"
 #include "video_core/renderer_d3d12/d3d12_root_signature.h"
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
@@ -27,6 +31,15 @@
 // counterpart of renderer_vulkan/pipeline_helper.h).
 
 namespace D3D12 {
+
+/// The fragment shader computes the logic op: D3D12's needs a feature the console lacks. Render
+/// target 0 only, single sampled, and in a format whose bits the shader knows.
+template <typename State>
+[[nodiscard]] bool EmulatesLogicOp(const State& state) {
+    return state.dynamic_state.logic_op_enable != 0 &&
+           MaxwellToD3D12::SampleCount(state.msaa_mode) == 1 &&
+           LogicOpChannelBits(state.color_formats[0])[0] != 0;
+}
 
 using ImageViewList = boost::container::small_vector<VideoCommon::ImageViewInOut, 64>;
 using SamplerIdList = boost::container::small_vector<VideoCommon::SamplerId, 64>;
@@ -140,6 +153,89 @@ void GatherStageViews(const Info& info, TextureCache& texture_cache, bool is_com
     }
 }
 
+/// One handle a stage read and what it resolved to, in GatherStageViews order (stage_view_cache=1).
+struct StageViewEntry {
+    u32 tic{};
+    u32 tsc{}; ///< textures only
+    VideoCommon::ImageViewId view{};
+    VideoCommon::SamplerId sampler{}; ///< textures only
+};
+
+/// Stages that write storage images scale them down while resolving them: never reused.
+template <typename Info>
+[[nodiscard]] bool StageViewsCacheable(const Info& info) {
+    return std::ranges::none_of(info.image_descriptors,
+                                [](const auto& desc) { return desc.is_written; });
+}
+
+/// Appends the views and samplers of a stage from entries, the last draw's, when the stage reads
+/// the same handles and the descriptor tables still hold the entries they were resolved from.
+/// The caller checks the texture cache's binding stamp. False, appending nothing, otherwise.
+template <typename Info, typename ReadHandle>
+[[nodiscard]] bool ReuseStageViews(const Info& info, const TextureCache& texture_cache,
+                                   ReadHandle&& read_handle,
+                                   std::span<const StageViewEntry> entries, ImageViewList& views,
+                                   SamplerIdList& samplers) {
+    const size_t first_view = views.size();
+    const size_t first_sampler = samplers.size();
+    size_t next = 0;
+    bool same = true;
+    const auto add = [&](const auto& desc, bool is_texture) {
+        for (u32 index = 0; same && index < desc.count; ++index) {
+            const auto handle = read_handle(desc, index);
+            const StageViewEntry* const entry = next < entries.size() ? &entries[next++] : nullptr;
+            same = entry && entry->tic == handle.first &&
+                   (!is_texture || entry->tsc == handle.second) &&
+                   texture_cache.GraphicsImageEntryMatches(handle.first) &&
+                   (!is_texture || texture_cache.GraphicsSamplerEntryMatches(handle.second));
+            if (!same) {
+                return;
+            }
+            views.push_back({.index = handle.first, .blacklist = false, .id = entry->view});
+            if (is_texture) {
+                samplers.push_back(entry->sampler);
+            }
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.image_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.texture_descriptors) add(desc, true);
+    for (const auto& desc : info.image_descriptors) add(desc, false);
+    if (same && next == entries.size()) {
+        return true;
+    }
+    views.resize(first_view);
+    samplers.resize(first_sampler);
+    return false;
+}
+
+/// Records what a stage resolved: its views from first_view and samplers from first_sampler,
+/// with the TSC handles in tsc (one per texture, in order).
+template <typename Info>
+void StoreStageViews(const Info& info, std::span<const VideoCommon::ImageViewInOut> views,
+                     std::span<const VideoCommon::SamplerId> samplers, std::span<const u32> tsc,
+                     std::vector<StageViewEntry>& entries) {
+    entries.clear();
+    size_t texture = 0;
+    const auto add = [&](const auto& desc, bool is_texture) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const VideoCommon::ImageViewInOut& view = views[entries.size()];
+            StageViewEntry& entry = entries.emplace_back();
+            entry.tic = view.index;
+            entry.view = view.id;
+            if (is_texture) {
+                entry.tsc = tsc[texture];
+                entry.sampler = samplers[texture];
+                ++texture;
+            }
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.image_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.texture_descriptors) add(desc, true);
+    for (const auto& desc : info.image_descriptors) add(desc, false);
+}
+
 /// Binds the texel and image buffers of a stage through the buffer cache. bind(index, view,
 /// format, is_written, is_image) forwards to Bind{Graphics,Compute}TextureBuffer. views_it
 /// advances past them.
@@ -212,6 +308,12 @@ private:
     boost::container::small_vector<D3D12_CPU_DESCRIPTOR_HANDLE, 32> handles;
     boost::container::small_vector<u64, 32> keys;
 };
+
+static_assert(Shader::Backend::SPIRV::BLEND_CONSTANTS_OFFSET == PUSH_CONSTANT_WORDS * sizeof(u32));
+static_assert(Shader::Backend::SPIRV::STAGE_CONSTANTS_OFFSET ==
+              (PUSH_CONSTANT_WORDS + BLEND_CONSTANT_WORDS) * sizeof(u32));
+static_assert(Shader::Backend::SPIRV::STAGE_CONSTANT_WORDS == STAGE_CONSTANT_WORDS);
+static_assert(Shader::Backend::SPIRV::POLYGON_STIPPLE_WORDS == POLYGON_STIPPLE_WORDS);
 
 /// Push constants with no resolution scaling (all rescaling bits clear, down factor 1).
 inline void ResetPushConstants(std::array<u32, PUSH_CONSTANT_WORDS>& words) {

@@ -14,11 +14,13 @@
 #include "common/bug_tracker.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/transform_feedback_storage.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_d3d12/d3d12_log.h"
 #include "video_core/renderer_d3d12/d3d12_draw_targets.h"
 #include "video_core/renderer_d3d12/d3d12_maxwell_to_d3d12.h"
+#include "video_core/perf_counters.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
 
@@ -201,34 +203,108 @@ void RasterizerD3D12::BindDrawState(const GraphicsPipeline& pipeline,
             command_state.depth_bounds = bounds;
         }
     }
-    // D3D12 has a single reference for both faces.
+    // D3D12 has a single reference for both faces (DrawStencilFaces handles a back one).
     if (!command_state.valid || state_tracker.TouchStencilReference() ||
         command_state.stencil_ref != regs.stencil_front_ref) {
         cmd->OMSetStencilRef(regs.stencil_front_ref);
         command_state.stencil_ref = regs.stencil_front_ref;
     }
-    if (regs.stencil_two_side_enable != 0 && regs.stencil_back_ref != regs.stencil_front_ref) {
-        BUG_TRACK(UnsupportedState, "different front ({}) and back ({}) stencil references; the "
-                                    "front one is used",
-                  regs.stencil_front_ref, regs.stencil_back_ref);
-        WarnOnceLog(logged_stencil_ref,
-                    "different front and back stencil references; using the front");
-    }
 
     SetGraphicsRootArguments(cmd, pipeline, bindings, params);
 
+    // Emulated tessellation sets its own topologies (TessEmulation).
+    const bool emulates_tess = pipeline.TessPlan().Active();
     const D3D12_PRIMITIVE_TOPOLOGY d3d_topology =
-        MaxwellToD3D12::PrimitiveTopology(topology, regs.patch_vertices);
+        emulates_tess ? command_state.topology
+                      : MaxwellToD3D12::PrimitiveTopology(topology, regs.patch_vertices);
     if (!command_state.valid || command_state.topology != d3d_topology) {
         cmd->IASetPrimitiveTopology(d3d_topology);
         command_state.topology = d3d_topology;
     }
     buffer_runtime.ApplyGeometry(cmd);
     // Last: nothing after it may submit the list before the draw.
-    if (layout.StreamOutput() && regs.transform_feedback_enabled != 0) {
+    if (layout.StreamOutput() && regs.transform_feedback_enabled != 0 && !emulates_tess) {
         stream_output.Bind(cmd, regs, buffer_runtime.TransformFeedbackBindings());
     }
     command_state.valid = true;
+}
+
+bool RasterizerD3D12::BeginStencilFaces(GraphicsPipeline& pipeline,
+                                        Maxwell::PrimitiveTopology topology) {
+    const auto& regs = maxwell3d->regs;
+    const auto& hashes = pipeline.Key().unique_hashes;
+    // Only triangles have a back face; a geometry or tessellation stage may turn them into
+    // something else, and drawing twice would capture stream output twice.
+    const bool triangles = topology == Maxwell::PrimitiveTopology::Triangles ||
+                           topology == Maxwell::PrimitiveTopology::TriangleStrip ||
+                           topology == Maxwell::PrimitiveTopology::TriangleFan ||
+                           topology == Maxwell::PrimitiveTopology::Quads ||
+                           topology == Maxwell::PrimitiveTopology::QuadStrip ||
+                           topology == Maxwell::PrimitiveTopology::Polygon ||
+                           topology == Maxwell::PrimitiveTopology::TrianglesAdjacency ||
+                           topology == Maxwell::PrimitiveTopology::TriangleStripAdjacency;
+    const bool plain = triangles && hashes[2] == 0 && hashes[3] == 0 && hashes[4] == 0 &&
+                       !pipeline.Layout().StreamOutput();
+    const auto warn = [&] {
+        BUG_TRACK(UnsupportedState,
+                  "different front and back stencil state (reference {}/{}, compare mask "
+                  "{:02x}/{:02x}, write mask {:02x}/{:02x}); the front one is used",
+                  regs.stencil_front_ref, regs.stencil_back_ref,
+                  static_cast<u8>(regs.stencil_front_func_mask),
+                  static_cast<u8>(regs.stencil_back_func_mask),
+                  static_cast<u8>(regs.stencil_front_mask), static_cast<u8>(regs.stencil_back_mask));
+        WarnOnceLog(logged_stencil_ref,
+                    "different front and back stencil state; using the front");
+    };
+    if (!plain) {
+        warn();
+        return false;
+    }
+    CommandStream* const cmd = scheduler.CommandList();
+    const auto set_reference = [&](u32 reference) {
+        cmd->OMSetStencilRef(reference);
+        command_state.stencil_ref = reference;
+    };
+    const auto& dynamic = pipeline.Key().state.dynamic_state;
+    if (dynamic.cull_enable != 0) {
+        // One face is drawn already: it just needs its own reference and masks.
+        if (dynamic.CullFace() == Maxwell::CullFace::Front) {
+            const bool own_masks =
+                static_cast<u8>(regs.stencil_back_func_mask) != pipeline.Key().stencil_read_mask ||
+                static_cast<u8>(regs.stencil_back_mask) != pipeline.Key().stencil_write_mask;
+            if (own_masks) {
+                if (ID3D12PipelineState* const back_faces = BackFaces(pipeline)) {
+                    scheduler.SetPipelineState(back_faces);
+                } else {
+                    warn();
+                }
+            }
+            set_reference(regs.stencil_back_ref);
+        }
+        return false;
+    }
+    ID3D12PipelineState* const front_faces = pipeline.CulledHandle(D3D12_CULL_MODE_BACK);
+    ID3D12PipelineState* const back_faces = BackFaces(pipeline);
+    if (!front_faces || !back_faces) {
+        warn();
+        return false;
+    }
+    scheduler.SetPipelineState(front_faces);
+    VideoCore::Perf::Add(VideoCore::Perf::Counter::StencilFaceSplits, 1);
+    return true;
+}
+
+ID3D12PipelineState* RasterizerD3D12::BackFaces(GraphicsPipeline& pipeline) {
+    const auto& regs = maxwell3d->regs;
+    return pipeline.CulledHandle(D3D12_CULL_MODE_FRONT, static_cast<u8>(regs.stencil_back_func_mask),
+                                 static_cast<u8>(regs.stencil_back_mask));
+}
+
+void RasterizerD3D12::NextStencilFace(GraphicsPipeline& pipeline) {
+    scheduler.SetPipelineState(BackFaces(pipeline));
+    const u32 reference = maxwell3d->regs.stencil_back_ref;
+    scheduler.CommandList()->OMSetStencilRef(reference);
+    command_state.stencil_ref = reference;
 }
 
 void RasterizerD3D12::SetGraphicsRootArguments(CommandStream* cmd,
@@ -242,6 +318,26 @@ void RasterizerD3D12::SetGraphicsRootArguments(CommandStream* cmd,
         cmd->SetGraphicsRoot32BitConstants(PipelineLayout::PUSH_CONSTANTS_INDEX,
                                            PUSH_CONSTANT_WORDS, bindings.push_constants.data(), 0);
         cached.push_constants = bindings.push_constants;
+    }
+    if (pipeline.ShaderBlendConstants()) {
+        const auto& blend_color = maxwell3d->regs.blend_color;
+        const std::array<f32, BLEND_CONSTANT_WORDS> constants{blend_color.r, blend_color.g,
+                                                              blend_color.b, blend_color.a};
+        cmd->SetGraphicsRoot32BitConstants(PipelineLayout::PUSH_CONSTANTS_INDEX,
+                                           BLEND_CONSTANT_WORDS, constants.data(),
+                                           PUSH_CONSTANT_WORDS);
+    }
+    if (layout.StageConstants()) {
+        const std::array<f32, STAGE_CONSTANT_WORDS> constants = StageConstants(pipeline, bindings);
+        cmd->SetGraphicsRoot32BitConstants(PipelineLayout::PUSH_CONSTANTS_INDEX,
+                                           STAGE_CONSTANT_WORDS, constants.data(),
+                                           PUSH_CONSTANT_WORDS + BLEND_CONSTANT_WORDS);
+    }
+    if (layout.PolygonStipple()) {
+        const auto& pattern = maxwell3d->regs.polygon_stipple_pattern;
+        cmd->SetGraphicsRoot32BitConstants(
+            PipelineLayout::PUSH_CONSTANTS_INDEX, POLYGON_STIPPLE_WORDS,
+            pattern.data(), PUSH_CONSTANT_WORDS + BLEND_CONSTANT_WORDS + STAGE_CONSTANT_WORDS);
     }
     dxil_spirv_vertex_runtime_data runtime_data{};
     runtime_data.first_vertex = params.runtime_first_vertex;
@@ -299,6 +395,67 @@ void RasterizerD3D12::SetGraphicsRootArguments(CommandStream* cmd,
         SetTransformFeedbackArguments(cmd, layout, params);
     }
     cached.valid = true;
+}
+
+std::array<f32, STAGE_CONSTANT_WORDS> RasterizerD3D12::StageConstants(
+    const GraphicsPipeline& pipeline, const PipelineBindings& bindings) const {
+    const auto& regs = maxwell3d->regs;
+    std::array<f32, STAGE_CONSTANT_WORDS> constants{};
+    if (pipeline.Key().unique_hashes[3] != 0) {
+        const auto& lod = regs.tessellation.lod;
+        constants = {lod.outer[0], lod.outer[1], lod.outer[2], lod.outer[3],
+                     lod.inner[0], lod.inner[1], 0.0f,         0.0f};
+    } else {
+        // Signed, as SetViewports works out each orientation: the point's top left corner is
+        // where its coordinates start, whichever way the guest's y runs.
+        const auto& viewport = regs.viewport_transform[0];
+        f32 height = viewport.scale_y * 2.0f;
+        if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+            height = -height;
+        }
+        if (viewport.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
+            height = -height;
+        }
+        constants[0] = regs.line_anti_alias_enable != 0 ? regs.line_width_smooth
+                                                        : regs.line_width_aliased;
+        constants[4] = viewport.scale_x != 0.0f ? viewport.scale_x * 2.0f : 1.0f;
+        constants[5] = height != 0.0f ? height : 1.0f;
+    }
+    constants[Shader::Optimization::MIRROR_BORDER_FIRST_CONSTANT] =
+        static_cast<f32>(bindings.mirror_border_masks[0]);
+    constants[Shader::Optimization::MIRROR_BORDER_FIRST_CONSTANT + 1] =
+        static_cast<f32>(bindings.mirror_border_masks[1]);
+    return constants;
+}
+
+void RasterizerD3D12::SetTessControlRootArguments(CommandStream* cmd,
+                                                  const GraphicsPipeline& pipeline,
+                                                  const PipelineBindings& bindings) {
+    // The compute root holds none of the draw's: all of them, but the runtime data
+    // (TessEmulation::Control sets the compute one).
+    const PipelineLayout& layout = pipeline.Layout();
+    cmd->SetComputeRoot32BitConstants(PipelineLayout::PUSH_CONSTANTS_INDEX, PUSH_CONSTANT_WORDS,
+                                      bindings.push_constants.data(), 0);
+    if (layout.StageConstants()) {
+        const std::array<f32, STAGE_CONSTANT_WORDS> constants = StageConstants(pipeline, bindings);
+        cmd->SetComputeRoot32BitConstants(PipelineLayout::PUSH_CONSTANTS_INDEX,
+                                          STAGE_CONSTANT_WORDS, constants.data(),
+                                          PUSH_CONSTANT_WORDS + BLEND_CONSTANT_WORDS);
+    }
+    if (layout.ResourceTableIndex() != PipelineLayout::NO_TABLE) {
+        cmd->SetComputeRootDescriptorTable(layout.ResourceTableIndex(), bindings.resource_table);
+    }
+    if (layout.SamplerTableIndex() != PipelineLayout::NO_TABLE) {
+        cmd->SetComputeRootDescriptorTable(layout.SamplerTableIndex(), bindings.sampler_table);
+    }
+    for (u32 slot = 0; slot < layout.NumRootCbvs(); ++slot) {
+        cmd->SetComputeRootConstantBufferView(layout.RootCbvIndex() + slot,
+                                              bindings.root_cbvs[slot]);
+    }
+    if (layout.IntegerSamplerIndex() != PipelineLayout::NO_TABLE && bindings.integer_samplers) {
+        cmd->SetComputeRootConstantBufferView(layout.IntegerSamplerIndex(),
+                                              bindings.integer_samplers);
+    }
 }
 
 void RasterizerD3D12::SetTransformFeedbackArguments(CommandStream* cmd,

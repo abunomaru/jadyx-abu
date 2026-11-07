@@ -24,6 +24,8 @@ inline TICEntry TextureViewHeader(TICEntry entry, bool native) {
     }
     return entry;
 }
+/// ASTC images that are only an alpha channel over constant RGB.
+enum class AstcMask : u8 { None, White, Black };
 
 struct ImageInfo {
     ImageInfo() = default;
@@ -56,6 +58,9 @@ struct ImageInfo {
     bool is_sparse = false;
     // ASTC data whose blocks carry no alpha: re-compressed to BC1 instead of BC3 (half the size).
     bool astc_opaque = false;
+    /// ASTC with alpha whose RGB is all white or all black, found with astc_opaque
+    /// (see AstcAlphaMaskFor): only the alpha channel needs keeping.
+    AstcMask astc_mask = AstcMask::None;
 };
 
 } // namespace VideoCommon

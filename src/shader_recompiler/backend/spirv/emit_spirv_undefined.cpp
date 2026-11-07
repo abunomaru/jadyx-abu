@@ -10,22 +10,13 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
-namespace {
-// Registers read before any write are zero rather than OpUndef, as NVIDIA hardware and drivers
-// give them; AMD's OpUndef is whatever the register held. Title 1's glow pass exits before
-// writing its colour on some pixels, which AMD blended in as green patches on the road.
-// EDEN_NX2_UNDEF_ZERO=0 emits OpUndef again.
-bool UndefIsZero() {
-    static const bool zero = [] {
-        const char* const value = std::getenv("EDEN_NX2_UNDEF_ZERO");
-        return value == nullptr || value[0] != '0';
-    }();
-    return zero;
-}
-} // Anonymous namespace
 
+// A guest register or predicate read before any write is zero, not OpUndef. A host compiler may fold
+// an undefined value into anything (drop a branch, keep a stale register), and the driver compilers
+// downstream of DXIL do. The guest never relies on what such a read holds, so zero is a value it
+// accepts, and one no compiler may change.
 Id EmitUndefU1(EmitContext& ctx) {
-    return UndefIsZero() ? ctx.false_value : ctx.OpUndef(ctx.U1);
+    return ctx.false_value;
 }
 
 Id EmitUndefU8(EmitContext&) {
@@ -37,7 +28,7 @@ Id EmitUndefU16(EmitContext&) {
 }
 
 Id EmitUndefU32(EmitContext& ctx) {
-    return UndefIsZero() ? ctx.u32_zero_value : ctx.OpUndef(ctx.U32[1]);
+    return ctx.u32_zero_value;
 }
 
 Id EmitUndefU64(EmitContext&) {

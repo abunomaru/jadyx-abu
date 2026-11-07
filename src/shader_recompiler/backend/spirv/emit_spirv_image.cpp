@@ -362,6 +362,37 @@ Id Emit(MethodPtrType sparse_ptr, MethodPtrType non_sparse_ptr, EmitContext& ctx
     return ctx.OpCompositeExtract(result_type, sample, 1U);
 }
 
+bool IsDynamicPtp(IR::Inst* inst, const IR::Value& offset, const IR::Value& offset2) {
+    if (offset2.IsEmpty() || offset.IsEmpty() ||
+        inst->GetAssociatedPseudoOperation(IR::Opcode::GetSparseFromOp)) {
+        return false;
+    }
+    const auto constant{[](const IR::Value& value) {
+        return value.IsImmediate() || value.InstRecursive()->AreAllArgsImmediates();
+    }};
+    return !constant(offset) || !constant(offset2);
+}
+
+// Per-tap offsets the IR could not fold to constants (ConstOffsets must be constant): one gather
+// per tap with a runtime Offset, keeping the i0,j0 texel (w) of each footprint, which is the
+// texel a per-tap gather returns for that tap.
+template <typename GatherFn>
+Id GatherDynamicPtp(EmitContext& ctx, bool is_integer, Id result_type, const IR::Value& offset,
+                    const IR::Value& offset2, GatherFn&& gather) {
+    const std::array packed{ctx.Def(offset), ctx.Def(offset2)};
+    const Id component_type{is_integer ? ctx.U32[1] : ctx.F32[1]};
+    std::array<Id, 4> texels;
+    for (u32 tap = 0; tap < 4; ++tap) {
+        const Id vector{packed[tap / 2]};
+        const u32 first{(tap % 2) * 2};
+        const Id x{ctx.OpBitcast(ctx.S32[1], ctx.OpCompositeExtract(ctx.U32[1], vector, first))};
+        const Id y{ctx.OpBitcast(ctx.S32[1], ctx.OpCompositeExtract(ctx.U32[1], vector, first + 1))};
+        const Id tap_offset{ctx.OpCompositeConstruct(ctx.S32[2], x, y)};
+        texels[tap] = ctx.OpCompositeExtract(component_type, gather(tap_offset), 3U);
+    }
+    return ctx.OpCompositeConstruct(result_type, std::span<const Id>{texels.data(), texels.size()});
+}
+
 Id IsScaled(EmitContext& ctx, const IR::Value& index, Id member_index, u32 base_index) {
     const Id push_constant_u32{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
     Id bit{};
@@ -507,6 +538,29 @@ Id EmitBindlessImageWrite(EmitContext&) {
     throw LogicError("Unreachable instruction");
 }
 
+/// Profile::sanitize_cube_directions: NaN components read as 0, a zero direction as +Z.
+Id SanitizeCubeDirection(EmitContext& ctx, const IR::TextureInstInfo& info, Id coords) {
+    if (!ctx.profile.sanitize_cube_directions ||
+        (info.type != TextureType::ColorCube && info.type != TextureType::ColorArrayCube)) {
+        return coords;
+    }
+    const Id zero{ctx.f32_zero_value};
+    std::array<Id, 4> parts{};
+    Id is_zero{};
+    for (u32 i = 0; i < 3; ++i) {
+        const Id part{ctx.OpCompositeExtract(ctx.F32[1], coords, i)};
+        parts[i] = ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, part), zero, part);
+        const Id part_zero{ctx.OpFOrdEqual(ctx.U1, parts[i], zero)};
+        is_zero = i == 0 ? part_zero : ctx.OpLogicalAnd(ctx.U1, is_zero, part_zero);
+    }
+    parts[2] = ctx.OpSelect(ctx.F32[1], is_zero, ctx.Const(1.0f), parts[2]);
+    if (info.type == TextureType::ColorCube) {
+        return ctx.OpCompositeConstruct(ctx.F32[3], parts[0], parts[1], parts[2]);
+    }
+    parts[3] = ctx.OpCompositeExtract(ctx.F32[1], coords, 3U);
+    return ctx.OpCompositeConstruct(ctx.F32[4], parts[0], parts[1], parts[2], parts[3]);
+}
+
 Id EmitBoundImageSampleImplicitLod(EmitContext&) {
     throw LogicError("Unreachable instruction");
 }
@@ -558,6 +612,7 @@ Id EmitBoundImageWrite(EmitContext&) {
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
                               Id bias_lc, const IR::Value& offset) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    coords = SanitizeCubeDirection(ctx, info, coords);
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
     Id color;
@@ -583,6 +638,7 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value&
 Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
                               Id lod, const IR::Value& offset) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    coords = SanitizeCubeDirection(ctx, info, coords);
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
     const ImageOperands operands(ctx, false, true, false, lod, offset);
@@ -601,6 +657,7 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value&
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
                                   Id coords, Id dref, Id bias_lc, const IR::Value& offset) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    coords = SanitizeCubeDirection(ctx, info, coords);
     if (ctx.stage == Stage::Fragment) {
         const ImageOperands operands(ctx, info.has_bias != 0, false, info.has_lod_clamp != 0,
                                      bias_lc, offset);
@@ -622,6 +679,7 @@ Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Va
 Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
                                   Id coords, Id dref, Id lod, const IR::Value& offset) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    coords = SanitizeCubeDirection(ctx, info, coords);
     const ImageOperands operands(ctx, false, true, false, lod, offset);
     return Emit(&EmitContext::OpImageSparseSampleDrefExplicitLod,
                 &EmitContext::OpImageSampleDrefExplicitLod, ctx, inst, ctx.F32[1],
@@ -631,12 +689,24 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Va
 Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
                    const IR::Value& offset, const IR::Value& offset2) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    coords = SanitizeCubeDirection(ctx, info, coords);
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    const ImageOperands operands(ctx, offset, offset2);
     if (ctx.profile.need_gather_subpixel_offset) {
         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
     }
+    if (IsDynamicPtp(inst, offset, offset2)) {
+        const Id texture{Texture(ctx, info, index)};
+        const Id component{ctx.Const(info.gather_component)};
+        const Id color{GatherDynamicPtp(ctx, is_integer, result_type, offset, offset2, [&](Id tap_offset) {
+            return Decorate(ctx, inst,
+                            ctx.OpImageGather(result_type, texture, coords, component,
+                                              spv::ImageOperandsMask::Offset,
+                                              std::span<const Id>{&tap_offset, 1}));
+        })};
+        return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+    }
+    const ImageOperands operands(ctx, offset, offset2);
     const Id color{Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx, inst,
                         result_type, Texture(ctx, info, index), coords,
                         ctx.Const(info.gather_component), operands.MaskOptional(),
@@ -647,12 +717,23 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id 
 Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
                        const IR::Value& offset, const IR::Value& offset2, Id dref) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    coords = SanitizeCubeDirection(ctx, info, coords);
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    const ImageOperands operands(ctx, offset, offset2);
     if (ctx.profile.need_gather_subpixel_offset) {
         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
     }
+    if (IsDynamicPtp(inst, offset, offset2)) {
+        const Id texture{Texture(ctx, info, index)};
+        const Id color{GatherDynamicPtp(ctx, is_integer, result_type, offset, offset2, [&](Id tap_offset) {
+            return Decorate(ctx, inst,
+                            ctx.OpImageDrefGather(result_type, texture, coords, dref,
+                                                  spv::ImageOperandsMask::Offset,
+                                                  std::span<const Id>{&tap_offset, 1}));
+        })};
+        return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+    }
+    const ImageOperands operands(ctx, offset, offset2);
     const Id color{Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather,
                         ctx, inst, result_type, Texture(ctx, info, index), coords, dref,
                         operands.MaskOptional(), operands.Span())};
@@ -721,6 +802,7 @@ Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, I
 Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
                      Id derivatives, const IR::Value& offset, Id lod_clamp) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
+    coords = SanitizeCubeDirection(ctx, info, coords);
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
     const auto operands = info.num_derivatives == 3
@@ -734,6 +816,47 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, I
     return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
 }
 
+// The guest reads the memory of an image as one R32 and unpacks it itself; a view of the image's
+// own format has already unpacked it. Each component: where it goes and how wide it is.
+static Id PackRawImageLoad(EmitContext& ctx, Id color, RawImageLoad layout, bool is_integer) {
+    struct Field {
+        u32 component;
+        u32 shift;
+        u32 bits;
+    };
+    const auto pack{[&](std::initializer_list<Field> fields) {
+        Id packed{ctx.u32_zero_value};
+        for (const Field& field : fields) {
+            const u32 max{(1U << field.bits) - 1};
+            const Id value{
+                is_integer
+                    ? ctx.OpBitwiseAnd(ctx.U32[1],
+                                       ctx.OpCompositeExtract(ctx.U32[1], color, field.component),
+                                       ctx.Const(max))
+                    : ctx.OpConvertFToU(
+                          ctx.U32[1],
+                          ctx.OpFAdd(ctx.F32[1],
+                                     ctx.OpFMul(ctx.F32[1],
+                                                ctx.OpCompositeExtract(ctx.F32[1], color,
+                                                                       field.component),
+                                                ctx.Const(static_cast<f32>(max))),
+                                     ctx.Const(0.5f)))};
+            packed = ctx.OpBitwiseOr(ctx.U32[1], packed,
+                                     ctx.OpShiftLeftLogical(ctx.U32[1], value, ctx.Const(field.shift)));
+        }
+        return ctx.OpCompositeConstruct(ctx.U32[4], packed, ctx.u32_zero_value, ctx.u32_zero_value,
+                                        ctx.u32_zero_value);
+    }};
+    switch (layout) {
+    case RawImageLoad::B8G8R8A8_UNORM:
+        return pack({{2, 0, 8}, {1, 8, 8}, {0, 16, 8}, {3, 24, 8}});
+    case RawImageLoad::A2B10G10R10_UNORM:
+        return pack({{0, 0, 10}, {1, 10, 10}, {2, 20, 10}, {3, 30, 2}});
+    default:
+        return pack({{0, 0, 8}, {1, 8, 8}, {2, 16, 8}, {3, 24, 8}});
+    }
+}
+
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     if (info.image_format == ImageFormat::Typeless && !ctx.profile.support_typeless_image_loads) {
@@ -744,6 +867,12 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id co
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
     Id color{Emit(&EmitContext::OpImageSparseRead, &EmitContext::OpImageRead, ctx, inst,
                   result_type, image, coords, std::nullopt, std::span<const Id>{})};
+    if (ctx.profile.repack_raw_image_loads && info.type != TextureType::Buffer) {
+        const RawImageLoad raw_load{ctx.images.at(info.descriptor_index).raw_load};
+        if (raw_load != RawImageLoad::None) {
+            return PackRawImageLoad(ctx, color, raw_load, is_integer);
+        }
+    }
     if (!is_integer) {
         color = ctx.OpBitcast(ctx.U32[4], color);
     }

@@ -8,6 +8,7 @@
 #include <chrono>
 
 #include "common/common_types.h"
+#include "core/hardware_properties.h"
 #include "video_core/frame_trace.h"
 
 namespace Core::CpuProfile {
@@ -21,7 +22,7 @@ struct alignas(64) CoreCounters {
     std::array<std::atomic<u64>, static_cast<size_t>(Counter::Count)> values{};
     u32 read_cursor{}; ///< single writer: this emulated core's CPU thread
 };
-inline std::array<CoreCounters, 4> cores;
+inline std::array<CoreCounters, Hardware::NUM_CPU_CORES> cores;
 inline std::atomic_bool enabled{};
 inline thread_local u64 local_flush_ns{};
 inline thread_local Snapshot local_counters{};

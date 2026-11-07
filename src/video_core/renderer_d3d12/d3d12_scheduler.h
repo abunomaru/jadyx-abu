@@ -72,12 +72,21 @@ public:
         }
     }
 
+    /// The PSO was set on the list outside SetPipelineState: the next SetPipelineState records.
+    void ForgetPipelineState() noexcept {
+        current_pipeline = nullptr;
+    }
+
     /// Submits the recorded work; returns the tick it signals.
     u64 Flush();
 
     [[nodiscard]] bool HasGpuTimestamps() const noexcept {
         return timestamp_data != nullptr;
     }
+
+    /// The longest GPU time of one submission finished since the last call, in microseconds
+    /// (0 without timestamps).
+    [[nodiscard]] u64 TakeLongestSubmitUs();
 
     /// Submits the recorded work and waits for the GPU to finish it.
     void Finish();
@@ -113,6 +122,13 @@ public:
     }
     /// Blocks until tick's list reached the queue; at once without a recording worker.
     void WaitSubmitted(u64 tick);
+    /// The next list to reach the queue waits on the GPU until fence reaches value: work recorded
+    /// after this call runs after it, without the CPU waiting. Any thread.
+    void QueueWaitBeforeNextSubmit(ID3D12Fence* fence, u64 value);
+    /// Reaches each tick once its list is done on the GPU; another queue waits for it there.
+    [[nodiscard]] ID3D12Fence* Fence() const noexcept {
+        return fence.Get();
+    }
 
     /// Everything recorded up to now has reached the list once IsRecorded(RecordPoint()) holds:
     /// what the list reads on the CPU when it is called (the RTV/DSV behind a handle) may be
@@ -222,6 +238,7 @@ private:
     bool timestamp_open{};
     std::mutex timestamp_mutex;
     std::deque<std::pair<u64, u32>> pending_timestamps; ///< (tick, slot)
+    u64 longest_submit_us{}; ///< TakeLongestSubmitUs, under timestamp_mutex
 
     static constexpr size_t SYNC_SITE_FRAMES = 6;
     /// Kind ('S' submit, 'W' wait) and return addresses -> count.
@@ -250,6 +267,10 @@ private:
     std::deque<PendingRelease> pending_releases;
     std::vector<std::function<void()>> on_submit;
     std::vector<std::function<void()>> on_reset;
+
+    /// QueueWaitBeforeNextSubmit: consumed by the next SubmitRecorded.
+    std::mutex queue_waits_mutex;
+    std::vector<std::pair<ComPtr<ID3D12Fence>, u64>> queue_waits;
 
     /// Serializes submissions; recursive because submit callbacks may end queries.
     std::recursive_mutex submit_mutex;

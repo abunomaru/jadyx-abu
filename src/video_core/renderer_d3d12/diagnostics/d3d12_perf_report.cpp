@@ -106,7 +106,7 @@ std::string DescribePerf(const VideoCore::Perf::Snapshot& d, double interval_ms)
         "guest flushes {} ({:.1f} ms), new resources {} ({:.1f} ms), CPU texture decode {:.1f} ms, "
         "residual estimate {:.1f} ms (scopes may overlap) | GPU busy {:.1f} ms, {} submits | {} draws, {} dispatches | "
         "uploads {} ({:.2f} MiB, {} GPU-decoded), downloads {} ({:.2f} MiB) | staging: {} "
-        "dedicated ({:.2f} MiB), {} ring waits",
+        "dedicated ({:.2f} MiB), {} ring waits | texture replays {} ({} mismatched)",
         idle, get(Counter::FenceWaits), fence, get(Counter::PipelineStalls), pipelines,
         get(Counter::GpuThreadFlushes), flushes, get(Counter::ResourcesCreated), creates, decodes,
         work,
@@ -117,7 +117,8 @@ std::string DescribePerf(const VideoCore::Perf::Snapshot& d, double interval_ms)
         static_cast<double>(get(Counter::TextureDownloadBytes)) / (1024.0 * 1024.0),
         get(Counter::StagingDedicated),
         static_cast<double>(get(Counter::StagingDedicatedBytes)) / (1024.0 * 1024.0),
-        get(Counter::StagingStreamWaits));
+        get(Counter::StagingStreamWaits), get(Counter::TextureReplays),
+        get(Counter::TextureReplayMismatches));
 }
 
 /// Where the GPU thread's draws spend their time (per draw, in microseconds), what is left outside
@@ -165,8 +166,9 @@ std::string DescribeDrawCosts(const VideoCore::Perf::Snapshot& d, double interva
         "samplers {:.1f}, record {:.1f}), clears {:.1f} ms, dispatches {:.1f} ms, "
         "outside them {:.1f} ms | pipeline fast path {} hits / {} misses, {} key reuses ({} "
         "mismatched) | CBV {} ({:.1f} ms: "
-        "{} streamed, {} persistent, {} null; {} root, {} root clamped), view copies {} "
-        "({:.1f} ms), tables {} reused of {} | guest waited for "
+        "{} streamed ({} reused), {} persistent, {} null; {} root, {} root clamped), view copies {} "
+        "({:.1f} ms), tables {} reused of {}, stage views {} reused / {} resolved, "
+        "attachments kept {} | guest waited for "
         "the GPU {} times ({:.1f} ms in all), syncpoints signalled {} at once and after the GPU "
         "{} (buffer downloads {}, image downloads {}, query flushes {}, operations {}, earlier "
         "fences {}) | commands: {} submit lists {:.1f} ms ({:.1f} ms "
@@ -180,7 +182,8 @@ std::string DescribeDrawCosts(const VideoCore::Perf::Snapshot& d, double interva
         "staging {:.1f}, unswizzle {:.1f}, "
         "backend {:.1f} ms | DMA: "
         "puller {} / {:.1f} ms, macros {} / {:.1f} ms, Maxwell {} / {:.1f} ms, compute {} / "
-        "{:.1f} ms, copies {} / {:.1f} ms, other {} / {:.1f} ms | Maxwell dirty: {} changed, "
+        "{:.1f} ms, copies {} / {:.1f} ms, other {} / {:.1f} ms, header flushes {} done, {} "
+        "skipped | Maxwell dirty: {} changed, "
         "{} identical skipped | index rewrites: {} new, {} reused, {} rechecked, {:.1f} ms | "
         "CB_DATA blocks: {} ({} words) | blit uploads skipped: {} ({} KiB, {} put back)",
         draw_ms, per_draw(Counter::DrawNs), per_draw(Counter::DrawTexturesNs),
@@ -192,10 +195,13 @@ std::string DescribeDrawCosts(const VideoCore::Perf::Snapshot& d, double interva
         get(Counter::PipelineFastHits), get(Counter::PipelineFastMisses),
         get(Counter::PipelineKeyReuses), get(Counter::PipelineKeyMismatches),
         get(Counter::CbvCreates), ns_ms(Counter::CbvCreateNs), get(Counter::CbvStreamed),
-        get(Counter::CbvPersistent), get(Counter::CbvNull), get(Counter::CbvRoot),
+        get(Counter::CbvReused), get(Counter::CbvPersistent), get(Counter::CbvNull),
+        get(Counter::CbvRoot),
         get(Counter::CbvRootClamped), get(Counter::ViewCopies),
         ns_ms(Counter::ViewCopyNs), get(Counter::DescriptorTableReuses),
         get(Counter::DescriptorTables),
+        get(Counter::StageViewReuses), get(Counter::StageViewMisses),
+        get(Counter::RenderTargetEarlyOuts),
         get(Counter::GuestGpuWaits), Ms(d, Counter::GuestGpuWaitUs),
         get(Counter::SyncpointsEarly),
         get(Counter::SyncpointsAfterBufferDownloads) + get(Counter::SyncpointsAfterTextureDownloads) +
@@ -224,6 +230,7 @@ std::string DescribeDrawCosts(const VideoCore::Perf::Snapshot& d, double interva
         ns_ms(Counter::DmaMacroNs), get(Counter::DmaMaxwellCalls), ns_ms(Counter::DmaMaxwellNs),
         get(Counter::DmaComputeCalls), ns_ms(Counter::DmaComputeNs), get(Counter::DmaCopyCalls),
         ns_ms(Counter::DmaCopyNs), get(Counter::DmaOtherCalls), ns_ms(Counter::DmaOtherNs),
+        get(Counter::DmaHeaderFlushes), get(Counter::DmaHeaderFlushesSkipped),
         get(Counter::MaxwellDirtyChanged), get(Counter::MaxwellDirtyUnchanged),
         get(Counter::IndexRewrites), get(Counter::IndexRewriteReuses),
         get(Counter::IndexRewriteRechecks), ns_ms(Counter::IndexRewriteNs),
@@ -254,6 +261,25 @@ std::string DescribeGuestWaitSites() {
         ++emitted;
     }
     return result.empty() ? "none" : result;
+}
+
+/// Why the emulated cores left the JIT, with the supervisor calls that did it most.
+std::string DescribeGuestExits(const VideoCore::Perf::Snapshot& d) {
+    const auto get = [&d](Counter counter) { return VideoCore::Perf::Get(d, counter); };
+    const auto svcs = VideoCore::Perf::TakeGuestSvcExits();
+    std::array<size_t, VideoCore::Perf::NUM_GUEST_SVCS> order{};
+    std::iota(order.begin(), order.end(), 0);
+    std::ranges::sort(order, [&svcs](size_t left, size_t right) { return svcs[left] > svcs[right]; });
+    std::string top;
+    for (size_t index = 0; index < 5 && svcs[order[index]] != 0; ++index) {
+        top += fmt::format("{}0x{:x} x{}", top.empty() ? "" : ", ", order[index], svcs[order[index]]);
+    }
+    return fmt::format("guest JIT runs ended {} times: {} supervisor calls ({}), {} interrupts, "
+                       "{} code cache invalidations, {} data aborts",
+                       get(Counter::GuestRunExits), get(Counter::GuestExitsSvc),
+                       top.empty() ? "none" : top, get(Counter::GuestExitsInterrupt),
+                       get(Counter::GuestExitsCacheInvalidation),
+                       get(Counter::GuestExitsDataAbort));
 }
 
 std::string DescribeMacroProfiles() {
@@ -293,14 +319,30 @@ std::string DescribeFrameChain(const VideoCore::Perf::Snapshot& d) {
         "thread {:.1f} ms | composites {} ({:.1f} ms after the request on average, {} over a "
         "frame) | game waited for a free framebuffer {} times ({:.1f} ms) | forced {} swap "
         "intervals to one | emulated cores idle {:.1f} ms in all, woken {} times while "
-        "spinning and {} after blocking",
+        "spinning and {} after blocking | present frame waits: free {:.1f} ms, render {:.1f} ms, "
+        "copy {:.1f} ms, {} over 1 ms; {} queued frames reused ({} would be) | vsync waits for "
+        "the GPU thread cut at 2 ms {} times, {} full waits | game changed its swap interval {} "
+        "times ({} frames of 3 paced at 2) | CPU writes queued without the cache locks {} ({} would be, {} mismatches, {} "
+        "with the queue full), {} applied, {} GPU-modified meanwhile | JIT load table: {} pages "
+        "left after GPU writes, {} slow loads would be inline ({} mismatches), {} flushes of "
+        "unmarked memory",
         get(Counter::GuestFramesQueued), get(Counter::Vsyncs), get(Counter::VsyncsLost),
         get(Counter::VsyncFrames), Ms(d, Counter::VsyncComposeWaitUs), get(Counter::Composites),
         average_ms(Counter::CompositeLatencyUs, Counter::Composites), get(Counter::CompositesLate),
         get(Counter::GuestDequeueWaits), Ms(d, Counter::GuestDequeueWaitUs),
         get(Counter::GuestSwapIntervalOverrides),
         Ms(d, Counter::GuestCoreIdleUs), get(Counter::GuestCoreWakesSpun),
-        get(Counter::GuestCoreWakesBlocked));
+        get(Counter::GuestCoreWakesBlocked), Ms(d, Counter::PresentFreeWaitUs),
+        Ms(d, Counter::PresentRenderWaitUs), Ms(d, Counter::PresentCopyWaitUs),
+        get(Counter::PresentWaitsLong), get(Counter::PresentsReplaced),
+        get(Counter::PresentsWouldReplace), get(Counter::VsyncComposeWaitsCut),
+        get(Counter::VsyncComposeWaitsFull), get(Counter::GuestSwapIntervalChanges), get(Counter::GuestSwapIntervalsHeld),
+        get(Counter::CpuWritesDeferred), get(Counter::CpuWritesWouldDefer),
+        get(Counter::CpuWriteDeferMismatches), get(Counter::CpuWriteQueueFull),
+        get(Counter::CpuWritesDrained), get(Counter::CpuWritesLateGpu),
+        get(Counter::JitReadPagesCleared), get(Counter::JitReadsWouldInline),
+        get(Counter::JitReadMismatches), get(Counter::GpuFlushUnmarked)) +
+        " | " + DescribeGuestExits(d);
 }
 
 /// The largest share of a slow frame, in words.
@@ -390,6 +432,8 @@ void RendererD3D12::ReportPerf(double interval_ms) {
     const HostTotals host = ReadHostTotals();
     const HostTotals host_delta = HostDelta(host, hitch.host);
     hitch.host = host;
+    // Every frame, so a hitch names only its own submissions.
+    const double longest_submit_ms = static_cast<double>(scheduler.TakeLongestSubmitUs()) / 1000.0;
 
     // A second without a present is a pause (menus, loading screens), not a hitch.
     constexpr double PAUSE_MS = 1000.0;
@@ -489,6 +533,21 @@ void RendererD3D12::ReportPerf(double interval_ms) {
              get(Counter::GpuThreadFlushes), at(HitchCause::NewResources),
              get(Counter::ResourcesCreated), at(HitchCause::TextureDecode),
              get(Counter::GuestFramesQueued), Ms(delta, Counter::GpuBusyUs));
+    // What the GPU ran in the frame, to tell heavy work from a submission held up by paging
+    // (one long submission with ordinary counts, local memory at its budget).
+    const DXGI_QUERY_VIDEO_MEMORY_INFO memory = device.QueryVideoMemory();
+    constexpr double MIB = 1024.0 * 1024.0;
+    LOG_INFO(Render,
+             "Hitch GPU work: longest submission {:.1f} ms of {} | {} draws, {} dispatches | "
+             "uploads {} ({:.2f} MiB, {} GPU-decoded), downloads {} ({:.2f} MiB) | local memory "
+             "{:.0f}/{:.0f} MiB",
+             longest_submit_ms, get(Counter::Submits), get(Counter::Draws),
+             get(Counter::Dispatches), get(Counter::TextureUploads),
+             static_cast<double>(get(Counter::TextureUploadBytes)) / MIB,
+             get(Counter::TextureGpuDecodes), get(Counter::TextureDownloads),
+             static_cast<double>(get(Counter::TextureDownloadBytes)) / MIB,
+             static_cast<double>(memory.CurrentUsage) / MIB,
+             static_cast<double>(memory.Budget) / MIB);
     if (VideoCore::Perf::DetailedGpuProfileEnabled()) {
         LOG_INFO(Render, "Hitch detail: {}", DescribeDrawCosts(delta, interval_ms));
     }
@@ -540,6 +599,18 @@ void RendererD3D12::ReportPerfWindow(u32 frames, double total_ms) {
                  mib(get(Counter::TransferPoolOverflowBytes)), mib(transfer_buffers.PooledBytes()));
         if (VideoCore::Perf::DetailedGpuProfileEnabled()) {
             LOG_INFO(Render, "D3D12 transfer buffer users: {}", transfer_buffers.TakeUserReport());
+        }
+        if (const u64 sampled = get(Counter::TessDrawsSampled); sampled != 0) {
+            const auto us = [&](Counter counter) {
+                return static_cast<double>(get(counter)) / (1000.0 * static_cast<double>(sampled));
+            };
+            LOG_INFO(Render,
+                     "D3D12 tessellation GPU per draw: capture {:.2f} us, control {:.2f} us, "
+                     "barriers {:.2f} us, tessellator {:.2f} us, readback {:.2f} us, draw {:.2f} us "
+                     "({} sampled draws)",
+                     us(Counter::TessCaptureGpuNs), us(Counter::TessControlGpuNs),
+                     us(Counter::TessBarriersGpuNs), us(Counter::TessTessellateGpuNs), us(Counter::TessReadbackGpuNs),
+                     us(Counter::TessDrawGpuNs), sampled);
         }
     }
     if (VideoCore::Perf::DetailedGpuProfileEnabled()) {
@@ -624,6 +695,22 @@ void RendererD3D12::ReportPerfWindow(u32 frames, double total_ms) {
              VideoCore::Perf::Get(delta, Counter::PsoCreates), Ms(delta, Counter::PsoCreateUs));
     LOG_INFO(Render, "D3D12 depth feedback: {} GPU copies in total",
              texture_cache_runtime.DepthFeedbackCopies());
+    {
+        const auto get = [&](Counter counter) { return VideoCore::Perf::Get(delta, counter); };
+        const auto mib = [](u64 bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
+        const u64 query_waits = get(Counter::QueryBlockingWaits);
+        LOG_INFO(Render,
+                 "D3D12 corrections: {} draws, {} tessellated, {} generated geometry, {} stencil "
+                 "face splits; copies: {} logic op ({:.2f} MiB whole), {} of them level-only, {} "
+                 "snapshots reused; {} depth feedback; {} query "
+                 "waits / {:.2f} ms ({:.3f} ms per wait)",
+                 get(Counter::Draws), get(Counter::TessDraws), get(Counter::GeneratedGeometryDraws),
+                 get(Counter::StencilFaceSplits), get(Counter::LogicOpCopies),
+                 mib(get(Counter::LogicOpCopyBytes)), get(Counter::SnapshotLevelCopies),
+                 get(Counter::SnapshotReuses), get(Counter::DepthFeedbackCopies), query_waits,
+                 Ms(delta, Counter::QueryBlockingWaitUs),
+                 query_waits != 0 ? Ms(delta, Counter::QueryBlockingWaitUs) / query_waits : 0.0);
+    }
     LOG_INFO(Render, "D3D12 guest JIT: {} full code cache clears in total",
              Dynarmic::JitProfile::full_cache_clears.load(std::memory_order_relaxed));
     if (Core::CpuProfile::Enabled()) {

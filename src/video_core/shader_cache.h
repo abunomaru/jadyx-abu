@@ -77,6 +77,11 @@ public:
     /// @brief Flushes delayed removal operations
     void SyncGuestHost();
 
+    /// Drops the native programs the debug server rejects so their next draw or dispatch lowers
+    /// them again (and fails); after an un-reject, forgets every rejection so they are retried.
+    /// Runs on the thread that owns the cache, between frames.
+    void RefreshDebugRejections(bool unrejected);
+
 protected:
     struct GraphicsEnvironments {
         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;
@@ -104,6 +109,8 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
+    /// rasterize_enable when the stages were last read: it decides whether the pixel stage counts.
+    bool last_rasterize_enable = true;
 
 private:
     friend struct ShaderCacheTestAccess;

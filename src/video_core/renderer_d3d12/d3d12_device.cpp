@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <iterator>
@@ -10,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <fmt/format.h>
@@ -18,13 +21,24 @@
 #include "common/logging.h"
 #include "common/memory_ledger.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "video_core/renderer_d3d12/d3d12_command_stream.h"
 #include "video_core/renderer_d3d12/d3d12_debug_messages.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
+#include "video_core/renderer_d3d12/d3d12_memory_import_probe.h"
 
 namespace D3D12 {
 
+bool Device::SupportsConservativeRaster() const {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    return SUCCEEDED(Get()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
+                                                sizeof(options))) &&
+           options.ConservativeRasterizationTier !=
+               D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+}
+
 namespace {
+std::atomic<bool> present_queue_enabled{false}; ///< SetPresentQueue
 
 std::string Narrow(const wchar_t* wide) {
     std::string out;
@@ -93,6 +107,8 @@ u64 detail_sequence{};
 u64 diagnostic_sequence{};
 std::atomic_flag diagnostic_dumped{};
 std::atomic<AppMemoryQuery> app_memory_query{nullptr};
+std::atomic<u64> last_gpu_used{};
+std::atomic<u64> last_gpu_budget{};
 bool breadcrumbs_enabled = false;
 // Two tokens: [0] the last command the GPU started, [1] the last it finished. A readback heap
 // stays mapped, and its memory is still readable after the device is removed.
@@ -181,6 +197,12 @@ void SetAppMemoryQuery(AppMemoryQuery query) {
     app_memory_query.store(query, std::memory_order_release);
 }
 
+bool LastGpuMemory(u64& used, u64& budget) {
+    budget = last_gpu_budget.load(std::memory_order_relaxed);
+    used = last_gpu_used.load(std::memory_order_relaxed);
+    return budget != 0;
+}
+
 namespace {
 void CreateBreadcrumbBuffer(ID3D12Device* device) {
     breadcrumb_address.store(0, std::memory_order_relaxed);
@@ -259,8 +281,14 @@ Device::Device() {
             LOG_INFO(Render, "D3D12: DRED not available");
         }
     }
+    // Gates only: JADYX_D3D12_WARP picks WARP, a cache-coherent UMA device like the console.
+    ComPtr<IDXGIAdapter> warp;
+    if (std::getenv("JADYX_D3D12_WARP") != nullptr &&
+        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)))) {
+        warp.Reset();
+    }
     // Feature level 11.0 is all Xbox Series UWP offers; desktop GPUs accept it too.
-    ThrowIfFailed(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
+    ThrowIfFailed(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
                   "D3D12CreateDevice");
     if (debug_layer && SUCCEEDED(device.As(&info_queue))) {
         // Guest images are created before the guest says what it clears them to, so every
@@ -302,6 +330,26 @@ Device::Device() {
     };
     ThrowIfFailed(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)),
                   "CreateCommandQueue");
+    if (present_queue_enabled.load(std::memory_order_relaxed)) {
+        // High priority: a late present is a visible stutter, the copy is tiny.
+        const D3D12_COMMAND_QUEUE_DESC present_desc{
+            .Type = D3D12_COMMAND_LIST_TYPE_DIRECT,
+            .Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
+            .Flags = D3D12_COMMAND_QUEUE_FLAG_NONE,
+            .NodeMask = 0,
+        };
+        const HRESULT hr =
+            device->CreateCommandQueue(&present_desc, IID_PPV_ARGS(&present_queue));
+        if (SUCCEEDED(hr)) {
+            present_queue->SetName(L"Present queue");
+            LOG_INFO(Render, "D3D12: presentation on a queue of its own");
+        } else {
+            present_queue.Reset();
+            LOG_WARNING(Render, "D3D12: present queue rejected (0x{:08X}); presenting on the "
+                                "emulation queue",
+                        static_cast<u32>(hr));
+        }
+    }
     ThrowIfFailed(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
                   "CreateFence");
     fence_event = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
@@ -311,6 +359,10 @@ Device::Device() {
 
     CreateBreadcrumbBuffer(device.Get());
     LogCapabilities();
+    if (GetMemoryImportProbe()) {
+        LOG_INFO(Render, "D3D12: memory import probe: {}",
+                 DescribeMemoryImportProbe(ProbeMemoryImport(device.Get())));
+    }
     if (SUCCEEDED(device.As(&device2))) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS2 options2{};
         depth_bounds = Query(device.Get(), D3D12_FEATURE_D3D12_OPTIONS2, options2) &&
@@ -329,9 +381,21 @@ Device::Device() {
     Common::SetGpuMemoryUnified(arch_known && arch.UMA);
     discrete_memory = arch_known && !arch.UMA;
     if (discrete_memory) {
-        const DXGI_QUERY_VIDEO_MEMORY_INFO cache = QueryCacheVideoMemory();
+        const DXGI_QUERY_VIDEO_MEMORY_INFO cache = ReadCacheVideoMemory();
         LOG_INFO(Render, "D3D12: discrete GPU memory: caches collect against {} MiB ({} MiB local)",
                  cache.Budget >> 20, initial_budget >> 20);
+    }
+    if (adapter3) {
+        // QueryVideoMemoryInfo enters the graphics kernel. On the GPU thread, with both cache locks
+        // held, every kernel stall there also stopped the guest cores waiting on those locks.
+        PublishCacheVideoMemory(ReadCacheVideoMemory());
+        video_memory_thread = std::jthread([this](std::stop_token stop) {
+            Common::SetCurrentThreadName("D3D12VideoMemory");
+            while (!stop.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                PublishCacheVideoMemory(ReadCacheVideoMemory());
+            }
+        });
     }
 }
 
@@ -572,13 +636,18 @@ struct ProbeList {
 /// happens between recording and Close, such as a resource released too early).
 ProbeList probe_window;
 ProbeList probe_whole;
+ProbeList probe_replay;
 std::vector<std::string> window_calls;
+std::vector<std::function<void(ID3D12GraphicsCommandList*)>> window_runs;
+/// The state the window started from and a list to get the device from, for its replay.
+ProbeState window_start;
+ID3D12GraphicsCommandList* window_real{};
 u64 window_index{};
 u64 window_failures{};
 u64 probed_calls{};
 bool whole_failed{};
 
-bool OpenProbe(ID3D12GraphicsCommandList* real, ProbeList& probe) {
+bool OpenProbe(ID3D12GraphicsCommandList* real, ProbeList& probe, const ProbeState& state) {
     if (probe.open) {
         return true;
     }
@@ -600,17 +669,17 @@ bool OpenProbe(ID3D12GraphicsCommandList* real, ProbeList& probe) {
     }
     probe.open = true;
     // The state the real list has here, which the commands are checked against.
-    if (probe_state.heap_count != 0) {
-        probe.list->SetDescriptorHeaps(probe_state.heap_count, probe_state.heaps.data());
+    if (state.heap_count != 0) {
+        probe.list->SetDescriptorHeaps(state.heap_count, state.heaps.data());
     }
-    if (probe_state.graphics) {
-        probe.list->SetGraphicsRootSignature(probe_state.graphics);
+    if (state.graphics) {
+        probe.list->SetGraphicsRootSignature(state.graphics);
     }
-    if (probe_state.compute) {
-        probe.list->SetComputeRootSignature(probe_state.compute);
+    if (state.compute) {
+        probe.list->SetComputeRootSignature(state.compute);
     }
-    if (probe_state.pipeline) {
-        probe.list->SetPipelineState(probe_state.pipeline);
+    if (state.pipeline) {
+        probe.list->SetPipelineState(state.pipeline);
     }
     return true;
 }
@@ -648,6 +717,39 @@ void QueryError(std::string_view what) {
     }
 }
 
+/// Whether a new list with the window's first count commands closes, or with only the one at
+/// index when alone is set.
+bool ReplayCloses(size_t count, bool alone) {
+    if (!OpenProbe(window_real, probe_replay, window_start)) {
+        return true;
+    }
+    for (size_t i = alone ? count : 0; i < (alone ? count + 1 : count); ++i) {
+        window_runs[i](probe_replay.list.Get());
+    }
+    return CloseProbe(probe_replay);
+}
+
+/// Names the first command of a failing window that makes Close fail.
+void ReplayFailedWindow() {
+    LOG_CRITICAL(Render, "D3D12 close probe: window started with signature={} PSO={}",
+                 static_cast<void*>(window_start.graphics),
+                 static_cast<void*>(window_start.pipeline));
+    for (size_t count = 0; count <= window_runs.size(); ++count) {
+        if (ReplayCloses(count, false)) {
+            continue;
+        }
+        if (count == 0) {
+            LOG_CRITICAL(Render, "D3D12 close probe: the window's starting state alone fails");
+            return;
+        }
+        LOG_CRITICAL(Render, "D3D12 close probe: first failing command: {}; alone it {}",
+                     window_calls[count - 1],
+                     ReplayCloses(count - 1, true) ? "closes" : "fails too");
+        return;
+    }
+    LOG_CRITICAL(Render, "D3D12 close probe: the window closed when run again");
+}
+
 void CloseWindow() {
     if (window_calls.empty()) {
         return;
@@ -661,12 +763,14 @@ void CloseWindow() {
             for (const std::string& call : window_calls) {
                 LOG_CRITICAL(Render, "D3D12 close probe:   {}", call);
             }
+            ReplayFailedWindow();
         } else if ((window_failures & (window_failures - 1)) == 0) {
             LOG_CRITICAL(Render, "D3D12 close probe: {} windows failed Close so far",
                          window_failures);
         }
     }
     window_calls.clear();
+    window_runs.clear();
 }
 } // Anonymous namespace
 
@@ -689,6 +793,10 @@ void ProbeTrackPipeline(ID3D12PipelineState* pipeline) {
 void ProbeResetState() {
     std::scoped_lock lock{probe_mutex};
     probe_state = {};
+}
+
+void SetPresentQueue(bool enabled) {
+    present_queue_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 void SetCloseProbeEnabled(bool enabled) {
@@ -735,14 +843,14 @@ void ProbeTrackQuery(bool begin, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, U
 }
 
 void ProbeAppend(ID3D12GraphicsCommandList* list,
-                 void (*run)(void* ctx, ID3D12GraphicsCommandList* scratch), void* ctx,
-                 const char* call, std::string arguments) {
+                 std::function<void(ID3D12GraphicsCommandList*)> run, const char* call,
+                 std::string arguments) {
     std::scoped_lock lock{probe_mutex};
     if (!close_probe_enabled.load(std::memory_order_relaxed)) {
         return;
     }
-    if (OpenProbe(list, probe_whole)) {
-        run(ctx, probe_whole.list.Get());
+    if (OpenProbe(list, probe_whole, probe_state)) {
+        run(probe_whole.list.Get());
     }
     // Begin and End fall in different windows: ProbeTrackQuery pairs them over the whole list.
     const std::string_view name{call};
@@ -750,10 +858,15 @@ void ProbeAppend(ID3D12GraphicsCommandList* list,
         ++probed_calls;
         return;
     }
-    if (!OpenProbe(list, probe_window)) {
+    if (!probe_window.open) {
+        window_start = probe_state;
+    }
+    if (!OpenProbe(list, probe_window, probe_state)) {
         return;
     }
-    run(ctx, probe_window.list.Get());
+    run(probe_window.list.Get());
+    window_real = list;
+    window_runs.push_back(std::move(run));
     window_calls.push_back(fmt::format("#{} {} {}", probed_calls++, call, arguments));
     if (window_calls.size() >= PROBE_WINDOW) {
         CloseWindow();
@@ -1059,6 +1172,8 @@ void Device::LogCapabilities() const {
 CacheMemorySnapshot Device::QueryCacheMemoryPressure() const {
     const auto local = QueryCacheVideoMemory();
     CacheMemorySnapshot result{.gpu_used = local.CurrentUsage, .gpu_budget = local.Budget};
+    last_gpu_used.store(local.CurrentUsage, std::memory_order_relaxed);
+    last_gpu_budget.store(local.Budget, std::memory_order_relaxed);
     if (const auto query = app_memory_query.load(std::memory_order_acquire)) {
         if (!query(result.app_used, result.app_limit)) {
             result.app_used = result.app_limit = 0;
@@ -1103,6 +1218,18 @@ DXGI_QUERY_VIDEO_MEMORY_INFO Device::QueryVideoMemory() const {
 }
 
 DXGI_QUERY_VIDEO_MEMORY_INFO Device::QueryCacheVideoMemory() const {
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    info.CurrentUsage = cache_video_used.load(std::memory_order_relaxed);
+    info.Budget = cache_video_budget.load(std::memory_order_relaxed);
+    return info;
+}
+
+void Device::PublishCacheVideoMemory(const DXGI_QUERY_VIDEO_MEMORY_INFO& info) {
+    cache_video_used.store(info.CurrentUsage, std::memory_order_relaxed);
+    cache_video_budget.store(info.Budget, std::memory_order_relaxed);
+}
+
+DXGI_QUERY_VIDEO_MEMORY_INFO Device::ReadCacheVideoMemory() const {
     DXGI_QUERY_VIDEO_MEMORY_INFO local = QueryVideoMemory();
     DXGI_QUERY_VIDEO_MEMORY_INFO system{};
     if (!discrete_memory || local.Budget == 0 ||

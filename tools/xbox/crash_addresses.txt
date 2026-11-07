@@ -1,0 +1,7 @@
+# Crash addresses to symbolize in CI (job "symbolize"): first line the CI run id whose jadyx-build
+# artifact matches the installed package, then one jadyx.exe+RVA per line, from jadyx_diag.txt.
+42275260508
+0xe0f5f4
+0xe0baa8
+0xe10e2c
+0xb8fd30

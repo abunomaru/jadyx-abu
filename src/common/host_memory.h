@@ -12,6 +12,7 @@
 #include <string>
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "common/guest_zero_census.h"
 
 namespace Common {
 
@@ -25,6 +26,38 @@ struct HostMemoryFastmemRegion {
 void ConfigureHostMemoryFastmem(size_t hot_mib, bool force_full);
 [[nodiscard]] size_t HostMemoryFastmemHotSize();
 [[nodiscard]] bool HostMemoryFastmemForceFull();
+
+/// Xbox private DRAM backing: cold guest memory written to a swap file (Permafrost, common/permafrost.h).
+/// Configured by the UWP frontend before Core::System creates DeviceMemory; off unless enabled.
+struct GuestSwapSettings {
+    bool enabled{};
+    std::wstring path;
+    u64 reserve_bytes{};
+    u32 probation_ms{1500};
+    u32 min_idle_ms{8000};
+    u64 batch_bytes{64ULL << 20};
+    u32 fill_pages{4};
+    bool prefetch{true};
+    bool pause_fill{true};
+};
+void ConfigureGuestSwap(const GuestSwapSettings& settings);
+/// Whether the backing in use writes cold memory out.
+[[nodiscard]] bool GuestSwapActive();
+/// How short of memory the swapper's caller is.
+enum class GuestSwapPressure : u8 {
+    Watch,     // close: the access sampling runs, nothing goes out
+    Low,       // short: idle granules go out
+    Urgent,    // far short
+    Emergency, // commits about to fail
+};
+/// One pass of the swapper: tries to give back `want` bytes, written out by its own threads.
+/// Returns the bytes those threads gave back since the last pass.
+u64 StepGuestSwap(u64 want, GuestSwapPressure pressure);
+/// Commits again the reserve given up to a failed demand commit. True when it is held.
+bool RefillGuestSwapReserve();
+/// Whether a demand commit failed and took the reserve since it was last refilled.
+[[nodiscard]] bool GuestSwapReserveReleased();
+[[nodiscard]] std::string DescribeGuestSwap();
 
 enum class MemoryPermission : u32 {
     Read = 1 << 0,
@@ -160,6 +193,10 @@ struct DramRegion {
     bool untouched{};
 };
 std::optional<DramRegion> QueryDramRegion(const void* host);
+
+/// Diagnostic, Xbox private DRAM backing: the committed bytes that hold only zeros, by guest swap
+/// granule. Reads every committed page, so it costs a pass over the DRAM. Empty elsewhere.
+std::optional<GuestZeroCensus> CensusGuestZeroMemory();
 
 /// Diagnostic: the commit state of the DRAM page at `host`, and the last kernel clear that
 /// decommitted it.

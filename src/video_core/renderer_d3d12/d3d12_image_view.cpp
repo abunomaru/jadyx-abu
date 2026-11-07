@@ -36,9 +36,21 @@ ImageView::ImageView(TextureCacheRuntime& runtime_, const VideoCommon::ImageView
         format_info = DecodedBcFormat(info.format).value_or(source.TransferFormat());
     } else if (VideoCore::Surface::IsPixelFormatASTC(info.format)) {
         // ASTC arrays may be RGBA8 where the rest is recompressed: as the image decided.
-        format_info = AstcFormat(info.format, VideoCommon::AstcRecompressionFor(source.info));
+        format_info = AstcFormatFor(source.info);
     }
     auto swizzle = info.Swizzle();
+    // Alpha masks (BC4) read as RGBA through the swizzle, render-target views included.
+    const VideoCommon::AstcMask astc_mask =
+        VideoCore::Surface::IsPixelFormatASTC(info.format) && !source.IsBcDecoded()
+            ? VideoCommon::AstcAlphaMaskFor(source.info)
+            : VideoCommon::AstcMask::None;
+    if (astc_mask != VideoCommon::AstcMask::None) {
+        if (info.IsRenderTarget()) {
+            using enum Tegra::Texture::SwizzleSource;
+            swizzle = {R, G, B, A};
+        }
+        AstcMaskSwizzle(astc_mask, swizzle);
+    }
     // As the Vulkan backend (ImageViewAspectMask): a sampled view of a depth-stencil image reads
     // its stencil when the swizzle selects the stencil component (R of S8_UINT_D24_UNORM, any
     // but R of the others). Reading depth there instead hands the shader float bits where it
@@ -88,19 +100,22 @@ ImageView::ImageView(TextureCacheRuntime& runtime_, const VideoCommon::ImageView
                                    : resource_desc.DepthOrArraySize;
     // A view past the end of its resource is undefined in D3D12: the PC's driver tolerates it,
     // AMD's may build a descriptor that addresses the wrong memory. Clamp it (and say so).
-    // A served-down image starts its host chain lower: the guest's level N is the host's
-    // N - dropped (d3d12_texture_downscale.h). The clamp below still keeps the view in bounds.
-    const u32 dropped_levels = source.DroppedLevels();
-    const u32 base_level = std::min(static_cast<u32>(info.range.base.level) + dropped_levels,
-                                    resource_levels - 1);
+    // Images without their top level (SetAstcDropTopLevel) start at guest level LevelBias():
+    // views of the levels left out read the resource's top instead.
+    const u32 level_bias = source.LevelBias();
+    const u32 guest_base = static_cast<u32>(info.range.base.level);
+    const u32 skipped_levels = guest_base < level_bias ? level_bias - guest_base : 0;
+    const u32 wanted_base = guest_base + skipped_levels - level_bias;
+    const u32 wanted_levels =
+        std::max(1U, static_cast<u32>(info.range.extent.levels) - std::min(
+                         skipped_levels, static_cast<u32>(info.range.extent.levels)));
+    const u32 base_level = std::min(wanted_base, resource_levels - 1);
     const u32 base_layer = std::min(static_cast<u32>(info.range.base.layer), resource_array - 1);
-    const u32 levels = std::clamp(static_cast<u32>(info.range.extent.levels), 1U,
-                                  resource_levels - base_level);
+    const u32 levels = std::clamp(wanted_levels, 1U, resource_levels - base_level);
     const u32 layers = std::clamp(static_cast<u32>(info.range.extent.layers), 1U,
                                   resource_array - base_layer);
-    if (base_level != static_cast<u32>(info.range.base.level) ||
+    if (base_level != wanted_base || levels != wanted_levels ||
         base_layer != static_cast<u32>(info.range.base.layer) ||
-        levels != static_cast<u32>(info.range.extent.levels) ||
         layers != static_cast<u32>(info.range.extent.layers)) {
         static std::atomic<u32> logged_clamps{};
         if (logged_clamps.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -157,7 +172,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime_, const VideoCommon::ImageView
         .format = format_info.srv,
         // Render-target views (blits, the display) carry no swizzle: sample them as stored, as
         // the Vulkan backend does.
-        .mapping = info.IsRenderTarget()
+        .mapping = info.IsRenderTarget() && astc_mask == VideoCommon::AstcMask::None
                        ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
                        : D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
                              Component(swizzle[0]), Component(swizzle[1]),
@@ -395,8 +410,15 @@ D3D12_CPU_DESCRIPTOR_HANDLE ImageView::Handle(Shader::TextureType texture_type) 
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE ImageView::DepthFeedbackHandle(Shader::TextureType texture_type) const {
+    // The snapshot of the resource the view's SRVs read, so it takes their format.
     Image* const source = SourceImage();
-    if (!source || !source->DepthFeedback()) {
+    ID3D12Resource* snapshot = nullptr;
+    if (source && ReadsReinterpretedCopy()) {
+        snapshot = source->ReinterpretedSnapshot();
+    } else if (source && source->DepthFeedback()) {
+        snapshot = source->DepthFeedback()->Handle();
+    }
+    if (!snapshot) {
         return Handle(texture_type);
     }
     if (!depth_feedback_srvs) {
@@ -405,13 +427,13 @@ D3D12_CPU_DESCRIPTOR_HANDLE ImageView::DepthFeedbackHandle(Shader::TextureType t
     }
     auto& handle = depth_feedback_srvs->at(static_cast<size_t>(texture_type));
     if (!handle.ptr) {
-        handle = CreateSrv(texture_type, source->DepthFeedback()->Handle());
+        handle = CreateSrv(texture_type, snapshot);
     }
     return handle;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE ImageView::StencilHandle() const {
-    if (stencil_srv.ptr || !runtime || !image || srv_params.is_msaa ||
+    if (stencil_srv.ptr || !runtime || !image ||
         srv_params.dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
         return stencil_srv;
     }
@@ -434,15 +456,37 @@ D3D12_CPU_DESCRIPTOR_HANDLE ImageView::StencilHandle() const {
         .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
         .Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(1, 1, 1, 1),
     };
-    desc.Texture2DArray = {.MostDetailedMip = srv_params.base_level,
-                           .MipLevels = 1,
-                           .FirstArraySlice = srv_params.base_layer,
-                           .ArraySize = 1,
-                           .PlaneSlice = 1,
-                           .ResourceMinLODClamp = 0.0f};
+    if (srv_params.is_msaa) {
+        // A multisampled view has no plane slice: the format alone selects the plane.
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+        desc.Texture2DMSArray = {srv_params.base_layer, 1};
+    } else {
+        desc.Texture2DArray = {.MostDetailedMip = srv_params.base_level,
+                               .MipLevels = 1,
+                               .FirstArraySlice = srv_params.base_layer,
+                               .ArraySize = 1,
+                               .PlaneSlice = 1,
+                               .ResourceMinLODClamp = 0.0f};
+    }
     stencil_srv = runtime->view_descriptors.Allocate();
     runtime->device.Get()->CreateShaderResourceView(image, &desc, stencil_srv);
     return stencil_srv;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE ImageView::MultisampleHandle() const {
+    if (multisample_srv.ptr || !runtime || !image || !srv_params.is_msaa) {
+        return multisample_srv;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc{
+        .Format = srv_params.format,
+        .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+        .Shader4ComponentMapping = srv_params.mapping,
+    };
+    desc.Texture2DMSArray = {srv_params.base_layer, 1};
+    multisample_srv = runtime->view_descriptors.Allocate();
+    runtime->device.Get()->CreateShaderResourceView(srv_resource ? srv_resource : image, &desc,
+                                                    multisample_srv);
+    return multisample_srv;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE ImageView::CreateSrv(Shader::TextureType texture_type,
@@ -664,29 +708,50 @@ void ImageView::PrepareRender() const {
     }
 }
 
-void ImageView::PrepareRead(Shader::TextureType texture_type) const {
+u8 ImageView::PrepareReadWork(Shader::TextureType texture_type) const noexcept {
+    u8 work = 0;
     if (srv_resource && srv_resource != image) {
-        if (Image* const source = SourceImage()) {
-            source->ReadReinterpreted();
-        }
+        work |= PREPARE_REINTERPRETED;
     }
     if (texture_type == Shader::TextureType::ColorArray2D &&
         srv_params.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-        if (Image* const source = SourceImage()) {
-            source->RefreshSliceArray();
-        }
+        work |= PREPARE_SLICE_ARRAY;
     }
     if (texture_type == Shader::TextureType::Color3D &&
         srv_params.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-        if (Image* const source = SourceImage()) {
-            source->RefreshVolume();
-        }
+        work |= PREPARE_VOLUME;
     }
     if (texture_type == Shader::TextureType::ColorCube &&
         srv_params.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && srv_params.layers == 1) {
-        if (Image* const source = SourceImage()) {
-            source->RefreshCube();
-        }
+        work |= PREPARE_CUBE;
+    }
+    return work;
+}
+
+bool ImageView::NeedsPrepareRead(Shader::TextureType texture_type) const noexcept {
+    return PrepareReadWork(texture_type) != 0;
+}
+
+void ImageView::PrepareRead(Shader::TextureType texture_type) const {
+    const u8 work = PrepareReadWork(texture_type);
+    if (work == 0) {
+        return;
+    }
+    Image* const source = SourceImage();
+    if (!source) {
+        return;
+    }
+    if (work & PREPARE_REINTERPRETED) {
+        source->ReadReinterpreted();
+    }
+    if (work & PREPARE_SLICE_ARRAY) {
+        source->RefreshSliceArray();
+    }
+    if (work & PREPARE_VOLUME) {
+        source->RefreshVolume();
+    }
+    if (work & PREPARE_CUBE) {
+        source->RefreshCube();
     }
 }
 
@@ -704,6 +769,8 @@ void ImageView::Release() {
     }
     if (stencil_srv.ptr) runtime->view_descriptors.Free(stencil_srv);
     stencil_srv = {};
+    if (multisample_srv.ptr) runtime->view_descriptors.Free(multisample_srv);
+    multisample_srv = {};
     if (uav.ptr) runtime->view_descriptors.Free(uav);
     if (rtv.ptr) runtime->rtv_descriptors.Free(rtv);
     if (dsv.ptr) runtime->dsv_descriptors.Free(dsv);
@@ -712,13 +779,14 @@ void ImageView::Release() {
 }
 ImageView::ImageView(ImageView&& other) noexcept : VideoCommon::ImageViewBase{std::move(other)}, runtime{std::exchange(other.runtime, nullptr)},
     slot_images{other.slot_images}, image{other.image}, srv_resource{other.srv_resource}, srv_params{other.srv_params}, natural_type{other.natural_type},
-    srvs{std::exchange(other.srvs, {})}, depth_feedback_srvs{std::move(other.depth_feedback_srvs)}, stencil_srv{std::exchange(other.stencil_srv, {})}, uav{other.uav}, rtv{other.rtv}, rtv_on_copy{other.rtv_on_copy}, dsv{other.dsv}, dsv_read_only{other.dsv_read_only}, buffer_size{other.buffer_size} {}
+    srvs{std::exchange(other.srvs, {})}, depth_feedback_srvs{std::move(other.depth_feedback_srvs)}, stencil_srv{std::exchange(other.stencil_srv, {})}, multisample_srv{std::exchange(other.multisample_srv, {})}, uav{other.uav}, rtv{other.rtv}, rtv_on_copy{other.rtv_on_copy}, dsv{other.dsv}, dsv_read_only{other.dsv_read_only}, buffer_size{other.buffer_size} {}
 ImageView& ImageView::operator=(ImageView&& other) noexcept {
     if (this != &other) { Release(); static_cast<VideoCommon::ImageViewBase&>(*this) = std::move(other);
         runtime = std::exchange(other.runtime, nullptr); slot_images = other.slot_images; image = other.image; srv_resource = other.srv_resource;
         srv_params = other.srv_params; natural_type = other.natural_type; srvs = std::exchange(other.srvs, {});
         depth_feedback_srvs = std::move(other.depth_feedback_srvs);
         stencil_srv = std::exchange(other.stencil_srv, {});
+        multisample_srv = std::exchange(other.multisample_srv, {});
         uav = other.uav; rtv = other.rtv; rtv_on_copy = other.rtv_on_copy; dsv = other.dsv; dsv_read_only = other.dsv_read_only; buffer_size = other.buffer_size; }
     return *this;
 }

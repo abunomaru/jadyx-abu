@@ -95,6 +95,39 @@ desde cero.
   `featureJosh/pokopia-recomp` (PR #5) limita los trabajos de compilación a RAM libre / 2 GiB porque
   el *Set up* agotaba memoria en portátiles; afecta al PC, no a la consola.
 
+## Forks de la comunidad y lo que sirve al emulador (6 nov 2026)
+
+**Primera cifra de memoria.** En una Steam Deck LCD (issue #46 de `featureJosh/pokopia-recomp`, con
+un build anterior a la v0.2.0), los pools de memoria GPU importados suman 3500 + 332 + 500 + 400 MiB
+= **4732 MiB (~4,6 GiB)**, solo la parte gráfica y sin contar la memoria de CPU del juego. Un port
+nativo sin sobrecoste de emulación ya roza los 5120 MiB del modo Game. Para el gate P0 esto apunta a
+«no cabe» si no se reduce el pool grande (3500 MiB) o se manda parte a almacenamiento (Permafrost).
+
+**Rendimiento en Deck.** Unos 26–54 FPS con Proton; el límite es el envío de trabajo a la GPU desde
+la CPU (~28 ms por frame en #46), no la GPU, que queda ociosa. `featureJosh` prepara una revisión de
+rendimiento (issue #55). El fork Linux `tinfoil-chewer/pokopia-recomp-linux` declara ~54 FPS en una
+Deck LCD.
+
+**Correcciones del recomp contrastadas con este fork.** Todas estaban ya cubiertas:
+
+| Fallo en el recomp | Estado en este fork |
+|---|---|
+| Esperas y temporizadores ~1,63× cortos (contador a 19,2 MHz en lugar de 31,25 MHz) | Cubierto: `core.cpp:386` fija `Switch2CNTFRQ` al arrancar un título de Switch 2; el reloj, dynarmic, NCE y `psc/time` leen `GetGuestCNTFRQ()`. `NSToCNTPCT` (19,2 MHz fijos) no tiene usuarios |
+| Seno y coseno desfasados 2π (niebla, agua, viento) | Cubierto: en SM70+ `MUFU.SIN/COS` toman vueltas; `lower_to_maxwell.h:2541` multiplica por 2π (`0x40c90fdb`) antes del `MUFU` de Maxwell |
+| Salidas del vertex shader sin escribir a NaN en AMD (cielo y nubes negros) | Cubierto: el prólogo del vertex stage de SPIR-V escribe (0, 0, 0, 1). Importa porque la GPU de la Series es AMD (RDNA 2) |
+| Copia GPU de la memoria del juego en AMD en lugar de `VK_EXT_external_memory_host` | No aplica: el backend D3D12 sube la memoria guest por su propio camino |
+
+**Ideas aprovechables más adelante.**
+
+- Los shaders de arranque empaquetados en un solo archivo zstd bajaron la espera de arranque en
+  microSD de ~60 s a ~10 s. Aplicable a la caché de pipelines en el almacenamiento externo de la
+  Series.
+- Corrección del swizzle de half-float (sombras del sol y las nubes) en su traductor de shaders.
+  Ese traductor viene de Ryujinx, no del recompilador de Eden: no se porta tal cual, pero conviene
+  revisar los swizzles `HADD2/HMUL2/HFMA2` de la ruta nativa si aparecen sombras rotas.
+- La v0.1.1 copia a la CPU los resultados de la GPU solo cuando el juego los lee, como el
+  `GpuWrittenPages` que ya trae Jadyx.
+
 ## Reglas
 
 - **Nada del juego en el repo ni en la nube:** ni el volcado, ni `exefs`, ni el C++ generado, ni el
@@ -114,5 +147,8 @@ desde cero.
 - https://github.com/Djihads80/Eglantine/issues/16 (heap de ~9,5 GiB).
 - https://github.com/drakolordx7/pokopia-recomp/releases/tag/v0.2.0 ·
   https://github.com/drakolordx7/switch2-recomp ·
-  https://github.com/featureJosh/pokopia-recomp/pull/5
+  https://github.com/featureJosh/pokopia-recomp/pull/5 ·
+  https://github.com/featureJosh/pokopia-recomp/issues/46 ·
+  https://github.com/featureJosh/pokopia-recomp/issues/55 ·
+  https://github.com/tinfoil-chewer/pokopia-recomp-linux
 - https://github.com/rodrigoandrigo/Cemu-UWP-Host · https://github.com/Cosmo/mesa_ai_slop_version
